@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -37,3 +38,29 @@ class RegistryTest(unittest.TestCase):
         self.assertTrue(self.registry.migrate_legacy(legacy))
         record = self.registry.get("legacy:192.168.1.23")
         self.assertEqual(record.token, "abcdefghijklmnop")
+
+    def test_concurrent_saves_do_not_raise(self):
+        for device_id in range(8):
+            self.registry.upsert(
+                f"d{device_id}",
+                model="dotii",
+                supported=["status"],
+            )
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def save_repeatedly():
+            barrier.wait()
+            try:
+                for _ in range(20):
+                    self.registry.save()
+            except OSError as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=save_repeatedly) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])

@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,63 +67,67 @@ class DeviceRegistry:
     def __init__(self, path: Path | None):
         self.path = Path(path) if path is not None else None
         self._devices: dict[str, DeviceRecord] = {}
+        self._lock = threading.RLock()
 
     def load(self) -> None:
-        if self.path is None or not self.path.exists():
-            return
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+        with self._lock:
+            if self.path is None or not self.path.exists():
+                return
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return
 
-        raw_devices = raw.get("devices", raw) if isinstance(raw, dict) else raw
-        if isinstance(raw_devices, list):
-            raw_devices = {
-                str(item.get("device_id")): item
-                for item in raw_devices
-                if isinstance(item, dict) and item.get("device_id")
-            }
-        if not isinstance(raw_devices, dict):
-            return
+            raw_devices = raw.get("devices", raw) if isinstance(raw, dict) else raw
+            if isinstance(raw_devices, list):
+                raw_devices = {
+                    str(item.get("device_id")): item
+                    for item in raw_devices
+                    if isinstance(item, dict) and item.get("device_id")
+                }
+            if not isinstance(raw_devices, dict):
+                return
 
-        loaded: dict[str, DeviceRecord] = {}
-        for device_id, value in raw_devices.items():
-            if isinstance(value, dict):
-                loaded[str(device_id)] = DeviceRecord.from_dict(str(device_id), value)
-        self._devices = loaded
+            loaded: dict[str, DeviceRecord] = {}
+            for device_id, value in raw_devices.items():
+                if isinstance(value, dict):
+                    loaded[str(device_id)] = DeviceRecord.from_dict(str(device_id), value)
+            self._devices = loaded
 
     def save(self) -> None:
-        if self.path is None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "devices": {
-                device_id: record.to_dict()
-                for device_id, record in self._devices.items()
-            },
-        }
-        temporary_name: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temporary_name = temporary.name
-                json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_name, self.path)
-        finally:
-            if temporary_name and os.path.exists(temporary_name):
-                os.unlink(temporary_name)
+        with self._lock:
+            if self.path is None:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "devices": {
+                    device_id: record.to_dict()
+                    for device_id, record in self._devices.items()
+                },
+            }
+            temporary_name: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.path.parent,
+                    prefix=f".{self.path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary_name = temporary.name
+                    json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_name, self.path)
+            finally:
+                if temporary_name and os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
 
     def get(self, device_id: str) -> DeviceRecord | None:
-        return self._devices.get(device_id)
+        with self._lock:
+            return self._devices.get(device_id)
 
     def upsert(
         self,
@@ -133,70 +138,75 @@ class DeviceRegistry:
         token: str | None = None,
         supported: Iterable[str] | None = None,
     ) -> DeviceRecord:
-        record = self._devices.get(device_id)
-        if record is None:
-            declared = normalize(supported or [])
-            record = DeviceRecord(
-                device_id=device_id,
-                model=model,
-                name=name,
-                token=token,
-                supported=declared,
-                enabled=(
-                    default_for(model) & (declared | set(MINIMAL))
-                    if supported is not None
-                    else default_for(model)
-                ),
-            )
-            self._devices[device_id] = record
+        with self._lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                declared = normalize(supported or [])
+                record = DeviceRecord(
+                    device_id=device_id,
+                    model=model,
+                    name=name,
+                    token=token,
+                    supported=declared,
+                    enabled=(
+                        default_for(model) & (declared | set(MINIMAL))
+                        if supported is not None
+                        else default_for(model)
+                    ),
+                )
+                self._devices[device_id] = record
+                return record
+
+            record.model = model
+            if name is not None:
+                record.name = name
+            if token is not None:
+                record.token = token
+            if supported is not None:
+                record.supported = normalize(supported)
             return record
 
-        record.model = model
-        if name is not None:
-            record.name = name
-        if token is not None:
-            record.token = token
-        if supported is not None:
-            record.supported = normalize(supported)
-        return record
-
     def remove(self, device_id: str) -> bool:
-        return self._devices.pop(device_id, None) is not None
+        with self._lock:
+            return self._devices.pop(device_id, None) is not None
 
     def set_enabled(self, device_id: str, enabled: Iterable[str]) -> None:
-        record = self._devices.get(device_id)
-        if record is None:
-            raise KeyError(device_id)
-        record.enabled = normalize(enabled)
+        with self._lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                raise KeyError(device_id)
+            record.enabled = normalize(enabled)
 
     def mint_token(self, device_id: str) -> str:
-        record = self._devices.get(device_id)
-        if record is None:
-            record = self.upsert(device_id, model="unknown")
-        if record.token is None:
-            record.token = secrets.token_urlsafe(TOKEN_BYTES)
-            self.save()
-        return record.token
+        with self._lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                record = self.upsert(device_id, model="unknown")
+            if record.token is None:
+                record.token = secrets.token_urlsafe(TOKEN_BYTES)
+                self.save()
+            return record.token
 
     def migrate_legacy(self, legacy_path: Path) -> bool:
-        try:
-            raw = json.loads(Path(legacy_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        if not isinstance(raw, dict):
-            return False
-        host = raw.get("host")
-        token = raw.get("token")
-        if not isinstance(host, str) or not host:
-            return False
-        if not isinstance(token, str) or len(token) < 16:
-            return False
-        self.upsert(
-            f"legacy:{host}",
-            model="FoloOS-AI-Passport",
-            name="FoloOS AI Passport",
-            token=token,
-            supported=["status", "text", "read_ack"],
-        )
-        self.save()
-        return True
+        with self._lock:
+            try:
+                raw = json.loads(Path(legacy_path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(raw, dict):
+                return False
+            host = raw.get("host")
+            token = raw.get("token")
+            if not isinstance(host, str) or not host:
+                return False
+            if not isinstance(token, str) or len(token) < 16:
+                return False
+            self.upsert(
+                f"legacy:{host}",
+                model="FoloOS-AI-Passport",
+                name="FoloOS AI Passport",
+                token=token,
+                supported=["status", "text", "read_ack"],
+            )
+            self.save()
+            return True
