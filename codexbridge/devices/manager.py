@@ -62,7 +62,7 @@ class DeviceManager:
         record = self.registry.upsert(
             result.device_id,
             model=result.device,
-            name=result.device,
+            name=result.name or result.device,
             supported=supported,
         )
         record.last_seen = time.time()
