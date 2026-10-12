@@ -60,6 +60,35 @@ def build_menu_model(registry: DeviceRegistry, hub: BridgeHub) -> list[MenuItem]
     return model
 
 
+def make_tray_menu(pystray, registry: DeviceRegistry, hub: BridgeHub, make_dispatch):
+    def make_menu(items):
+        def entries():
+            for item in items():
+                if item.kind == "submenu":
+                    yield pystray.MenuItem(
+                        item.label,
+                        make_menu(
+                            lambda children=tuple(item.children): children
+                        ),
+                    )
+                    continue
+                checked = None
+                if item.kind == "check":
+                    checked = lambda _item, action_id=item.action_id: (
+                        _capability_checked(registry, action_id)
+                    )
+                yield pystray.MenuItem(
+                    item.label,
+                    make_dispatch(item.action_id),
+                    checked=checked,
+                    radio=False,
+                )
+
+        return pystray.Menu(entries)
+
+    return make_menu(lambda: build_menu_model(registry, hub))
+
+
 def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
     try:
         import pystray
@@ -117,37 +146,11 @@ def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
 
         return dispatch
 
-    def make_menu(items: list[MenuItem]) -> pystray.Menu:
-        entries = []
-        for item in items:
-            if item.kind == "submenu":
-                entries.append(
-                    pystray.MenuItem(
-                        item.label,
-                        make_menu(item.children),
-                    )
-                )
-                continue
-            checked = None
-            if item.kind == "check":
-                checked = lambda _item, action_id=item.action_id: (
-                    _capability_checked(registry, action_id)
-                )
-            entries.append(
-                pystray.MenuItem(
-                    item.label,
-                    make_dispatch(item.action_id),
-                    checked=checked,
-                    radio=False,
-                )
-            )
-        return pystray.Menu(*entries)
-
     icon = pystray.Icon(
         "CodexBridge",
         image,
         "CodexBridge",
-        make_menu(build_menu_model(registry, hub)),
+        make_tray_menu(pystray, registry, hub, make_dispatch),
     )
     icon.run()
 

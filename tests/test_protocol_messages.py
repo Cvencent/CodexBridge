@@ -1,6 +1,12 @@
 import unittest
 
-from codexbridge.protocol.messages import decode, encode, split_text, wire_messages
+from codexbridge.protocol.messages import (
+    MAX_LINE_BYTES,
+    decode,
+    encode,
+    split_text,
+    wire_messages,
+)
 
 
 class MessageWireTest(unittest.TestCase):
@@ -24,3 +30,24 @@ class MessageWireTest(unittest.TestCase):
         self.assertGreater(len(records), 1)
         self.assertEqual(decode(records[0])["total"], len(records))
         self.assertEqual(decode(records[-1])["seq"], len(records) - 1)
+
+    def test_long_message_metadata_respects_line_limit(self):
+        body = "中" * 600
+        records = wire_messages(
+            {
+                "type": "message",
+                "message_id": "m1",
+                "thread_id": "t" * 200,
+                "kind": "result",
+                "status": "completed",
+                "title": "题" * 500,
+                "body": body,
+                "created_at": 0.0,
+            }
+        )
+        decoded = [decode(record) for record in records]
+
+        self.assertTrue(all(len(record) <= MAX_LINE_BYTES for record in records))
+        self.assertEqual("".join(item["body"] for item in decoded), body)
+        self.assertLessEqual(len(decoded[0]["title"].encode("utf-8")), 160)
+        self.assertTrue(decoded[0]["title"].endswith("..."))

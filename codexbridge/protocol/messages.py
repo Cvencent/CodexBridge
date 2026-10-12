@@ -3,6 +3,8 @@ from typing import Any
 
 MAX_LINE_BYTES = 768
 TEXT_CHUNK_BYTES = 480
+MAX_TITLE_BYTES = 160
+TRUNCATION_SUFFIX = "..."
 
 
 def encode(message: dict[str, Any]) -> bytes:
@@ -55,16 +57,54 @@ def split_text(text: str, limit: int = TEXT_CHUNK_BYTES) -> list[str]:
     return chunks
 
 
+def _truncate_utf8(text: str, limit: int) -> str:
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    suffix_bytes = len(TRUNCATION_SUFFIX.encode("utf-8"))
+    if limit < suffix_bytes:
+        raise ValueError("limit is too small for the truncation suffix")
+    budget = limit - suffix_bytes
+    kept: list[str] = []
+    size = 0
+    for character in text:
+        character_size = len(character.encode("utf-8"))
+        if size + character_size > budget:
+            break
+        kept.append(character)
+        size += character_size
+    return "".join(kept) + TRUNCATION_SUFFIX
+
+
 def wire_messages(message: dict[str, Any]) -> list[bytes]:
     if message.get("type") != "message":
         return [encode(message)]
 
-    body = message.get("body", "")
+    prepared = dict(message)
+    title = prepared.get("title")
+    if isinstance(title, str):
+        prepared["title"] = _truncate_utf8(title, MAX_TITLE_BYTES)
+
+    body = prepared.get("body", "")
     if not isinstance(body, str):
         raise TypeError("message body must be a string")
-    chunks = split_text(body)
-    total = len(chunks)
-    return [
-        encode({**message, "body": chunk, "seq": seq, "total": total})
-        for seq, chunk in enumerate(chunks)
-    ]
+
+    limit = TEXT_CHUNK_BYTES
+    while True:
+        chunks = split_text(body, limit)
+        total = len(chunks)
+        try:
+            return [
+                encode(
+                    {
+                        **prepared,
+                        "body": chunk,
+                        "seq": seq,
+                        "total": total,
+                    }
+                )
+                for seq, chunk in enumerate(chunks)
+            ]
+        except ValueError:
+            if limit == 1:
+                raise
+            limit = max(1, limit - 64)
