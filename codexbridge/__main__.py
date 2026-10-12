@@ -8,6 +8,7 @@ from pathlib import Path
 
 from codexbridge.admin_api import AdminApi
 from codexbridge.devices.discovery import discover
+from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
 
@@ -28,8 +29,7 @@ def _migrate_legacy(registry: DeviceRegistry) -> None:
 
 
 def _discovery_loop(
-    registry: DeviceRegistry,
-    hub: BridgeHub,
+    manager: DeviceManager,
     stop: threading.Event,
 ) -> None:
     while not stop.is_set():
@@ -37,24 +37,7 @@ def _discovery_loop(
             results = discover(timeout=1.0)
         except OSError:
             results = []
-        for result in results:
-            record = registry.get(result.device_id)
-            if record is None:
-                record = registry.upsert(
-                    result.device_id,
-                    model=result.device,
-                    name=result.device,
-                    supported=result.capabilities,
-                )
-            else:
-                registry.upsert(
-                    result.device_id,
-                    model=result.device,
-                    name=record.name or result.device,
-                    supported=result.capabilities,
-                )
-            registry.get(result.device_id).last_seen = time.time()
-            registry.save()
+        manager.sync(results)
         stop.wait(5.0)
 
 
@@ -74,12 +57,13 @@ def main(argv: list[str] | None = None) -> int:
     _migrate_legacy(registry)
 
     hub = BridgeHub(registry)
+    manager = DeviceManager(registry, hub)
     admin = AdminApi(hub, registry)
     admin.start()
     stop = threading.Event()
     discovery_thread = threading.Thread(
         target=_discovery_loop,
-        args=(registry, hub, stop),
+        args=(manager, stop),
         daemon=True,
     )
     discovery_thread.start()
@@ -97,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         stop.set()
+        manager.stop()
         admin.stop()
         discovery_thread.join(timeout=1.0)
     return 0

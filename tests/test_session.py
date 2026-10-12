@@ -71,3 +71,18 @@ class SessionTest(unittest.TestCase):
             )
             session.run_once()
         self.assertEqual(seen[0]["message_id"], "m1")
+
+    def test_v1_authenticates_without_waiting_for_hello(self):
+        with FakeDevice(protocol=1) as device:
+            device.expect_handshake("abcdefghijklmnop")
+            session = DeviceSession(
+                device.host,
+                device.port,
+                "abcdefghijklmnop",
+                protocol=1,
+                heartbeat_seconds=0.2,
+                timeout_seconds=1.0,
+            )
+            session.run_once()
+        self.assertEqual(device.received[0]["type"], "bridge_auth")
+        self.assertFalse(any(message["type"] == "hello_ok" for message in device.received))

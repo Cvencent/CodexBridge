@@ -23,6 +23,8 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
         device = self.server.device
         buffer = bytearray()
         authenticated = False
+        if device.protocol == 2:
+            self.request.sendall(encode(device._hello_message()))
 
         while not device._stopped.is_set():
             try:
@@ -42,18 +44,17 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
                 device._append_received(message)
 
                 message_type = message.get("type")
-                if message_type == "hello":
+                if message_type == "hello_ok" and device.protocol == 2:
+                    if message.get("protocol") != 2:
+                        return
                     self.request.sendall(
-                        encode(
-                            {
-                                "type": "hello_ok",
-                                "protocol": 2,
-                                "bridge": "CodexBridge",
-                                "version": VERSION,
-                                "capabilities": [],
-                            }
-                        )
+                        encode({"type": "bridge_auth", "token": device._expected_token})
                     )
+                elif message_type == "bridge_auth_ok" and device.protocol == 2:
+                    authenticated = True
+                    with device._connection_lock:
+                        device._connection = self.request
+                    device._run_after_handshake()
                 elif message_type == "bridge_auth":
                     if message.get("token") != device._expected_token:
                         return
@@ -69,8 +70,9 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
 
 
 class FakeDevice:
-    def __init__(self, host: str = "127.0.0.1"):
+    def __init__(self, host: str = "127.0.0.1", protocol: int = 2):
         self.host = host
+        self.protocol = protocol
         self._expected_token: str | None = None
         self._stalled = False
         self._callbacks: list[Callable[[], None]] = []
@@ -138,3 +140,14 @@ class FakeDevice:
     def _run_after_handshake(self) -> None:
         for callback in tuple(self._callbacks):
             callback()
+
+    def _hello_message(self) -> dict:
+        return {
+            "type": "hello",
+            "protocol": 2,
+            "device_id": "fake-device",
+            "model": "dotii",
+            "name": "Fake Device",
+            "firmware": "test",
+            "capabilities": ["status", "text", "read_ack"],
+        }

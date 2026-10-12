@@ -34,3 +34,10 @@ class MessageStoreTest(unittest.TestCase):
                 )
             )
         self.assertIsNone(store.get("m0"))
+
+    def test_replacing_message_preserves_read_state(self):
+        store = MessageStore()
+        store.add(MessageRecord("m1", "t1", "result", "completed", "t", "b", 0.0))
+        store.mark_read("m1", "d1")
+        store.add(MessageRecord("m1", "t1", "result", "completed", "t", "b", 0.0))
+        self.assertEqual(store.read_by("m1"), {"d1"})

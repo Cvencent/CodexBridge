@@ -112,6 +112,14 @@ class BridgeHub:
             },
         )
 
+    def replay_state(self, device_id: str) -> None:
+        with self._lock:
+            state = self.state_for(device_id)
+        for message in state["messages"]:
+            self._send(device_id, {"type": "message", **message})
+        for read_state in state["read_state"]:
+            self._send(device_id, {"type": "read_state", **read_state})
+
     def _handle_read_ack(self, device_id: str, event: dict) -> None:
         if "read_ack" not in self.capabilities_for(device_id):
             self._send_error(device_id, "capability_not_enabled")

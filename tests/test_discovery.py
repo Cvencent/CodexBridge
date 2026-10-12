@@ -2,7 +2,12 @@ import socket
 import threading
 import unittest
 
-from codexbridge.devices.discovery import DISCOVERY_PORT, discover, parse_reply
+from codexbridge.devices.discovery import (
+    DISCOVERY_PORT,
+    LEGACY_DISCOVERY_REQUEST,
+    discover,
+    parse_reply,
+)
 
 
 class DiscoveryTest(unittest.TestCase):
@@ -27,6 +32,7 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_loopback_round_trip(self):
         stop = threading.Event()
+        requests = []
 
         def responder():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -35,13 +41,18 @@ class DiscoveryTest(unittest.TestCase):
             sock.settimeout(0.2)
             while not stop.is_set():
                 try:
-                    _, source = sock.recvfrom(1024)
+                    payload, source = sock.recvfrom(1024)
                 except socket.timeout:
                     continue
-                sock.sendto(
-                    b'{"device":"dotii","device_id":"a1","port":8765,"protocol":2}',
-                    source,
-                )
+                requests.append(payload)
+                if payload == LEGACY_DISCOVERY_REQUEST:
+                    reply = b'{"device":"FoloOS-AI-Passport","port":8765}'
+                else:
+                    reply = (
+                        b'{"device":"dotii","device_id":"a1","port":8765,'
+                        b'"protocol":2}'
+                    )
+                sock.sendto(reply, source)
             sock.close()
 
         thread = threading.Thread(target=responder, daemon=True)
@@ -51,4 +62,8 @@ class DiscoveryTest(unittest.TestCase):
         finally:
             stop.set()
             thread.join(timeout=1.0)
-        self.assertEqual([r.device_id for r in results], ["a1"])
+        self.assertEqual(
+            {result.device_id for result in results},
+            {"a1", "legacy:127.0.0.1"},
+        )
+        self.assertIn(LEGACY_DISCOVERY_REQUEST, requests)

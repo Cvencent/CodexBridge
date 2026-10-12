@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 DISCOVERY_PORT = 8764
 DISCOVERY_REQUEST = b"CODEXBRIDGE_DISCOVER_V2"
+LEGACY_DISCOVERY_REQUEST = b"FOLOOS_DISCOVER_V1"
 MAX_REPLY_BYTES = 1024
 
 
@@ -80,10 +81,11 @@ def discover(
         sock.bind(("", 0))
 
         for target in target_hosts:
-            try:
-                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
-            except OSError:
-                continue
+            for request in (DISCOVERY_REQUEST, LEGACY_DISCOVERY_REQUEST):
+                try:
+                    sock.sendto(request, (target, DISCOVERY_PORT))
+                except OSError:
+                    continue
 
         while True:
             remaining = deadline - time.monotonic()

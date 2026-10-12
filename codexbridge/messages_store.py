@@ -31,7 +31,9 @@ class MessageStore:
         self._messages: OrderedDict[str, MessageRecord] = OrderedDict()
 
     def add(self, record: MessageRecord) -> MessageRecord:
-        if record.message_id in self._messages:
+        existing = self._messages.get(record.message_id)
+        if existing is not None:
+            record.read_by.update(existing.read_by)
             del self._messages[record.message_id]
         self._messages[record.message_id] = record
         while len(self._messages) > self.max_messages:
