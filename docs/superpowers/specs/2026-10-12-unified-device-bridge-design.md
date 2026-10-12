@@ -1,7 +1,7 @@
 # CodexBridge 统一设备桥设计
 
 日期：2026-10-12
-状态：设计已确认，待评审
+状态：设计已确认，待评审（2026-10-12）
 
 ## 1. 背景
 
@@ -65,7 +65,10 @@ Dotii 固件是双数据源：Codex 从 CodexBridge 走，其余继续从管理�
 3. 设备到 PC：{"type":"bridge_auth","token":"<令牌>"}
 4. PC 到设备：{"type":"bridge_auth_ok","device_id":"<分配或确认的ID>"}
 
-未配对设备接受首个合法令牌并持久保存（TOFU），之后必须严格匹配。这条沿用现有 CodexBridge 的行为，不新增配对码流程。
+两条来源，取决于设备有没有配网入口：
+
+- AI Passport：没有 BLE 配网通道，沿用现有 CodexBridge 的 TOFU，接受首个合法令牌并持久保存，之后必须严格匹配。
+- Dotii：有 BLE 配网通道，由管理中心在配网时预置令牌（见第 8 节），设备端按严格匹配处理，不走 TOFU。
 
 ### 6.3 心跳与断线
 
@@ -141,8 +144,8 @@ PC 到设备（星号为 v2 新增）：
 管理中心（原 dotii/bridge/）：
 
 - 删除 Codex 采集：codex_app_server.py、Codex 模块开关、快照里的 Codex 段、管理页 Codex 标签。
-- 快照保留 Bambu、自定义页、显示设置、模块开关、Dotii 表情（表情改为设备本地推导后，这一段可以只留配置）。
-- BLE 配网增加一步：通过 CodexBridge 回环接口取该设备的配对令牌，和 Wi-Fi 信息一起下发。
+- 快照保留 Bambu、自定义页、显示设置、模块开关；Dotii 表情的触发时长与开关留在配置里，表情本身由设备按 Codex 状态本地推导。
+- BLE 配网增加两步：设备通过 BLE 上报自己的 device_id；管理中心据此向 CodexBridge 回环接口申领该设备的配对令牌，连同 Wi-Fi 信息一起下发。
 - 保留烧录、日志、运行目录与现有配置兼容性。
 
 ## 9. AI Passport 侧改造（最小）
