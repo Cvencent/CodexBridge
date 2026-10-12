@@ -8,8 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 DISCOVERY_PORT = 8764
-DISCOVERY_REQUEST = b"CODEXBRIDGE_DISCOVER_V2"
-LEGACY_DISCOVERY_REQUEST = b"FOLOOS_DISCOVER_V1"
+DISCOVERY_REQUEST = b"CODEXBRIDGE_DISCOVER"
 MAX_REPLY_BYTES = 1024
 
 
@@ -18,8 +17,8 @@ class DiscoveryResult:
     host: str
     device: str
     device_id: str
+    name: str | None
     port: int
-    protocol: int
     capabilities: list[str]
 
 
@@ -37,18 +36,14 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         return None
 
-    protocol = value.get("protocol", 1)
-    if not isinstance(protocol, int) or isinstance(protocol, bool):
-        protocol = 1
-
     device = value.get("device")
-    device = device if isinstance(device, str) and device else "unknown"
+    if not isinstance(device, str) or not device:
+        return None
     device_id = value.get("device_id")
-    device_id = (
-        device_id
-        if isinstance(device_id, str) and device_id
-        else f"legacy:{host}"
-    )
+    if not isinstance(device_id, str) or not device_id:
+        return None
+    name = value.get("name")
+    name = name if isinstance(name, str) and name else None
     capabilities = value.get("capabilities", [])
     if not isinstance(capabilities, list):
         capabilities = []
@@ -57,8 +52,8 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
         host=host,
         device=device,
         device_id=device_id,
+        name=name,
         port=port,
-        protocol=protocol,
         capabilities=capabilities,
     )
 
@@ -81,11 +76,10 @@ def discover(
         sock.bind(("", 0))
 
         for target in target_hosts:
-            for request in (DISCOVERY_REQUEST, LEGACY_DISCOVERY_REQUEST):
-                try:
-                    sock.sendto(request, (target, DISCOVERY_PORT))
-                except OSError:
-                    continue
+            try:
+                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+            except OSError:
+                continue
 
         while True:
             remaining = deadline - time.monotonic()

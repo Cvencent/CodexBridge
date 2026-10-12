@@ -70,8 +70,8 @@ class DeviceManagerTest(unittest.TestCase):
             host="127.0.0.1",
             device="dotii",
             device_id="d1",
+            name="Desk",
             port=8765,
-            protocol=2,
             capabilities=["status", "text", "results", "read_ack"],
         )
         self.manager.sync([result])
@@ -85,8 +85,8 @@ class DeviceManagerTest(unittest.TestCase):
             host="127.0.0.1",
             device="dotii",
             device_id="d1",
+            name="Desk",
             port=8765,
-            protocol=2,
             capabilities=["status", "text", "results", "read_ack"],
         )
         FakeSession.fail_before_online = True
@@ -106,8 +106,8 @@ class DeviceManagerTest(unittest.TestCase):
             host="127.0.0.1",
             device="dotii",
             device_id="d1",
+            name="Desk",
             port=8765,
-            protocol=2,
             capabilities=["status", "text", "results", "read_ack"],
         )
         self.manager.sync([result])

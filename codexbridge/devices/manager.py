@@ -58,7 +58,7 @@ class DeviceManager:
             thread.join(timeout=1.0)
 
     def _sync_one(self, result: DiscoveryResult) -> None:
-        supported = result.capabilities if result.protocol >= 2 else None
+        supported = result.capabilities
         record = self.registry.upsert(
             result.device_id,
             model=result.device,
@@ -78,7 +78,7 @@ class DeviceManager:
             result.host,
             result.port,
             record.token,
-            protocol=result.protocol,
+            protocol=2,
             device_id=result.device_id,
             capabilities=self.hub.capabilities_for(result.device_id),
             on_hello=lambda hello: self._handle_hello(result.device_id, hello),
