@@ -47,6 +47,16 @@ class DeviceManager:
         for thread in threads:
             thread.join(timeout=1.0)
 
+    def remove(self, device_id: str) -> None:
+        with self._lock:
+            session = self._sessions.pop(device_id, None)
+            thread = self._threads.pop(device_id, None)
+        self.hub.detach(device_id)
+        if session is not None:
+            session.stop()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
     def _sync_one(self, result: DiscoveryResult) -> None:
         supported = result.capabilities if result.protocol >= 2 else None
         record = self.registry.upsert(

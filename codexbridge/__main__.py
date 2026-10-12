@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
 
     hub = BridgeHub(registry)
     manager = DeviceManager(registry, hub)
-    admin = AdminApi(hub, registry)
+    admin = AdminApi(hub, registry, on_device_removed=manager.remove)
     admin.start()
     stop = threading.Event()
     discovery_thread = threading.Thread(
@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from codexbridge import tray
 
-            tray.run(hub, registry)
+            tray.run(hub, registry, manager)
     except KeyboardInterrupt:
         pass
     finally:

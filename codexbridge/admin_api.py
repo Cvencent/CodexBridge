@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -21,6 +22,7 @@ def handle_request(
     client_host: str,
     hub: BridgeHub,
     registry: DeviceRegistry,
+    on_device_removed: Callable[[str], None] | None = None,
 ) -> tuple[int, dict]:
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -62,6 +64,8 @@ def handle_request(
             if removed:
                 registry.save()
                 hub.detach(device_id)
+            if on_device_removed is not None:
+                on_device_removed(device_id)
             return 200, {"ok": True, "device_id": device_id, "removed": removed}
         if method == "POST" and path == "/api/v1/admin/devices/capabilities":
             payload = _json_body(body)
@@ -126,11 +130,13 @@ class AdminApi:
         registry: DeviceRegistry,
         host: str = "127.0.0.1",
         port: int = 8788,
+        on_device_removed: Callable[[str], None] | None = None,
     ):
         self.hub = hub
         self.registry = registry
         self.host = host
         self.port = port
+        self.on_device_removed = on_device_removed
         self._server: _AdminServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -181,6 +187,7 @@ class AdminApi:
                             self.client_address[0],
                             api.hub,
                             api.registry,
+                            api.on_device_removed,
                         )
                 encoded = json.dumps(
                     payload,

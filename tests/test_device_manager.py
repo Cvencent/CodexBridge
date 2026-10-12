@@ -100,3 +100,21 @@ class DeviceManagerTest(unittest.TestCase):
         FakeSession.fail_before_online = False
         self.manager.sync([result])
         self.assertTrue(FakeSession.online.wait(1.0))
+
+    def test_remove_stops_session_and_clears_hub(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="d1",
+            port=8765,
+            protocol=2,
+            capabilities=["status", "text", "results", "read_ack"],
+        )
+        self.manager.sync([result])
+        self.assertTrue(FakeSession.online.wait(1.0))
+
+        self.manager.remove("d1")
+
+        self.assertTrue(FakeSession.created.stopped.is_set())
+        self.assertNotIn("d1", self.manager._sessions)
+        self.assertNotIn("d1", self.hub._sessions)

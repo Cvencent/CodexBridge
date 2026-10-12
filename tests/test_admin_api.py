@@ -82,3 +82,19 @@ class AdminApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(self.registry.get("d1").enabled, {"status"})
+
+    def test_remove_notifies_device_manager(self):
+        removed = []
+        body = json.dumps({"device_id": "d1"}).encode()
+        status, _ = handle_request(
+            "POST",
+            "/api/v1/admin/devices/remove",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            on_device_removed=removed.append,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(removed, ["d1"])

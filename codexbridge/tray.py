@@ -60,7 +60,7 @@ def build_menu_model(registry: DeviceRegistry, hub: BridgeHub) -> list[MenuItem]
     return model
 
 
-def run(hub: BridgeHub, registry: DeviceRegistry) -> None:
+def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
     try:
         import pystray
         from PIL import Image, ImageDraw
@@ -91,7 +91,10 @@ def run(hub: BridgeHub, registry: DeviceRegistry) -> None:
         device_id = action_id.split(":", 1)[1]
         if registry.remove(device_id):
             registry.save()
-            hub.detach(device_id)
+            if manager is not None:
+                manager.remove(device_id)
+            else:
+                hub.detach(device_id)
 
     def make_dispatch(action_id: str | None):
         def dispatch(icon, _item) -> None:
