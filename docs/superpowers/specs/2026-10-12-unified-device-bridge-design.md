@@ -1,7 +1,7 @@
 # CodexBridge 统一设备桥设计
 
 日期：2026-10-12
-状态：设计已确认，待评审（2026-10-12）
+状态：唯一协议修订，待评审（2026-10-12）
 
 ## 1. 背景
 
@@ -16,14 +16,14 @@
 2. 一套通用设备协议：以后任何新设备实现这套协议就能接进来，拿到 Codex 运行状态、任务状态、任务结果、通知和已读同步。
 3. 消息互通：一条 Codex 消息广播给所有在线设备；任何一台设备标记已读，其他设备同步。
 4. Dotii 改说这套协议（Codex 部分）；Bambu、自定义页、显示设置仍走管理中心。
-5. 尽量多改 Dotii，少改 AI Passport。
+5. 所有设备只实现、只运行这一套协议；AI Passport 做一次最小固件迁移，Dotii 承担主要接入工作。
 
 ## 3. 非目标
 
 - 不改 Dotii 的 Bambu、自定义页、显示设置、BLE 配网与烧录链路。
 - 不做云端中转，所有连接都在同一局域网。
 - 不重写 AI Passport 的语音、审批和单词熊功能。
-- 不为了统一而删除旧的 v1 协议：已刷机的 AI Passport 必须零改动继续可用。
+- 不在 CodexBridge 内保留任何设备协议版本分支、并行握手或旧设备兼容路径。
 
 ## 4. 仓库与目录
 
@@ -48,87 +48,85 @@ Dotii 固件是双数据源：Codex 从 CodexBridge 走，其余继续从管理�
 
 配对与配网的分工：设备连 Wi-Fi 仍由管理中心的 BLE 配网页完成；配网时管理中心通过本机回环接口向 CodexBridge 取该设备的配对令牌，连同 Wi-Fi 信息一起写进设备。
 
-## 6. 通用设备协议 v2
+## 6. 唯一设备协议
 
-传输沿用现有设计：TCP 8765、换行分隔 JSON、UTF-8；UDP 8764 做发现。选它是因为设备数量少、局域网内够用，且 AI Passport 固件已经实现了这一套。
+CodexBridge、Dotii 和 AI Passport 只实现本节这一套协议。协议内部没有版本字段、版本分支、并行握手或“旧设备优先”逻辑。传输为 TCP 8765、换行分隔 JSON、UTF-8；UDP 8764 只做发现。
 
 ### 6.1 发现
 
-- 请求：CODEXBRIDGE_DISCOVER_V2；同时接受旧的 FOLOOS_DISCOVER_V1。
-- 应答：{"device":"dotii","device_id":"<稳定ID>","port":8765,"protocol":2,"capabilities":[...]}。
-- 旧设备应答 {"device":"FoloOS-AI-Passport","port":8765}（无 protocol 字段）时按 v1 处理。
+- 请求固定为 `CODEXBRIDGE_DISCOVER`，不发送第二套发现请求。
+- 应答固定为 `{"device":"dotii","device_id":"<稳定ID>","name":"<名称>","port":8765,"capabilities":[...]}`。
+- `device_id`、`device`、`port` 为必填；缺少 `device_id` 的应答不进入设备列表。
+- 设备切换 IP 后必须继续上报同一个 `device_id`。
 
 ### 6.2 握手
 
-1. 设备到 PC：{"type":"hello","protocol":2,"device_id":"...","model":"...","name":"...","firmware":"...","capabilities":[...]}
-2. PC 到设备：{"type":"hello_ok","protocol":2,"bridge":"CodexBridge","version":"<x.y.z>","capabilities":["<生效能力集合>"]}
-3. 设备到 PC：{"type":"bridge_auth","token":"<令牌>"}
-4. PC 到设备：{"type":"bridge_auth_ok","device_id":"<分配或确认的ID>"}
+握手只有一条状态机：
 
-两条来源，取决于设备有没有配网入口：
+1. PC 主动连接设备的 TCP 8765。
+2. PC 到设备：`{"type":"bridge_auth","token":"<令牌>"}`。
+3. 设备校验令牌并返回：`{"type":"bridge_auth_ok","device_id":"<稳定ID>","model":"<型号>","name":"<名称>","firmware":"<固件版本>","capabilities":[...]}`。
+4. PC 到设备：`{"type":"bridge_ready","bridge":"CodexBridge","version":"<PC程序版本>","capabilities":["<生效能力集合>"]}`。
+5. 收到 `bridge_ready` 后，会话进入在线状态。
 
-- AI Passport：没有 BLE 配网通道，沿用现有 CodexBridge 的 TOFU，接受首个合法令牌并持久保存，之后必须严格匹配。
-- Dotii：有 BLE 配网通道，由管理中心在配网时预置令牌（见第 9 节），设备端按严格匹配处理，不走 TOFU。
+令牌为空且设备支持首次信任配对的型号，可以接受第一个合法令牌并持久保存；这只是一种设备端配对策略，不是第二套协议。Dotii 由管理中心在配网时预置令牌，AI Passport 在固件迁移时实现同一字段和同一校验流程。
 
 ### 6.3 心跳与断线
 
-- PC 每 5 秒发 bridge_ready。
-- 设备 15 秒收不到任何消息即判定掉线，重连后重新走握手。
-- PC 侧每台设备有独立会话与重连退避，一台设备的抖动不影响其他设备。
+- PC 每 5 秒发送 `bridge_ready`；首次 `bridge_ready` 同时完成能力授予。
+- 设备 15 秒未收到任何 PC 消息即判定离线，断线后重新执行同一握手。
+- PC 侧每台设备有独立会话和重连退避，一台设备抖动不影响其他设备。
 
 ### 6.4 消息
 
-PC 到设备（星号为 v2 新增）：
+PC 到设备：
 
 | 类型 | 用途 |
 | --- | --- |
-| task_status | 任务状态变化（沿用） |
-| done / text / error | 结果、正文、错误（沿用） |
-| approval | 等待用户审批（沿用，仅 approval 能力） |
-| codex_catalog_begin/item/end、codex_selected | 任务目录与选择（沿用） |
-| speech_start/chunk/end | 语音播放（沿用，仅 audio 能力） |
-| message | 归一后的消息：message_id、thread_id、kind、status、title、body、seq、total、created_at |
-| read_state | 已读广播：message_id、read_by[]、read_at |
+| `bridge_ready` | 握手完成与心跳，首次带生效能力 |
+| `capabilities_update` | 运行时更新该设备允许使用的能力 |
+| `message` | 归一消息：`message_id`、`thread_id`、`kind`、`status`、`title`、`body`、`seq`、`total`、`created_at` |
+| `read_state` | 已读广播：`message_id`、`read_by[]`、`read_at` |
+| `error` | 设备发起了未授予能力的事件 |
 
-设备到 PC（星号为 v2 新增）：
+设备到 PC：
 
 | 类型 | 用途 |
 | --- | --- |
-| voice_command / approval_decision / cancel_task | 沿用 |
-| record_start / audio_chunk / record_stop / record_cancel | 沿用 |
-| codex_catalog_request / codex_project_select / codex_thread_select / codex_thread_new | 沿用 |
-| read_ack | 上报某条消息已读：message_id |
+| `read_ack` | 上报 `message_id` 已读 |
+| `cancel_task` | 取消当前任务 |
+| `approval_decision` | 提交审批决定 |
+| `voice_command` | 提交语音命令 |
+| `audio_chunk` | 上传语音数据 |
+
+未知消息类型必须忽略，不能断开会话。后续只能增加可选字段或新消息类型，不得在同一协议内建立另一套握手。
 
 ### 6.5 能力协商
 
-- 设备在 hello 里声明 capabilities，例如 Dotii 用 ["status","text","read_ack"]，AI Passport 用 ["status","text","audio","approval"]。
-- PC 只推设备声明支持的类型；message 与 read_state 是所有设备都有的基础能力。
-- 未知消息类型必须被接收方忽略，不能中断会话。
+- 设备在 `bridge_auth_ok.capabilities` 中声明自己实际支持的能力。
+- PC 计算 `supported ∩ enabled`，通过首次 `bridge_ready.capabilities` 返回生效能力。
+- Dotii 默认开启 `status`、`text`、`tasks`、`results`、`read_ack`；AI Passport 默认只开启 `status`、`text`、`read_ack`。
+- PC 只下发设备声明且已经授权的数据；设备上报未授权事件时，PC 返回 `error`。
+- 未知能力一律丢弃，不写入设备配置。
 
 ### 6.6 长文本
 
-- 沿用分片（每片 480 字节），message 带 seq 与 total。
-- 设备侧按消息拼接，上限 4 KB；超长截断并保留尾部提示。
+- `message.body` 每片最多 480 字节，消息带 `seq` 与 `total`。
+- 设备侧按消息拼接，保留上限 4 KB；超长时截断并给出尾部提示。
 
-### 6.7 版本兼容
+### 6.7 协议演进
 
-- protocol = 2 走 v2；无 protocol 字段按 v1 处理，v1 的全部消息类型与语义保持不变。
-- 新字段一律可选，旧固件忽略即可；不兼容变更必须抬 protocol 版本号。
-
-### 6.8 能力授予与运行时变更
-
-- hello_ok 返回生效能力集合（supported 与 enabled 的交集，见第 7 节）。
-- 用户在托盘改开关后，PC 立即下发 capabilities_update（带 enabled 数组），设备据此显示或隐藏页面与菜单，不需要重连。
-- 设备收到与未授予能力相关的消息必须忽略；设备发起未授予能力的事件时，PC 回 error 并且不驱动 Codex。
-- 关闭能力不删除已收到的历史消息，只停止后续下发。
+- 同一协议永远使用同一握手和同一消息语义。
+- 新能力通过能力清单增加，不能通过增加协议分支实现。
+- 新字段必须可选；不兼容的字段变化在设备固件、CodexBridge 和测试中一次性同步完成。
 
 ## 7. 能力与权限模型（可插拔）
 
 需求原话：每台设备能看到什么、能用什么都要可配置；AI Passport 因为性能限制，默认只开很少的能力。因此能力不写死在协议里，而是按设备配置的插件。
 
-- 能力清单（feature id）：codex_status、codex_tasks、codex_results、codex_approval、voice_command、audio_playback、read_sync、word_bear 等，最终清单在实现计划里定稿。
-- 两层来源：设备在 hello 里声明 supported（它固件支持的）；CodexBridge 保存每台设备的 enabled（用户允许的）。生效能力等于 supported 与 enabled 的交集，只有生效能力对应的消息才会推给这台设备。
-- 型号默认模板：按 model 保存一份默认 enabled，新设备首次配对时套用。AI Passport 默认只开最小集合（状态、结果、已读）；Dotii 默认开状态、任务、结果、已读。
+- 能力清单（feature id）：`status`、`text`、`tasks`、`results`、`approval`、`audio`、`read_ack`、`voice`、`word_bear`。
+- 两层来源：设备在 `bridge_auth_ok` 中声明 supported（它固件支持的）；CodexBridge 保存每台设备的 enabled（用户允许的）。生效能力等于 supported 与 enabled 的交集，只有生效能力对应的消息才会推给这台设备。
+- 型号默认模板：按 model 保存一份默认 enabled，新设备首次配对时套用。AI Passport 默认只开最小集合 `status`、`text`、`read_ack`；Dotii 默认开 `status`、`text`、`tasks`、`results`、`read_ack`。
 - 运行时变更：用户在托盘改开关后立即下发 capabilities_update，设备据此显示或隐藏页面与菜单，不需要重连。
 - 能力与权限分开：能力是这台设备能不能做，权限是允不允许做。被关掉的能力既不下发数据，也不接受它发起的事件，PC 回 error。
 - 默认保守：没有模板的新型号只开最小集合；未知能力一律不下发。
@@ -155,7 +153,7 @@ PC 到设备（星号为 v2 新增）：
 
 | 文件 | 改动 |
 | --- | --- |
-| main/codex_bridge_client.c/.h（新增） | UDP 发现应答、TCP 服务端、hello 与 auth、行 JSON 解析、心跳、断线重连、read_ack 上报 |
+| main/codex_bridge_client.c/.h（新增） | UDP 发现应答、TCP 服务端、bridge_auth 与 bridge_auth_ok、行 JSON 解析、心跳、断线重连、read_ack 上报 |
 | main/connectivity.c | Codex 字段改由新客户端填充；HTTP 轮询继续填 Bambu、自定义页、显示设置 |
 | main/state_ui.c | 详情页停留 2 秒触发已读上报；完成/失败表情由 Codex 状态本地推导 |
 | main/device_config.c、main/ble_bridge.c | 新增 codex_bridge_token；管理中心的 URL 与令牌保持不动 |
@@ -170,9 +168,11 @@ PC 到设备（星号为 v2 新增）：
 
 ## 10. AI Passport 侧改造（最小）
 
-- 固件：用户按 OK 离开某条消息时发送 {"type":"read_ack","message_id":"..."}。
-- 固件：确认未知消息类型被忽略，保证 v2 新消息不会打断 v1 逻辑。
-- 其余不动：语音、审批、单词熊、界面、配网。
+- 固件：发现常量改为 `CODEXBRIDGE_DISCOVER`，应答补充稳定的 `device_id`、`name` 和 `capabilities`。
+- 固件：`bridge_auth_ok` 补充 `device_id`、`model`、`name`、`firmware`、`capabilities`。
+- 固件：接收并保存首次 `bridge_ready.capabilities`，用户按 OK 离开消息时发送 `read_ack`。
+- 固件：未知消息类型只忽略，不断开会话。
+- 其余不动：语音、审批、单词熊、界面、配网入口。
 
 ## 11. 托盘与管理界面
 
@@ -187,10 +187,10 @@ CodexBridge 托盘右键菜单：
 
 CodexBridge 本机管理接口（仅 127.0.0.1）：
 
-- GET /api/v1/admin/devices：设备列表与状态。
-- POST /api/v1/admin/devices/remove：移除设备。
-- GET /api/v1/admin/pairing：给管理中心的配网流程取配对令牌。
-- GET /api/v1/admin/status：版本与健康状态。
+- GET /api/admin/devices：设备列表与状态。
+- POST /api/admin/devices/remove：移除设备。
+- GET /api/admin/pairing：给管理中心的配网流程取配对令牌。
+- GET /api/admin/status：版本与健康状态。
 
 ## 12. 存储与路径
 
@@ -205,21 +205,22 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 - 所有字符串、数组、分片都有长度上限；日志不写令牌。
 - 8765 只用于局域网，不暴露到公网。
 
-## 14. 兼容与迁移
+## 14. 迁移
 
-- 未升级的 Dotii 固件继续只连管理中心：Codex 显示为空或离线，不报错。
-- 已刷机的 AI Passport 走 v1 分支，零改动。
-- 回滚路径：CodexBridge 保留 v1 代码路径，必要时可退回现有 FoloOS bridge 行为。
+- CodexBridge 不做设备协议兼容分支；接入前，Dotii 与 AI Passport 都必须支持第 6 节这一套协议。
+- AI Passport 做一次固件迁移后直接进入唯一协议，不保留旧握手运行路径。
+- 旧 `%LOCALAPPDATA%\FoloOS\bridge.json` 只迁移 host、port、token 数据，不迁移旧协议行为。
+- 未升级的 Dotii 固件继续只连管理中心，Codex 区域显示为空或离线；这不是 CodexBridge 的第二套协议。
 
 ## 15. 测试与验收
 
 单元测试：
 
-- 协议编解码与分片、能力过滤（supported 与 enabled 的交集、运行时变更、越权事件被拒）、消息归一、已读广播、令牌校验与 TOFU、长度上限。
+- 唯一握手状态机、协议编解码与分片、能力过滤（supported 与 enabled 的交集、运行时变更、越权事件被拒）、消息归一、已读广播、令牌校验、长度上限。
 
 集成测试：
 
-- 假设备（分别模拟 Dotii 与 AI Passport）跑通发现、握手、消息、已读全链路。
+- Dotii 与 AI Passport 假设备使用同一发现、握手、消息与已读状态机跑通全链路。
 - 两台设备同时在线的广播与已读同步。
 
 真机验收：
@@ -233,7 +234,7 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 
 | 阶段 | 内容 | 产出 |
 | --- | --- | --- |
-| M1 | 新仓库骨架、协议核心、设备注册表、托盘设备列表 | 不依赖设备改动的可运行宿主 |
+| M1 | 新仓库骨架、唯一协议核心、设备注册表、托盘设备列表 | 可运行宿主，协议不包含版本分支 |
 | M2 | Dotii 固件客户端、双数据源合并、管理中心去掉 Codex | 设备能从 CodexBridge 拿 Codex 数据 |
 | M3 | 统一消息与已读、AI Passport read_ack | 多设备已读同步 |
 | M4 | 单托盘打包、管理中心子进程、配置迁移 | 一个 EXE、一个托盘 |
@@ -243,6 +244,7 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 
 - Dotii 固件新增 TCP 服务端并维护双数据源，内存、栈和断线重连是主要风险点。
 - 双令牌的配网流程改动面较大，需要真机验证。
+- AI Passport 只能在一次固件更新中迁入唯一协议；迁移前不能与 CodexBridge 建立设备会话。
 - FoloOS 是社区衍生项目，搬运其 bridge 代码必须保留许可证与出处说明。
 - 多台同型号设备依赖稳定的 device_id（建议由 MAC 派生）。
 - 发现机制依赖广播；启用访客网络隔离或热点客户端隔离时，需要手动添加 IP 兜底。
