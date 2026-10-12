@@ -41,16 +41,7 @@ class BridgeHub:
             capability = KIND_CAPABILITY.get(record.kind)
             if capability is None:
                 return
-            payload = {
-                "type": "message",
-                "message_id": record.message_id,
-                "thread_id": record.thread_id,
-                "kind": record.kind,
-                "status": record.status,
-                "title": record.title,
-                "body": record.body,
-                "created_at": record.created_at,
-            }
+            payload = {"type": "message", **self._message_payload(record)}
             self._broadcast(payload, capability)
 
     def attach(self, device_id: str, session: Any) -> None:
@@ -180,7 +171,7 @@ class BridgeHub:
 
     @staticmethod
     def _message_payload(record: MessageRecord) -> dict:
-        return {
+        payload = {
             "message_id": record.message_id,
             "thread_id": record.thread_id,
             "kind": record.kind,
@@ -189,3 +180,6 @@ class BridgeHub:
             "body": record.body,
             "created_at": record.created_at,
         }
+        if isinstance(record.data, dict):
+            payload["data"] = record.data
+        return payload

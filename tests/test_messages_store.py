@@ -41,3 +41,22 @@ class MessageStoreTest(unittest.TestCase):
         store.mark_read("m1", "d1")
         store.add(MessageRecord("m1", "t1", "result", "completed", "t", "b", 0.0))
         self.assertEqual(store.read_by("m1"), {"d1"})
+
+    def test_message_data_survives_replacement_and_payload(self):
+        store = MessageStore()
+        store.add(
+            MessageRecord(
+                "m1",
+                "t1",
+                "status",
+                "working",
+                "标题",
+                "正文",
+                1.0,
+                data={"codex": {"task": {"status": "working"}}},
+            )
+        )
+        self.assertEqual(
+            store.get("m1").data["codex"]["task"]["status"],
+            "working",
+        )

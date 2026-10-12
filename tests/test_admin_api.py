@@ -110,3 +110,24 @@ class AdminApiTest(unittest.TestCase):
             self.registry,
         )
         self.assertEqual(status, 404)
+
+    def test_codex_status_reports_collector_state(self):
+        status = {
+            "enabled": True,
+            "collector_state": "online",
+            "collector_detail": "数据采集正常",
+            "last_snapshot_epoch": 123,
+        }
+        code, payload = handle_request(
+            "GET",
+            "/api/admin/codex-status",
+            {},
+            b"",
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            codex_status=lambda: status,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["codex"], status)
+        self.assertTrue(payload["ok"])

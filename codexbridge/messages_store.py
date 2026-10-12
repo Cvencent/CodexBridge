@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Any
 
 KIND_CAPABILITY: dict[str, str] = {
     "status": "status",
@@ -20,6 +21,7 @@ class MessageRecord:
     title: str
     body: str
     created_at: float
+    data: dict[str, Any] | None = None
     read_by: set[str] = field(default_factory=set)
 
 
@@ -34,6 +36,8 @@ class MessageStore:
         existing = self._messages.get(record.message_id)
         if existing is not None:
             record.read_by.update(existing.read_by)
+            if record.data is None:
+                record.data = existing.data
             del self._messages[record.message_id]
         self._messages[record.message_id] = record
         while len(self._messages) > self.max_messages:

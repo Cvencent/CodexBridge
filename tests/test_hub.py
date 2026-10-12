@@ -72,3 +72,18 @@ class HubTest(unittest.TestCase):
         )
         state = self.hub.state_for("d1")
         self.assertEqual([message["message_id"] for message in state["messages"]], ["m1"])
+
+    def test_structured_data_is_sent_only_to_capable_devices(self):
+        record = MessageRecord(
+            "m-data",
+            "t1",
+            "result",
+            "completed",
+            "标题",
+            "正文",
+            1.0,
+            data={"codex": {"task": {"status": "working"}}},
+        )
+        self.hub.publish(record)
+        self.assertEqual(self.s1.sent[-1]["data"], record.data)
+        self.assertEqual(self.s2.sent, [])

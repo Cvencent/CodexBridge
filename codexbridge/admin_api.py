@@ -23,6 +23,7 @@ def handle_request(
     hub: BridgeHub,
     registry: DeviceRegistry,
     on_device_removed: Callable[[str], None] | None = None,
+    codex_status: Callable[[], dict] | None = None,
 ) -> tuple[int, dict]:
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -35,6 +36,9 @@ def handle_request(
                 "version": VERSION,
                 "device_count": len(registry._devices),
             }
+        if method == "GET" and path == "/api/admin/codex-status":
+            status = codex_status() if codex_status is not None else {}
+            return 200, {"ok": True, "codex": status}
         if method == "GET" and path == "/api/admin/devices":
             return 200, {
                 "ok": True,
@@ -131,12 +135,14 @@ class AdminApi:
         host: str = "127.0.0.1",
         port: int = 8788,
         on_device_removed: Callable[[str], None] | None = None,
+        codex_status: Callable[[], dict] | None = None,
     ):
         self.hub = hub
         self.registry = registry
         self.host = host
         self.port = port
         self.on_device_removed = on_device_removed
+        self.codex_status = codex_status
         self._server: _AdminServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -188,6 +194,7 @@ class AdminApi:
                             api.hub,
                             api.registry,
                             api.on_device_removed,
+                            api.codex_status,
                         )
                 encoded = json.dumps(
                     payload,
