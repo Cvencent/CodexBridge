@@ -5,18 +5,26 @@ from tests.fake_device import FakeDevice
 
 
 class SessionTest(unittest.TestCase):
-    def test_handshake_and_heartbeat(self):
+    def test_unified_handshake_and_heartbeat(self):
+        seen = []
         with FakeDevice() as device:
             device.expect_handshake("abcdefghijklmnop")
             session = DeviceSession(
                 device.host,
                 device.port,
                 "abcdefghijklmnop",
+                device_id="fake-device",
+                on_device_info=lambda info: (
+                    seen.append(info) or {"status", "text"}
+                ),
                 heartbeat_seconds=0.2,
                 timeout_seconds=1.0,
             )
             session.run_once()
-            self.assertTrue(any(m["type"] == "bridge_ready" for m in device.received))
+        self.assertEqual(device.received[0]["type"], "bridge_auth")
+        self.assertEqual(device.received[1]["type"], "bridge_ready")
+        self.assertEqual(device.received[1]["capabilities"], ["status", "text"])
+        self.assertEqual(seen[0]["device_id"], "fake-device")
 
     def test_device_event_reaches_callback(self):
         seen = []
@@ -29,6 +37,7 @@ class SessionTest(unittest.TestCase):
                 device.host,
                 device.port,
                 "abcdefghijklmnop",
+                device_id="fake-device",
                 on_event=seen.append,
                 heartbeat_seconds=0.2,
                 timeout_seconds=1.0,
@@ -45,6 +54,7 @@ class SessionTest(unittest.TestCase):
                 device.host,
                 device.port,
                 "abcdefghijklmnop",
+                device_id="fake-device",
                 on_offline=lambda: states.append("offline"),
                 heartbeat_seconds=0.1,
                 timeout_seconds=0.5,
@@ -65,6 +75,7 @@ class SessionTest(unittest.TestCase):
                 device.host,
                 device.port,
                 "abcdefghijklmnop",
+                device_id="fake-device",
                 on_event=seen.append,
                 heartbeat_seconds=0.2,
                 timeout_seconds=1.0,
@@ -72,17 +83,35 @@ class SessionTest(unittest.TestCase):
             session.run_once()
         self.assertEqual(seen[0]["message_id"], "m1")
 
-    def test_v1_authenticates_without_waiting_for_hello(self):
-        with FakeDevice(protocol=1) as device:
+    def test_identity_mismatch_is_rejected(self):
+        online = []
+        with FakeDevice() as device:
             device.expect_handshake("abcdefghijklmnop")
             session = DeviceSession(
                 device.host,
                 device.port,
                 "abcdefghijklmnop",
-                protocol=1,
+                device_id="another-id",
+                on_online=lambda: online.append(True),
                 heartbeat_seconds=0.2,
                 timeout_seconds=1.0,
             )
             session.run_once()
+        self.assertEqual(online, [])
+
+    def test_token_mismatch_does_not_go_online(self):
+        online = []
+        with FakeDevice() as device:
+            device.expect_handshake("abcdefghijklmnop")
+            session = DeviceSession(
+                device.host,
+                device.port,
+                "wrong-token-abcdef",
+                device_id="fake-device",
+                on_online=lambda: online.append(True),
+                heartbeat_seconds=0.2,
+                timeout_seconds=1.0,
+            )
+            session.run_once()
+        self.assertEqual(online, [])
         self.assertEqual(device.received[0]["type"], "bridge_auth")
-        self.assertFalse(any(message["type"] == "hello_ok" for message in device.received))

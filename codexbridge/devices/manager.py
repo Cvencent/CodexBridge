@@ -78,10 +78,11 @@ class DeviceManager:
             result.host,
             result.port,
             record.token,
-            protocol=2,
             device_id=result.device_id,
-            capabilities=self.hub.capabilities_for(result.device_id),
-            on_hello=lambda hello: self._handle_hello(result.device_id, hello),
+            on_device_info=lambda info: self._handle_device_info(
+                result.device_id,
+                info,
+            ),
             on_event=lambda event: self.hub.handle_device_event(result.device_id, event),
             on_online=lambda: self._online(result.device_id, session),
             on_offline=lambda: self._offline(result.device_id, session),
@@ -107,13 +108,13 @@ class DeviceManager:
         finally:
             self._offline(device_id, session)
 
-    def _handle_hello(self, device_id: str, hello: dict) -> set[str]:
+    def _handle_device_info(self, device_id: str, info: dict) -> set[str]:
         record = self.registry.get(device_id)
         if record is None:
             return set()
-        model = hello.get("model")
-        name = hello.get("name")
-        capabilities = hello.get("capabilities")
+        model = info.get("model")
+        name = info.get("name")
+        capabilities = info.get("capabilities")
         self.registry.upsert(
             device_id,
             model=model if isinstance(model, str) and model else record.model,

@@ -4,7 +4,6 @@ import select
 import socket
 import threading
 import time
-import hmac
 from collections.abc import Callable, Iterable
 
 from codexbridge import VERSION
@@ -18,18 +17,18 @@ class DeviceSession:
         port: int,
         token: str,
         *,
-        protocol: int = 2,
-        device_id: str | None = None,
+        device_id: str,
         on_event: Callable[[dict], None] | None = None,
-        on_hello: Callable[[dict], Iterable[str]] | None = None,
+        on_device_info: Callable[[dict], Iterable[str]] | None = None,
         on_online: Callable[[], None] | None = None,
         on_offline: Callable[[], None] | None = None,
-        capabilities: Iterable[str] = (),
         heartbeat_seconds: float = 5.0,
         timeout_seconds: float = 15.0,
     ):
         if len(token) < 16:
             raise ValueError("token must be at least 16 characters")
+        if not device_id:
+            raise ValueError("device_id must not be empty")
         if heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds must be positive")
         if timeout_seconds <= 0:
@@ -38,13 +37,12 @@ class DeviceSession:
         self.host = host
         self.port = port
         self.token = token
-        self.protocol = protocol
         self.device_id = device_id
         self.on_event = on_event
-        self.on_hello = on_hello
+        self.on_device_info = on_device_info
         self.on_online = on_online
         self.on_offline = on_offline
-        self.capabilities = set(capabilities)
+        self._active_capabilities: set[str] = set()
         self.heartbeat_seconds = heartbeat_seconds
         self.timeout_seconds = timeout_seconds
         self._socket: socket.socket | None = None
@@ -79,72 +77,22 @@ class DeviceSession:
             with self._send_lock:
                 self._socket = sock
 
-            if self.protocol >= 2:
-                hello, closed = self._next_message(
-                    sock,
-                    buffer,
-                    time.monotonic() + self.timeout_seconds,
-                )
-                if closed or hello is None or hello.get("type") != "hello":
-                    return
-                hello_device_id = hello.get("device_id")
-                if (
-                    self.device_id
-                    and hello_device_id
-                    and hello_device_id != self.device_id
-                ):
-                    return
-                negotiated = (
-                    set(self.on_hello(hello))
-                    if self.on_hello is not None
-                    else set(self.capabilities)
-                )
-                assigned_id = hello_device_id or self.device_id or ""
-                self.send(
-                    {
-                        "type": "hello_ok",
-                        "protocol": 2,
-                        "bridge": "CodexBridge",
-                        "version": VERSION,
-                        "capabilities": sorted(negotiated),
-                    }
-                )
-                authentication, closed = self._next_message(
-                    sock,
-                    buffer,
-                    time.monotonic() + self.timeout_seconds,
-                )
-                if (
-                    closed
-                    or authentication is None
-                    or authentication.get("type") != "bridge_auth"
-                ):
-                    return
-                supplied_token = authentication.get("token")
-                if not isinstance(supplied_token, str) or not hmac.compare_digest(
-                    supplied_token,
-                    self.token,
-                ):
-                    return
-                self.send(
-                    {
-                        "type": "bridge_auth_ok",
-                        "device_id": assigned_id,
-                    }
-                )
-            else:
-                self.send({"type": "bridge_auth", "token": self.token})
-                reply, closed = self._next_message(
-                    sock,
-                    buffer,
-                    time.monotonic() + self.timeout_seconds,
-                )
-                if (
-                    closed
-                    or reply is None
-                    or reply.get("type") != "bridge_auth_ok"
-                ):
-                    return
+            self.send({"type": "bridge_auth", "token": self.token})
+            reply, closed = self._next_message(
+                sock,
+                buffer,
+                time.monotonic() + self.timeout_seconds,
+            )
+            if closed or reply is None or reply.get("type") != "bridge_auth_ok":
+                return
+            if reply.get("device_id") != self.device_id:
+                return
+            self._active_capabilities = (
+                set(self.on_device_info(reply))
+                if self.on_device_info is not None
+                else set()
+            )
+            self.send(self._ready_message(self._active_capabilities))
 
             online = True
             if self.on_online is not None:
@@ -161,7 +109,7 @@ class DeviceSession:
                     return
                 if now >= next_heartbeat:
                     try:
-                        self.send({"type": "bridge_ready"})
+                        self.send(self._ready_message(self._active_capabilities))
                     except OSError:
                         return
                     next_heartbeat = now + self.heartbeat_seconds
@@ -197,6 +145,15 @@ class DeviceSession:
                 self._socket = None
             if online and self.on_offline is not None:
                 self.on_offline()
+
+    @staticmethod
+    def _ready_message(capabilities: Iterable[str]) -> dict:
+        return {
+            "type": "bridge_ready",
+            "bridge": "CodexBridge",
+            "version": VERSION,
+            "capabilities": sorted(capabilities),
+        }
 
     @staticmethod
     def _drain_buffer(

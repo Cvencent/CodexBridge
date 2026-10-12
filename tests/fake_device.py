@@ -5,7 +5,6 @@ import threading
 import time
 from collections.abc import Callable
 
-from codexbridge import VERSION
 from codexbridge.protocol.messages import decode, encode
 
 
@@ -23,8 +22,7 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
         device = self.server.device
         buffer = bytearray()
         authenticated = False
-        if device.protocol == 2:
-            self.request.sendall(encode(device._hello_message()))
+        announced = False
 
         while not device._stopped.is_set():
             try:
@@ -44,35 +42,26 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
                 device._append_received(message)
 
                 message_type = message.get("type")
-                if message_type == "hello_ok" and device.protocol == 2:
-                    if message.get("protocol") != 2:
-                        return
-                    self.request.sendall(
-                        encode({"type": "bridge_auth", "token": device._expected_token})
-                    )
-                elif message_type == "bridge_auth_ok" and device.protocol == 2:
-                    authenticated = True
-                    with device._connection_lock:
-                        device._connection = self.request
-                    device._run_after_handshake()
-                elif message_type == "bridge_auth":
+                if message_type == "bridge_auth":
                     if message.get("token") != device._expected_token:
                         return
-                    self.request.sendall(encode({"type": "bridge_auth_ok"}))
+                    self.request.sendall(encode({"type": "bridge_auth_ok", **device._device_info()}))
                     authenticated = True
                     with device._connection_lock:
                         device._connection = self.request
-                    device._run_after_handshake()
                 elif message_type == "bridge_ready" and authenticated:
+                    if not announced:
+                        announced = True
+                        device._run_after_handshake()
                     if device._stalled:
                         continue
                     return
 
 
 class FakeDevice:
-    def __init__(self, host: str = "127.0.0.1", protocol: int = 2):
+    def __init__(self, host: str = "127.0.0.1", device_id: str = "fake-device"):
         self.host = host
-        self.protocol = protocol
+        self.device_id = device_id
         self._expected_token: str | None = None
         self._stalled = False
         self._callbacks: list[Callable[[], None]] = []
@@ -141,11 +130,9 @@ class FakeDevice:
         for callback in tuple(self._callbacks):
             callback()
 
-    def _hello_message(self) -> dict:
+    def _device_info(self) -> dict:
         return {
-            "type": "hello",
-            "protocol": 2,
-            "device_id": "fake-device",
+            "device_id": self.device_id,
             "model": "dotii",
             "name": "Fake Device",
             "firmware": "test",
