@@ -157,6 +157,8 @@ class DeviceRegistry:
                 self._devices[device_id] = record
                 return record
 
+            previous_model = record.model
+            previous_enabled = set(record.enabled)
             record.model = model
             if name is not None:
                 record.name = name
@@ -164,6 +166,14 @@ class DeviceRegistry:
                 record.token = token
             if supported is not None:
                 record.supported = normalize(supported)
+            if (
+                previous_model == "unknown"
+                and model != "unknown"
+                and previous_enabled == default_for(previous_model)
+            ):
+                record.enabled = default_for(model) & (
+                    record.supported | set(MINIMAL)
+                )
             return record
 
     def remove(self, device_id: str) -> bool:

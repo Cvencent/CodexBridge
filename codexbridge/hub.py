@@ -86,21 +86,30 @@ class BridgeHub:
         return effective(record.supported, record.enabled)
 
     def state_for(self, device_id: str) -> dict:
-        capabilities = self.capabilities_for(device_id)
-        pending = self.store.pending_for(device_id, capabilities)
-        visible = self.store.pending_for(device_id, capabilities, unread_only=False)
-        read_state = [
-            {
-                "message_id": record.message_id,
-                "read_by": sorted(record.read_by),
+        with self._lock:
+            capabilities = self.capabilities_for(device_id)
+            pending = self.store.pending_for(device_id, capabilities)
+            visible = self.store.pending_for(
+                device_id,
+                capabilities,
+                unread_only=False,
+            )
+            read_state = (
+                [
+                    {
+                        "message_id": record.message_id,
+                        "read_by": sorted(record.read_by),
+                    }
+                    for record in visible
+                    if record.read_by
+                ]
+                if "read_ack" in capabilities
+                else []
+            )
+            return {
+                "messages": [self._message_payload(record) for record in pending],
+                "read_state": read_state,
             }
-            for record in visible
-            if record.read_by
-        ]
-        return {
-            "messages": [self._message_payload(record) for record in pending],
-            "read_state": read_state,
-        }
 
     def push_capabilities(self, device_id: str) -> None:
         capabilities = sorted(self.capabilities_for(device_id))
@@ -121,24 +130,27 @@ class BridgeHub:
             self._send(device_id, {"type": "read_state", **read_state})
 
     def _handle_read_ack(self, device_id: str, event: dict) -> None:
-        if "read_ack" not in self.capabilities_for(device_id):
-            self._send_error(device_id, "capability_not_enabled")
-            return
-        message_id = event.get("message_id")
-        if not isinstance(message_id, str):
-            return
-        record = self.store.mark_read(message_id, device_id)
-        if record is None:
-            return
-        payload = {
-            "type": "read_state",
-            "message_id": record.message_id,
-            "read_by": sorted(record.read_by),
-            "read_at": time.time(),
-        }
         with self._lock:
+            if "read_ack" not in self.capabilities_for(device_id):
+                self._send_error(device_id, "capability_not_enabled")
+                return
+            message_id = event.get("message_id")
+            if not isinstance(message_id, str):
+                return
+            record = self.store.mark_read(message_id, device_id)
+            if record is None:
+                return
+            payload = {
+                "type": "read_state",
+                "message_id": record.message_id,
+                "read_by": sorted(record.read_by),
+                "read_at": time.time(),
+            }
             for other_id, session in self._sessions.items():
-                if other_id != device_id:
+                if (
+                    other_id != device_id
+                    and "read_ack" in self.capabilities_for(other_id)
+                ):
                     self._send_to(session, payload)
 
     def _broadcast(self, payload: dict, capability: str) -> None:

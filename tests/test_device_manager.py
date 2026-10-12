@@ -120,6 +120,29 @@ class DeviceManagerTest(unittest.TestCase):
         self.assertTrue(FakeSession.online.wait(1.0))
         self.assertEqual(self.registry.get("d1").name, "Desk From Discovery")
 
+    def test_legacy_record_migrates_token_to_discovered_device_id(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        legacy = Path(tmp.name) / "bridge.json"
+        legacy.write_text(
+            '{"host":"127.0.0.1","port":8765,"token":"legacy-token-abcdef"}',
+            encoding="utf-8",
+        )
+        self.registry.migrate_legacy(legacy)
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="FoloOS-AI-Passport",
+            device_id="passport-device",
+            name="Passport",
+            port=8765,
+            capabilities=["status", "text", "read_ack"],
+        )
+        self.manager.sync([result])
+        self.assertTrue(FakeSession.online.wait(1.0))
+        record = self.registry.get("passport-device")
+        self.assertEqual(record.token, "legacy-token-abcdef")
+        self.assertIsNone(self.registry.get("legacy:127.0.0.1"))
+
     def test_failed_session_is_removed_and_can_retry(self):
         result = DiscoveryResult(
             host="127.0.0.1",

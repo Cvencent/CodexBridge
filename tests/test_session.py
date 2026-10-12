@@ -1,3 +1,5 @@
+import threading
+import time
 import unittest
 
 from codexbridge.devices.session import DeviceSession
@@ -45,7 +47,7 @@ class SessionTest(unittest.TestCase):
             session.run_once()
         self.assertEqual(seen[0]["message_id"], "m1")
 
-    def test_stalled_device_goes_offline(self):
+    def test_silent_device_stays_online_and_receives_heartbeats(self):
         states = []
         with FakeDevice() as device:
             device.expect_handshake("abcdefghijklmnop")
@@ -55,12 +57,36 @@ class SessionTest(unittest.TestCase):
                 device.port,
                 "abcdefghijklmnop",
                 device_id="fake-device",
+                on_online=lambda: states.append("online"),
                 on_offline=lambda: states.append("offline"),
-                heartbeat_seconds=0.1,
-                timeout_seconds=0.5,
+                heartbeat_seconds=0.05,
+                timeout_seconds=0.1,
             )
-            session.run_once()
-        self.assertIn("offline", states)
+            thread = threading.Thread(target=session.run_once)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    ready_count = sum(
+                        item.get("type") == "bridge_ready"
+                        for item in device.received
+                    )
+                    if ready_count >= 3:
+                        break
+                    time.sleep(0.01)
+                self.assertNotIn("offline", states)
+                self.assertGreaterEqual(
+                    sum(
+                        item.get("type") == "bridge_ready"
+                        for item in device.received
+                    ),
+                    3,
+                )
+            finally:
+                session.stop()
+                thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(states, ["online", "offline"])
 
     def test_line_split_across_packets_is_reassembled(self):
         seen = []

@@ -26,9 +26,15 @@ class HubTest(unittest.TestCase):
             model="FoloOS-AI-Passport",
             supported=["status", "text", "read_ack"],
         )
-        self.s1, self.s2 = FakeSession(), FakeSession()
+        self.hub.registry.upsert(
+            "d3",
+            model="dotii",
+            supported=["status"],
+        )
+        self.s1, self.s2, self.s3 = FakeSession(), FakeSession(), FakeSession()
         self.hub.attach("d1", self.s1)
         self.hub.attach("d2", self.s2)
+        self.hub.attach("d3", self.s3)
 
     def test_publish_only_reaches_capable_devices(self):
         self.hub.publish(
@@ -45,6 +51,16 @@ class HubTest(unittest.TestCase):
         self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
         self.assertEqual(self.s2.sent[-1]["type"], "read_state")
         self.assertEqual(self.s2.sent[-1]["read_by"], ["d1"])
+
+    def test_read_state_is_filtered_by_read_ack_capability(self):
+        self.hub.publish(
+            MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
+        )
+        self.s2.sent.clear()
+        self.s3.sent.clear()
+        self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
+        self.assertEqual(self.s2.sent[-1]["type"], "read_state")
+        self.assertEqual(self.s3.sent, [])
 
     def test_capability_less_event_is_rejected(self):
         self.hub.handle_device_event("d2", {"type": "voice_command", "text": "hi"})

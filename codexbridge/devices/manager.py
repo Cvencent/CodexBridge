@@ -59,12 +59,22 @@ class DeviceManager:
 
     def _sync_one(self, result: DiscoveryResult) -> None:
         supported = result.capabilities
+        legacy_id = f"legacy:{result.host}"
+        legacy = self.registry.get(legacy_id)
+        token = None
+        if legacy is not None:
+            existing = self.registry.get(result.device_id)
+            if existing is None or not existing.token:
+                token = legacy.token
         record = self.registry.upsert(
             result.device_id,
             model=result.device,
             name=result.name or result.device,
+            token=token,
             supported=supported,
         )
+        if legacy is not None and result.device_id != legacy_id:
+            self.registry.remove(legacy_id)
         record.last_seen = time.time()
         self.registry.save()
         if not record.token:

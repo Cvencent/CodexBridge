@@ -32,6 +32,19 @@ class RegistryTest(unittest.TestCase):
         self.assertGreaterEqual(len(first), 16)
         self.assertEqual(first, self.registry.mint_token("d1"))
 
+    def test_pairing_model_defaults_apply_after_discovery(self):
+        self.registry.mint_token("d1")
+        record = self.registry.upsert(
+            "d1",
+            model="dotii",
+            name="Desk",
+            supported=["status", "text", "tasks", "results", "read_ack"],
+        )
+        self.assertEqual(
+            record.enabled,
+            {"status", "text", "tasks", "results", "read_ack"},
+        )
+
     def test_migrate_legacy_bridge_json(self):
         legacy = Path(self.tmp.name) / "bridge.json"
         legacy.write_text(json.dumps({"host": "192.168.1.23", "port": 8765, "token": "abcdefghijklmnop"}))

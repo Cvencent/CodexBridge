@@ -74,6 +74,7 @@ class DeviceSession:
                 (self.host, self.port),
                 timeout=self.timeout_seconds,
             )
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             with self._send_lock:
                 self._socket = sock
 
@@ -105,8 +106,6 @@ class DeviceSession:
                     return
                 self._drain_buffer(buffer, self.on_event)
                 now = time.monotonic()
-                if now - last_received >= self.timeout_seconds:
-                    return
                 if now >= next_heartbeat:
                     try:
                         self.send(self._ready_message(self._active_capabilities))
@@ -114,15 +113,11 @@ class DeviceSession:
                         return
                     next_heartbeat = now + self.heartbeat_seconds
 
-                wait_until = min(
-                    next_heartbeat,
-                    last_received + self.timeout_seconds,
-                )
                 readable, _, _ = select.select(
                     [sock],
                     [],
                     [],
-                    max(0.0, wait_until - time.monotonic()),
+                    max(0.0, next_heartbeat - time.monotonic()),
                 )
                 if not readable:
                     continue
@@ -132,7 +127,6 @@ class DeviceSession:
                     return
                 if not payload:
                     return
-                last_received = time.monotonic()
                 buffer.extend(payload)
                 self._drain_buffer(buffer, self.on_event)
         finally:
