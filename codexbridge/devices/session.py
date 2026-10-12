@@ -97,6 +97,7 @@ class DeviceSession:
             last_received = time.monotonic()
             next_heartbeat = last_received + self.heartbeat_seconds
             while True:
+                self._drain_buffer(buffer, self.on_event)
                 now = time.monotonic()
                 if now - last_received >= self.timeout_seconds:
                     return
@@ -127,12 +128,7 @@ class DeviceSession:
                     return
                 last_received = time.monotonic()
                 buffer.extend(payload)
-                while b"\n" in buffer:
-                    line, _, remainder = buffer.partition(b"\n")
-                    buffer = bytearray(remainder)
-                    message = decode(bytes(line) + b"\n")
-                    if message is not None and self.on_event is not None:
-                        self.on_event(message)
+                self._drain_buffer(buffer, self.on_event)
         finally:
             if sock is not None:
                 try:
@@ -143,6 +139,19 @@ class DeviceSession:
                 self._socket = None
             if online and self.on_offline is not None:
                 self.on_offline()
+
+    @staticmethod
+    def _drain_buffer(
+        buffer: bytearray,
+        on_event: Callable[[dict], None] | None,
+    ) -> None:
+        while b"\n" in buffer:
+            line, _, remainder = buffer.partition(b"\n")
+            del buffer[:]
+            buffer.extend(remainder)
+            message = decode(bytes(line) + b"\n")
+            if message is not None and on_event is not None:
+                on_event(message)
 
     @staticmethod
     def _next_message(
