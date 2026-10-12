@@ -29,7 +29,7 @@
 
 - 新仓库 CodexBridge（本仓库）：PC 端全部内容。托盘、通用协议宿主、Codex 采集、统一消息与已读、管理中心后台（网页、Bambu、自定义页、配网、烧录）、打包与发布。
 - Dotii-Display：回归设备项目，保留固件、硬件资料和文档。bridge/ 下的管理中心代码迁移到本仓库；迁移完成后该仓库的便携包发布入口改为指向 CodexBridge 的 Release。
-- FoloOS AI Passport 社区仓库：只做设备固件的最小改动（见第 9 节）。
+- FoloOS AI Passport 社区仓库：只做设备固件的最小改动（见第 10 节）。
 
 迁移带来的取舍：Dotii-Display 不再自己发布 DotiiManagementCenter 便携包，它的 README 与下载入口改指 CodexBridge。这是有意的，避免两套 PC 端程序长期并存。
 
@@ -61,14 +61,14 @@ Dotii 固件是双数据源：Codex 从 CodexBridge 走，其余继续从管理�
 ### 6.2 握手
 
 1. 设备到 PC：{"type":"hello","protocol":2,"device_id":"...","model":"...","name":"...","firmware":"...","capabilities":[...]}
-2. PC 到设备：{"type":"hello_ok","protocol":2,"bridge":"CodexBridge","version":"<x.y.z>"}
+2. PC 到设备：{"type":"hello_ok","protocol":2,"bridge":"CodexBridge","version":"<x.y.z>","capabilities":["<生效能力集合>"]}
 3. 设备到 PC：{"type":"bridge_auth","token":"<令牌>"}
 4. PC 到设备：{"type":"bridge_auth_ok","device_id":"<分配或确认的ID>"}
 
 两条来源，取决于设备有没有配网入口：
 
 - AI Passport：没有 BLE 配网通道，沿用现有 CodexBridge 的 TOFU，接受首个合法令牌并持久保存，之后必须严格匹配。
-- Dotii：有 BLE 配网通道，由管理中心在配网时预置令牌（见第 8 节），设备端按严格匹配处理，不走 TOFU。
+- Dotii：有 BLE 配网通道，由管理中心在配网时预置令牌（见第 9 节），设备端按严格匹配处理，不走 TOFU。
 
 ### 6.3 心跳与断线
 
@@ -115,7 +115,27 @@ PC 到设备（星号为 v2 新增）：
 - protocol = 2 走 v2；无 protocol 字段按 v1 处理，v1 的全部消息类型与语义保持不变。
 - 新字段一律可选，旧固件忽略即可；不兼容变更必须抬 protocol 版本号。
 
-## 7. 统一消息与已读
+### 6.8 能力授予与运行时变更
+
+- hello_ok 返回生效能力集合（supported 与 enabled 的交集，见第 7 节）。
+- 用户在托盘改开关后，PC 立即下发 capabilities_update（带 enabled 数组），设备据此显示或隐藏页面与菜单，不需要重连。
+- 设备收到与未授予能力相关的消息必须忽略；设备发起未授予能力的事件时，PC 回 error 并且不驱动 Codex。
+- 关闭能力不删除已收到的历史消息，只停止后续下发。
+
+## 7. 能力与权限模型（可插拔）
+
+需求原话：每台设备能看到什么、能用什么都要可配置；AI Passport 因为性能限制，默认只开很少的能力。因此能力不写死在协议里，而是按设备配置的插件。
+
+- 能力清单（feature id）：codex_status、codex_tasks、codex_results、codex_approval、voice_command、audio_playback、read_sync、word_bear 等，最终清单在实现计划里定稿。
+- 两层来源：设备在 hello 里声明 supported（它固件支持的）；CodexBridge 保存每台设备的 enabled（用户允许的）。生效能力等于 supported 与 enabled 的交集，只有生效能力对应的消息才会推给这台设备。
+- 型号默认模板：按 model 保存一份默认 enabled，新设备首次配对时套用。AI Passport 默认只开最小集合（状态、结果、已读）；Dotii 默认开状态、任务、结果、已读。
+- 运行时变更：用户在托盘改开关后立即下发 capabilities_update，设备据此显示或隐藏页面与菜单，不需要重连。
+- 能力与权限分开：能力是这台设备能不能做，权限是允不允许做。被关掉的能力既不下发数据，也不接受它发起的事件，PC 回 error。
+- 默认保守：没有模板的新型号只开最小集合；未知能力一律不下发。
+- 与现有开关的关系：Dotii 管理中心的模块开关继续管 Bambu、自定义页与显示设置；Codex 相关开关搬到 CodexBridge，避免两处开关互相打架。
+- 配置入口：托盘右键的设备子菜单里逐项勾选，另有该型号默认值；同一份数据通过回环管理接口暴露，管理中心网页可以复用。
+
+## 8. 统一消息与已读
 
 - 归一：一个 Codex 任务或一条通知生成一条 message。message_id 由 thread_id 加任务内递增序号组成，跨设备稳定。
 - 广播：新消息推给所有在线设备，按能力过滤。
@@ -123,13 +143,13 @@ PC 到设备（星号为 v2 新增）：
 - 补发：设备重连后，PC 先推送未读消息与最新 read_state，避免重连后看不到别人已经读过的状态。
 - 不变量：已读是通知级的，按 message_id 记录；不依赖任何设备本地的页面计数或缓存。
 
-### 7.1 看过的定义
+### 8.1 看过的定义
 
 - Dotii：任务详情页停留满 2 秒即上报已读（阈值做成常量，便于真机调）。不加额外按键，避免和圆屏的翻页手势冲突。
 - AI Passport：用户在该条消息上按 OK 离开时上报已读。
 - 备选（仅记录，不实现）：Dotii 改为按 Button A 才算已读。
 
-## 8. Dotii 侧改造
+## 9. Dotii 侧改造
 
 固件（主要工作量，ESP-IDF / C）：
 
@@ -148,18 +168,19 @@ PC 到设备（星号为 v2 新增）：
 - BLE 配网增加两步：设备通过 BLE 上报自己的 device_id；管理中心据此向 CodexBridge 回环接口申领该设备的配对令牌，连同 Wi-Fi 信息一起下发。
 - 保留烧录、日志、运行目录与现有配置兼容性。
 
-## 9. AI Passport 侧改造（最小）
+## 10. AI Passport 侧改造（最小）
 
 - 固件：用户按 OK 离开某条消息时发送 {"type":"read_ack","message_id":"..."}。
 - 固件：确认未知消息类型被忽略，保证 v2 新消息不会打断 v1 逻辑。
 - 其余不动：语音、审批、单词熊、界面、配网。
 
-## 10. 托盘与管理界面
+## 11. 托盘与管理界面
 
 CodexBridge 托盘右键菜单：
 
 - 设备列表：每台设备的名称、型号、在线状态、最后一条消息、最近已读状态。
 - 配对设备：广播发现并配对；手动添加 IP 作为发现失败时的兜底；移除设备。
+- 能力开关：对选中的设备逐项勾选它能看什么、能用什么（见第 7 节）；另有该型号的默认值。
 - 打开管理中心：打开 8787 网页（管理中心由 CodexBridge 拉起，无自己的托盘）。
 - Codex 设置：工作目录、语音源等，沿用现有界面。
 - 开机自动启动、打开日志目录、退出。
@@ -171,30 +192,30 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 - GET /api/v1/admin/pairing：给管理中心的配网流程取配对令牌。
 - GET /api/v1/admin/status：版本与健康状态。
 
-## 11. 存储与路径
+## 12. 存储与路径
 
-- %LOCALAPPDATA%\CodexBridge\：devices.json（device_id、名称、型号、令牌、能力、最后在线时间、已读状态）、bridge.log、语音源配置。
+- %LOCALAPPDATA%\CodexBridge\：devices.json（device_id、名称、型号、令牌、supported 与 enabled 能力、最后在线时间、已读状态）、capability-defaults.json（按型号的默认能力）、bridge.log、语音源配置。
 - 迁移：现有 %LOCALAPPDATA%\FoloOS\bridge.json 里的 host、port、token 自动迁入 devices.json，旧文件保留但不再读取。
 - Dotii 的 %LOCALAPPDATA%\StateDisplay 保持不动，Bambu、自定义页与显示配置继续存在那里。
 
-## 12. 安全
+## 13. 安全
 
 - 每台设备一枚令牌（不少于 16 字符），首次配对 TOFU，之后严格校验。
 - 管理接口只接受回环地址；设备接口校验令牌。
 - 所有字符串、数组、分片都有长度上限；日志不写令牌。
 - 8765 只用于局域网，不暴露到公网。
 
-## 13. 兼容与迁移
+## 14. 兼容与迁移
 
 - 未升级的 Dotii 固件继续只连管理中心：Codex 显示为空或离线，不报错。
 - 已刷机的 AI Passport 走 v1 分支，零改动。
 - 回滚路径：CodexBridge 保留 v1 代码路径，必要时可退回现有 FoloOS bridge 行为。
 
-## 14. 测试与验收
+## 15. 测试与验收
 
 单元测试：
 
-- 协议编解码与分片、能力过滤、消息归一、已读广播、TOFU 与令牌校验、长度上限。
+- 协议编解码与分片、能力过滤（supported 与 enabled 的交集、运行时变更、越权事件被拒）、消息归一、已读广播、令牌校验与 TOFU、长度上限。
 
 集成测试：
 
@@ -208,7 +229,7 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 - Dotii 的 Bambu、自定义页、显示设置、BLE 配网、烧录全链路回归。
 - FoloOS 的语音、审批、单词熊回归。
 
-## 15. 里程碑
+## 16. 里程碑
 
 | 阶段 | 内容 | 产出 |
 | --- | --- | --- |
@@ -218,7 +239,7 @@ CodexBridge 本机管理接口（仅 127.0.0.1）：
 | M4 | 单托盘打包、管理中心子进程、配置迁移 | 一个 EXE、一个托盘 |
 | M5 | 真机验收与发布 | 可发布的 Release |
 
-## 16. 风险
+## 17. 风险
 
 - Dotii 固件新增 TCP 服务端并维护双数据源，内存、栈和断线重连是主要风险点。
 - 双令牌的配网流程改动面较大，需要真机验证。
