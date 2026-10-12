@@ -20,7 +20,7 @@ class AdminApiTest(unittest.TestCase):
     def test_non_loopback_is_forbidden(self):
         status, _ = handle_request(
             "GET",
-            "/api/v1/admin/status",
+            "/api/admin/status",
             {},
             b"",
             "10.0.0.9",
@@ -32,7 +32,7 @@ class AdminApiTest(unittest.TestCase):
     def test_status_reports_version(self):
         status, payload = handle_request(
             "GET",
-            "/api/v1/admin/status",
+            "/api/admin/status",
             {},
             b"",
             "127.0.0.1",
@@ -45,7 +45,7 @@ class AdminApiTest(unittest.TestCase):
     def test_pairing_mints_token_and_stores_it(self):
         status, payload = handle_request(
             "GET",
-            "/api/v1/admin/pairing",
+            "/api/admin/pairing",
             {"device_id": ["d2"]},
             b"",
             "127.0.0.1",
@@ -59,7 +59,7 @@ class AdminApiTest(unittest.TestCase):
     def test_devices_list_hides_token(self):
         status, payload = handle_request(
             "GET",
-            "/api/v1/admin/devices",
+            "/api/admin/devices",
             {},
             b"",
             "127.0.0.1",
@@ -73,7 +73,7 @@ class AdminApiTest(unittest.TestCase):
         body = json.dumps({"device_id": "d1", "enabled": ["status", "nope"]}).encode()
         status, _ = handle_request(
             "POST",
-            "/api/v1/admin/devices/capabilities",
+            "/api/admin/devices/capabilities",
             {},
             body,
             "127.0.0.1",
@@ -88,7 +88,7 @@ class AdminApiTest(unittest.TestCase):
         body = json.dumps({"device_id": "d1"}).encode()
         status, _ = handle_request(
             "POST",
-            "/api/v1/admin/devices/remove",
+            "/api/admin/devices/remove",
             {},
             body,
             "127.0.0.1",
@@ -98,3 +98,15 @@ class AdminApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(removed, ["d1"])
+
+    def test_old_versioned_path_is_not_served(self):
+        status, _ = handle_request(
+            "GET",
+            "/api/v1/admin/status",
+            {},
+            b"",
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 404)

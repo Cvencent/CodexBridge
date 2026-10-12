@@ -29,13 +29,13 @@ def handle_request(
 
     method = method.upper()
     try:
-        if method == "GET" and path == "/api/v1/admin/status":
+        if method == "GET" and path == "/api/admin/status":
             return 200, {
                 "ok": True,
                 "version": VERSION,
                 "device_count": len(registry._devices),
             }
-        if method == "GET" and path == "/api/v1/admin/devices":
+        if method == "GET" and path == "/api/admin/devices":
             return 200, {
                 "ok": True,
                 "devices": [
@@ -43,7 +43,7 @@ def handle_request(
                     for record in registry._devices.values()
                 ],
             }
-        if method == "GET" and path == "/api/v1/admin/pairing":
+        if method == "GET" and path == "/api/admin/pairing":
             values = query.get("device_id", [])
             device_id = values[0] if values else ""
             if not device_id:
@@ -55,7 +55,7 @@ def handle_request(
                 "token": token,
                 "port": 8765,
             }
-        if method == "POST" and path == "/api/v1/admin/devices/remove":
+        if method == "POST" and path == "/api/admin/devices/remove":
             payload = _json_body(body)
             device_id = payload.get("device_id")
             if not isinstance(device_id, str) or not device_id:
@@ -67,7 +67,7 @@ def handle_request(
             if on_device_removed is not None:
                 on_device_removed(device_id)
             return 200, {"ok": True, "device_id": device_id, "removed": removed}
-        if method == "POST" and path == "/api/v1/admin/devices/capabilities":
+        if method == "POST" and path == "/api/admin/devices/capabilities":
             payload = _json_body(body)
             device_id = payload.get("device_id")
             enabled = payload.get("enabled")
