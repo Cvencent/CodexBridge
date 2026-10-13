@@ -14,4 +14,9 @@ dependencies = []
 tray = ["pystray>=0.19", "Pillow>=10"]
 
 [tool.setuptools]
-packages = ["codexbridge", "codexbridge.protocol", "codexbridge.devices"]
+packages = [
+    "codexbridge",
+    "codexbridge.codex",
+    "codexbridge.protocol",
+    "codexbridge.devices",
+]
