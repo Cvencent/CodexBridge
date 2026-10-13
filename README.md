@@ -8,7 +8,7 @@
 
 ## 快速开始
 
-1. 电脑端启动包含伴侣接口的 CodexBridge（`1.3.3-companion` 或更新版本，见 `release/CodexBridge-1.3.3-companion-win64-portable.zip`）。
+1. 电脑端启动包含伴侣接口的 CodexBridge（`1.3.3` 或更新版本，见 CodexBridge 仓库的 `release/CodexBridge-1.3.3-win64-portable.zip`）。
 2. 打开电脑端的设置页 `http://127.0.0.1:8788/settings`，在“手机连接”里：
    - 打开“启用手机连接”；
    - 记录显示的局域网地址（形如 `192.168.x.x:8790`）；
