@@ -1,6 +1,5 @@
 param(
     [string]$Version = "1.3.3",
-    [string]$FirmwareRoot = "",
     [switch]$SkipInstaller,
     [switch]$SkipTests
 )
@@ -10,29 +9,15 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Dist = Join-Path $Root "dist"
 $Release = Join-Path $Root "release"
 $Work = Join-Path $Root "build\windows"
-$FirmwareSource = if ($FirmwareRoot) {
-    (Resolve-Path -LiteralPath $FirmwareRoot).Path
-} else {
-    Join-Path $Root "firmware"
-}
 
 if (-not $SkipTests) {
     python -m unittest discover -s (Join-Path $Root "tests") -v
     if ($LASTEXITCODE -ne 0) { throw "CodexBridge tests failed" }
 }
 
-$Manifest = Join-Path $FirmwareSource "flasher_args.json"
-if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
-    throw "Firmware manifest not found: $Manifest. Pass -FirmwareRoot with a prepared Dotii firmware directory."
-}
-
 if (Test-Path $Dist) { Remove-Item -LiteralPath $Dist -Recurse -Force }
 if (Test-Path $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Dist, $Release, $Work | Out-Null
-
-$BuildFirmware = Join-Path $Root "firmware"
-if (Test-Path $BuildFirmware) { Remove-Item -LiteralPath $BuildFirmware -Recurse -Force }
-Copy-Item -LiteralPath $FirmwareSource -Destination $BuildFirmware -Recurse
 
 python -m PyInstaller --noconfirm --clean --distpath $Dist --workpath $Work (Join-Path $PSScriptRoot "CodexBridge.spec")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
@@ -47,7 +32,7 @@ if ($Executables.Count -ne 1 -or $Executables[0].FullName -ne $Exe) {
 }
 
 $Portable = Join-Path $Release "CodexBridge-$Version-win64-portable.zip"
-if (Test-Path $Portable) { Remove-Item -LiteralPath $Portable -Force }
+if (Test-Path -LiteralPath $Portable) { Remove-Item -LiteralPath $Portable -Force }
 Compress-Archive -LiteralPath $Exe -DestinationPath $Portable -CompressionLevel Optimal
 
 if (-not $SkipInstaller) {

@@ -14,12 +14,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout firmware source
-        uses: actions/checkout@v4
-        with:
-          repository: Cvencent/Dotii-Display
-          path: dotii
-          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -38,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (python -c "import codexbridge; print(codexbridge.VERSION)")
-          ./packaging/build_windows.ps1 -Version $version -FirmwareRoot ./dotii/firmware
+          ./packaging/build_windows.ps1 -Version $version
       - name: Upload release assets
         shell: pwsh
         env:

@@ -14,12 +14,6 @@ from codexbridge.devices.discovery import discover
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
-from codexbridge.management_process import (
-    ManagementProcess,
-    is_esptool_argv,
-    run_esptool,
-    run_management_child,
-)
 from codexbridge.speech import SpeechService
 
 
@@ -111,10 +105,6 @@ def _launch_restarted_process(
 
 
 def main(argv: list[str] | None = None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if is_esptool_argv(arguments):
-        return run_esptool(arguments)
-
     parser = argparse.ArgumentParser(prog="codexbridge")
     parser.add_argument(
         "--no-tray",
@@ -127,24 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         help="open the local settings page and exit",
     )
     parser.add_argument(
-        "--management-child",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--no-management",
-        action="store_true",
-        help="run without the Dotii management child",
-    )
-    parser.add_argument(
         "--startup",
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    args = parser.parse_args(arguments)
-
-    if args.management_child:
-        return run_management_child(["--no-browser"])
+    args = parser.parse_args(argv)
 
     if args.settings:
         import webbrowser
@@ -184,13 +161,6 @@ def main(argv: list[str] | None = None) -> int:
         open_logs=open_logs,
     )
     admin.start()
-    management = None
-    if not args.no_management:
-        management = ManagementProcess(
-            Path(sys.executable),
-            bool(getattr(sys, "frozen", False)),
-        )
-        management.start()
     stop = threading.Event()
     codex_stop = threading.Event()
     codex_thread = threading.Thread(
@@ -222,27 +192,11 @@ def main(argv: list[str] | None = None) -> int:
     speech_thread = threading.Thread(target=poll_speech, daemon=True)
     speech_thread.start()
 
-    management_stop = threading.Event()
-
-    def poll_management() -> None:
-        while not management_stop.wait(1.0):
-            if management is None:
-                return
-            management.poll()
-            if management.failed:
-                return
-
-    management_thread = None
-    if management is not None:
-        management_thread = threading.Thread(target=poll_management, daemon=True)
-        management_thread.start()
-
     try:
         if args.no_tray:
             print(f"CodexBridge admin API: {admin.url}", flush=True)
             while not stop.wait(1.0):
-                if management is not None and management.failed:
-                    break
+                pass
         else:
             from codexbridge import tray
 
@@ -251,17 +205,10 @@ def main(argv: list[str] | None = None) -> int:
                 registry,
                 manager,
                 on_restart=restart_process,
-                management_url=management.url if management is not None else None,
-                management_failed=lambda: bool(management and management.failed),
             )
     except KeyboardInterrupt:
         pass
     finally:
-        management_stop.set()
-        if management_thread is not None:
-            management_thread.join(timeout=1.0)
-        if management is not None:
-            management.stop()
         codex_stop.set()
         stop.set()
         manager.stop()

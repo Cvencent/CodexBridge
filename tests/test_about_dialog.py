@@ -29,6 +29,3 @@ class DialogTest(unittest.TestCase):
 
     def test_about_dialog_runs_off_the_menu_callback_thread(self):
         self.assert_shown_off_thread(tray._show_about)
-
-    def test_management_error_dialog_runs_off_the_menu_callback_thread(self):
-        self.assert_shown_off_thread(tray._show_management_error)

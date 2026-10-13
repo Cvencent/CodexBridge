@@ -12,7 +12,6 @@ from codexbridge.hub import BridgeHub
 
 REPOSITORY_URL = "https://github.com/Cvencent/CodexBridge"
 SETTINGS_URL = "http://127.0.0.1:8788/settings"
-ADMIN_URL = "http://127.0.0.1:8787/"
 
 
 @dataclass
@@ -66,7 +65,6 @@ def build_menu_model(
     return [
         device_menu,
         MenuItem("打开设置", "action", "open_settings"),
-        MenuItem("打开管理中心", "action", "open_admin"),
         MenuItem("重启", "action", "restart"),
         MenuItem("关于", "action", "about"),
         MenuItem("退出", "action", "exit"),
@@ -132,22 +130,11 @@ def _show_dialog(message: str, title: str, flags: int) -> None:
 def _show_about() -> None:
     _show_dialog(about_text(), "关于 CodexBridge", 0x00000040)
 
-
-def _show_management_error() -> None:
-    _show_dialog(
-        "管理中心子进程多次异常退出，请重启 CodexBridge 后重试。",
-        "管理中心不可用",
-        0x00000010,
-    )
-
-
 def run(
     hub: BridgeHub,
     registry: DeviceRegistry,
     manager=None,
     on_restart=None,
-    management_url: str | None = None,
-    management_failed=None,
 ) -> None:
     try:
         import pystray
@@ -172,11 +159,6 @@ def run(
                 _show_about()
             elif action_id == "open_settings":
                 webbrowser.open(SETTINGS_URL)
-            elif action_id == "open_admin":
-                if management_failed is not None and management_failed():
-                    _show_management_error()
-                    return
-                webbrowser.open(management_url or ADMIN_URL)
             elif action_id == "exit":
                 icon.stop()
             elif action_id and action_id.startswith("capability:"):

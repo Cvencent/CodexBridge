@@ -62,13 +62,14 @@ A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 1.3.3 -FirmwareRoot D:\dotii\firmware
+./packaging/build_windows.ps1 -Version 1.3.3
 ```
 
-The EXE contains the Dotii firmware package, so flashing and BLE provisioning
-work without a second executable or an installed Python environment. The Dotii
-management center runs as a hidden child process owned by the tray host; it is
-available at `http://127.0.0.1:8787/` and never creates another tray icon.
+`CodexBridge.exe` stays in the system tray and only handles the Codex side:
+Codex collection, the unified LAN device protocol, per-device capabilities and
+shared read state. Dotii flashing, BLE provisioning, display and emotion
+settings live in the separate `DotiiManagementCenter.exe`, which is started
+on demand and does not stay resident.
 
 The installer is Simplified Chinese by default. Installing a newer CodexBridge
 version over an older one upgrades the application in place and keeps user data
