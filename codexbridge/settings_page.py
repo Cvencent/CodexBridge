@@ -95,16 +95,17 @@ SETTINGS_HTML = r'''<!doctype html>
     .page-heading p { margin: 7px 0 0; color: var(--muted); }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
-      grid-template-areas:
-        "general general"
-        "devices speech";
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
       gap: 20px;
       align-items: start;
     }
-    .general-panel { grid-area: general; }
-    .devices-panel { grid-area: devices; }
-    .speech-panel { grid-area: speech; }
+    .general-panel { grid-column: 1; grid-row: 1; }
+    .speech-panel { grid-column: 1; grid-row: 2; }
+    .devices-panel {
+      grid-column: 2;
+      grid-row: 1 / span 2;
+      align-self: stretch;
+    }
     .panel {
       overflow: hidden;
       background: var(--surface);
@@ -349,11 +350,10 @@ SETTINGS_HTML = r'''<!doctype html>
     @media (max-width: 900px) {
       .layout {
         grid-template-columns: minmax(0, 1fr);
-        grid-template-areas:
-          "general"
-          "devices"
-          "speech";
       }
+      .general-panel { grid-column: 1; grid-row: auto; order: 1; }
+      .devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 2; }
+      .speech-panel { grid-column: 1; grid-row: auto; order: 3; }
     }
     @media (max-width: 560px) {
       .topbar-inner, main { width: min(100% - 24px, 1120px); }

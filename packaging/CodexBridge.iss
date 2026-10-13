@@ -1,7 +1,7 @@
-; Build with ISCC /DAppVersion=1.3.0 /DSourceDir=... /DOutputDir=...
+; Build with ISCC /DAppVersion=1.3.1 /DSourceDir=... /DOutputDir=...
 
 #ifndef AppVersion
-  #define AppVersion "1.3.0"
+  #define AppVersion "1.3.1"
 #endif
 #ifndef SourceDir
   #define SourceDir "..\dist\CodexBridge"

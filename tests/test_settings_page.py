@@ -20,14 +20,16 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("API Key", SETTINGS_HTML)
         self.assertIn("/api/admin/settings/speech", SETTINGS_HTML)
 
-    def test_page_uses_stable_desktop_grid_areas(self):
-        self.assertIn("grid-template-areas:", SETTINGS_HTML)
-        self.assertIn('"general general"', SETTINGS_HTML)
-        self.assertIn('"devices speech"', SETTINGS_HTML)
-        self.assertIn(".general-panel { grid-area: general; }", SETTINGS_HTML)
-        self.assertIn(".devices-panel { grid-area: devices; }", SETTINGS_HTML)
-        self.assertIn(".speech-panel { grid-area: speech; }", SETTINGS_HTML)
+    def test_page_uses_stable_desktop_layout(self):
+        self.assertIn("grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);", SETTINGS_HTML)
+        self.assertIn(".general-panel { grid-column: 1; grid-row: 1; }", SETTINGS_HTML)
+        self.assertIn(".speech-panel { grid-column: 1; grid-row: 2; }", SETTINGS_HTML)
+        self.assertIn(".devices-panel {", SETTINGS_HTML)
+        self.assertIn("grid-column: 2;", SETTINGS_HTML)
+        self.assertIn("grid-row: 1 / span 2;", SETTINGS_HTML)
 
     def test_page_collapses_to_one_column_on_narrow_screens(self):
-        self.assertIn('"general"\n          "devices"\n          "speech";', SETTINGS_HTML)
+        self.assertIn(".general-panel { grid-column: 1; grid-row: auto; order: 1; }", SETTINGS_HTML)
+        self.assertIn(".devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 2; }", SETTINGS_HTML)
+        self.assertIn(".speech-panel { grid-column: 1; grid-row: auto; order: 3; }", SETTINGS_HTML)
         self.assertIn(".general-list, .source-options { grid-template-columns: 1fr; }", SETTINGS_HTML)
