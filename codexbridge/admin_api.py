@@ -37,6 +37,8 @@ def handle_request(
     startup_enabled: Callable[[], bool] | None = None,
     set_startup_enabled: Callable[[bool], bool] | None = None,
     open_logs: Callable[[], None] | None = None,
+    companion_status: Callable[[], dict] | None = None,
+    companion_action: Callable[[dict], dict] | None = None,
 ):
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -162,6 +164,19 @@ def handle_request(
             if on_device_removed is not None:
                 on_device_removed(device_id)
             return 200, {"ok": True, "device_id": device_id, "removed": removed}
+        if method == "GET" and path == "/api/admin/companion":
+            payload = (
+                companion_status()
+                if companion_status is not None
+                else {"enabled": False, "urls": [], "phones": [], "port": 8790}
+            )
+            return 200, {"ok": True, "companion": payload}
+        if method == "POST" and path == "/api/admin/companion":
+            payload = _json_body(body)
+            if companion_action is None:
+                return 400, {"ok": False, "error": "companion_unavailable"}
+            result = companion_action(payload)
+            return 200, {"ok": True, **(result or {})}
         if method == "POST" and path == "/api/admin/devices/capabilities":
             payload = _json_body(body)
             device_id = payload.get("device_id")
@@ -252,7 +267,11 @@ class AdminApi:
         startup_enabled: Callable[[], bool] | None = None,
         set_startup_enabled: Callable[[bool], bool] | None = None,
         open_logs: Callable[[], None] | None = None,
+        companion_status: Callable[[], dict] | None = None,
+        companion_action: Callable[[dict], dict] | None = None,
     ):
+        self.companion_status = companion_status
+        self.companion_action = companion_action
         self.hub = hub
         self.registry = registry
         self.host = host
@@ -319,6 +338,8 @@ class AdminApi:
                             api.startup_enabled,
                             api.set_startup_enabled,
                             api.open_logs,
+                            api.companion_status,
+                            api.companion_action,
                         )
                 if isinstance(payload, str):
                     encoded = payload.encode("utf-8")

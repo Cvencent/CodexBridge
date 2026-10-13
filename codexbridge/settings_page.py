@@ -347,6 +347,12 @@ SETTINGS_HTML = r'''<!doctype html>
       accent-color: var(--accent);
     }
     .general-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
+    .pair-code { margin: 14px 0 6px; padding: 14px 16px; border-radius: 12px; background: #101828; color: #f8fafc; font-size: 30px; font-weight: 700; letter-spacing: 6px; text-align: center; }
+    .pair-code small { display: block; margin-top: 6px; font-size: 12px; font-weight: 400; letter-spacing: 0; color: #cbd5e1; }
+    .phone-list { display: grid; gap: 8px; margin-top: 8px; }
+    .phone-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
+    .phone-row strong { display: block; font-size: 14px; }
+    .phone-row p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
     @media (max-width: 900px) {
       .layout {
         grid-template-columns: minmax(0, 1fr);
@@ -419,6 +425,43 @@ SETTINGS_HTML = r'''<!doctype html>
             <button id="refresh-general" class="button" type="button">刷新状态</button>
           </div>
           <div id="general-message" class="form-message" role="status" aria-live="polite">正在读取常规设置...</div>
+        </div>
+      </section>
+
+      <section class="panel companion-panel" aria-labelledby="companion-title">
+        <div class="panel-header">
+          <h2 id="companion-title">手机连接</h2>
+          <p>在手机上安装 CodexBridge 手机端，用配对码连接这台电脑。</p>
+        </div>
+        <div class="panel-body">
+          <div class="general-list">
+            <div class="general-row">
+              <div>
+                <strong>允许手机连接</strong>
+                <p>只允许局域网访问，所有数据请求都需要配对令牌。</p>
+              </div>
+              <input id="companion-enabled" class="switch" type="checkbox" role="switch" aria-label="允许手机连接">
+            </div>
+            <div class="general-row">
+              <div>
+                <strong>连接地址</strong>
+                <p id="companion-addresses">正在读取...</p>
+              </div>
+            </div>
+            <div class="general-row">
+              <div>
+                <strong>配对码</strong>
+                <p>在手机端输入，10 分钟内有效，使用一次后立即失效。</p>
+              </div>
+              <button id="companion-new-code" class="button" type="button">生成配对码</button>
+            </div>
+          </div>
+          <div id="companion-code" class="pair-code" hidden></div>
+          <div class="subsection-title">已配对手机</div>
+          <div id="companion-phones" class="phone-list" aria-live="polite">
+            <div class="empty-state">正在读取...</div>
+          </div>
+          <div id="companion-message" class="form-message" role="status" aria-live="polite"></div>
         </div>
       </section>
 
@@ -934,8 +977,133 @@ SETTINGS_HTML = r'''<!doctype html>
       $("#toggle-key").textContent = visible ? "显示" : "隐藏";
     });
 
+    function companionTime(value) {
+      if (!value) return "从未连接";
+      const date = new Date(Number(value) * 1000);
+      return Number.isNaN(date.getTime()) ? "从未连接" : `最近连接 ${date.toLocaleString()}`;
+    }
+
+    function renderCompanionPhones(phones) {
+      const list = $("#companion-phones");
+      list.textContent = "";
+      if (!phones.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "还没有配对手机。";
+        list.appendChild(empty);
+        return;
+      }
+      phones.forEach((phone) => {
+        const row = document.createElement("div");
+        row.className = "phone-row";
+        const info = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = phone.name || "未命名手机";
+        const meta = document.createElement("p");
+        meta.textContent = `${phone.phone_id} · ${companionTime(phone.last_seen)}`;
+        info.appendChild(title);
+        info.appendChild(meta);
+        const remove = document.createElement("button");
+        remove.className = "button";
+        remove.type = "button";
+        remove.textContent = "解除";
+        remove.addEventListener("click", async () => {
+          remove.disabled = true;
+          try {
+            await requestJson("/api/admin/companion", {
+              method: "POST",
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({action: "remove_phone", phone_id: phone.phone_id})
+            });
+            setMessage($("#companion-message"), "已解除该手机。", "success");
+            loadCompanion();
+          } catch (error) {
+            setMessage($("#companion-message"), `解除失败：${error.message}`, "error");
+            remove.disabled = false;
+          }
+        });
+        row.appendChild(info);
+        row.appendChild(remove);
+        list.appendChild(row);
+      });
+    }
+
+    async function loadCompanion() {
+      const toggle = $("#companion-enabled");
+      try {
+        const payload = await requestJson("/api/admin/companion");
+        const companion = payload.companion || {};
+        toggle.checked = Boolean(companion.enabled);
+        const urls = companion.urls || [];
+        $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
+        renderCompanionPhones(companion.phones || []);
+        if (!companion.enabled) {
+          setMessage($("#companion-message"), "手机连接已关闭。");
+        } else if (!$("#companion-message").dataset.state) {
+          setMessage($("#companion-message"), "手机连接已开启。");
+        }
+      } catch (error) {
+        toggle.disabled = true;
+        setMessage($("#companion-message"), `读取失败：${error.message}`, "error");
+      }
+    }
+
+    async function saveCompanionEnabled() {
+      const toggle = $("#companion-enabled");
+      toggle.disabled = true;
+      setMessage($("#companion-message"), "正在保存手机连接设置...", "working");
+      try {
+        const payload = await requestJson("/api/admin/companion", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: toggle.checked})
+        });
+        const companion = payload.companion || {};
+        toggle.checked = Boolean(companion.enabled);
+        setMessage(
+          $("#companion-message"),
+          toggle.checked ? "已允许手机连接。" : "已关闭手机连接，已配对手机需要重新开启后再连接。",
+          "success"
+        );
+        const urls = companion.urls || [];
+        $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
+      } catch (error) {
+        setMessage($("#companion-message"), `保存失败：${error.message}`, "error");
+      } finally {
+        toggle.disabled = false;
+      }
+    }
+
+    async function newCompanionCode() {
+      const button = $("#companion-new-code");
+      setBusy(button, true, "生成中...");
+      try {
+        const payload = await requestJson("/api/admin/companion", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "new_code"})
+        });
+        const pairing = payload.pairing || {};
+        const box = $("#companion-code");
+        box.textContent = pairing.code || "------";
+        const hint = document.createElement("small");
+        hint.textContent = `有效期至 ${new Date(Number(pairing.expires_at) * 1000).toLocaleTimeString()}`;
+        box.appendChild(hint);
+        box.hidden = false;
+        setMessage($("#companion-message"), "请在手机端输入配对码。", "success");
+      } catch (error) {
+        setMessage($("#companion-message"), `生成失败：${error.message}`, "error");
+      } finally {
+        setBusy(button, false, "生成中...");
+      }
+    }
+
+    $("#companion-enabled").addEventListener("change", saveCompanionEnabled);
+    $("#companion-new-code").addEventListener("click", newCompanionCode);
+
     loadStatus();
     loadGeneral();
+    loadCompanion();
     loadDevices();
     loadSpeech();
   </script>

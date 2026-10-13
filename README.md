@@ -35,6 +35,16 @@ The saved API key is never returned to the browser. Leaving the API Key field
 empty preserves the previously saved key; use the explicit clear checkbox to
 remove it. Remote recognition failures fall back to built-in recognition.
 
+## 手机端
+
+CodexBridge 内置手机伴侣接口：同一局域网内的手机在管理页面
+`127.0.0.1:8788/settings` 生成配对码后，即可查看线程、读取消息、远程发送任务、
+切换模型并处理审批。
+
+- 手机端通过 UDP `8766` 自动发现电脑，也可以手动填写 `http://<电脑 IP>:8790`。
+- 伴侣接口默认开启，可在管理页面关闭；配对令牌只保存在手机与电脑本机。
+- 接口细节见 [PROTOCOL.md](PROTOCOL.md) 第 17 节。
+
 ## Development
 
 Python 3.11 or newer is required. The core uses only the standard library.

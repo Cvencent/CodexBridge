@@ -45,6 +45,8 @@ HTTP API。
 | 设备会话 | TCP | `8765` | CodexBridge 主动连接设备 |
 | CodexBridge 本机管理 | HTTP | `127.0.0.1:8788` | 本机浏览器或本机程序 |
 | Dotii 管理中心 | HTTP | `127.0.0.1:8787` | 本机浏览器；设备端仅访问其快照接口 |
+| 手机发现 | UDP | `8766` | 手机广播，CodexBridge 应答 |
+| 手机伴侣 API | HTTP + SSE | `TCP 8790` | 已配对手机 |
 
 设备 TCP 会话使用 UTF-8 JSON，每条消息一行，以 `\n` 分隔。设备是 TCP 服务端，
 CodexBridge 是 TCP 客户端。设备切换 IP 后仍必须上报同一个稳定
@@ -728,4 +730,69 @@ PC -> 设备: {"type":"bridge_ready","bridge":"CodexBridge","version":"1.3.3","c
 PC -> 设备: {"type":"message","message_id":"task:t1","thread_id":"t1","kind":"task","status":"working","title":"Codex 任务","body":"正在处理","created_at":1234567890.0,"seq":0,"total":1}
 设备 -> PC: {"type":"read_ack","message_id":"task:t1"}
 PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read_at":1234567890.0}
+## 17. 手机伴侣接口
+
+手机端不实现设备 UDP/TCP 协议，而是使用 CodexBridge 直接托管的伴侣接口。手机与电脑在同一
+局域网内，通过配对码换取长期令牌后，可以查看线程、读取消息、远程发起任务、切换模型并处理审批。
+
+| 用途 | 传输 | 端口 | 发起方 |
+| --- | --- | --- | --- |
+| 手机发现 | UDP | `8766` | 手机广播，CodexBridge 应答 |
+| 手机伴侣 API | HTTP + SSE | `TCP 8790` | 已配对手机 |
+
+发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
+
+```json
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.3","port":8790,"discovery_port":8766,"requires_pairing":true}
+```
+
+### 17.1 配对与鉴权
+
+- `POST /api/companion/pair` 请求体为 `{"code":"123456","name":"Pixel"}`；配对码在电脑端管理页面生成，`10` 分钟有效，最多尝试 `5` 次，成功使用一次后立即失效。
+- 配对成功后返回 `{"ok":true,"phone_id":"phone-xxxxxxxxxxxx","token":"cbp_...","bridge":{...}}`。令牌只在这次响应中返回，电脑端只保存 SHA-256 摘要。
+- 后续请求使用 `Authorization: Bearer <token>`；SSE 允许使用 `?token=`。未配对返回 `401 unauthorized`，电脑端关闭手机连接时返回 `403 companion_disabled`，配对码错误返回 `403 pairing_failed`。
+
+### 17.2 接口清单
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/companion/ping` | 无需鉴权，返回服务名、版本、端口 |
+| POST | `/api/companion/pair` | 无需鉴权，使用配对码换取令牌 |
+| GET | `/api/companion/status` | 额度、当前任务与待处理审批 |
+| GET | `/api/companion/threads` | 线程列表，支持 `limit`、`search`、`cursor` |
+| POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model` |
+| GET | `/api/companion/threads/<id>` | 线程详情与归一化消息 |
+| POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务 |
+| POST | `/api/companion/threads/<id>/interrupt` | 中断任务，`turn_id` 可省略 |
+| POST | `/api/companion/approvals/<request_id>` | 审批决定，`decision` 取 `accept`、`acceptForSession`、`decline`、`cancel` |
+| GET | `/api/companion/models` | 可用模型与推理档位 |
+| GET | `/api/companion/projects` | 最近项目目录 |
+| GET | `/api/companion/events` | SSE 事件流，可用 `thread_id` 过滤 |
+
+### 17.3 消息与事件
+
+线程详情中的消息统一为 `kind`：
+
+| `kind` | 说明 |
+| --- | --- |
+| `user` | 用户消息 |
+| `agent` | 最终回复 |
+| `commentary` | 进行中的可见进展 |
+| `reasoning` | 推理摘要 |
+| `command` | 命令执行，`detail.output` 为截断输出 |
+| `fileChange` | 文件变更，`detail.paths` 与 `detail.diff` |
+| `tool` | 工具调用 |
+| `plan` | 计划步骤 |
+| `notice` | 系统提示，例如上下文压缩 |
+
+SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
+`turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
+`token_usage`、`thread_status`、`thread_name`、`rate_limits`、`approval_request`、
+`approval_resolved`、`error`。手机端必须忽略未知 `type`。审批请求超过 `600` 秒未处理会在电脑端失效。
+
+### 17.4 本机管理
+
+- `GET /api/admin/companion` 返回开关、局域网地址、端口与已配对手机。
+- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`。
+- 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 ```

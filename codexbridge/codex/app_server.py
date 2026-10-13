@@ -143,6 +143,10 @@ class AppServerClient:
         self._pending_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.notifications: queue.Queue[dict[str, Any]] = queue.Queue()
+        # Server-initiated requests (approval prompts and tool questions).
+        # Only clients that explicitly consume this queue need them; the rest
+        # keep the previous behaviour of ignoring them.
+        self.server_requests: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=200)
         self._closed = threading.Event()
 
     def start(self) -> None:
@@ -182,12 +186,18 @@ class AppServerClient:
             except json.JSONDecodeError:
                 continue
             response_id = message.get("id")
-            if isinstance(response_id, int):
+            method = message.get("method")
+            if isinstance(response_id, int) and isinstance(method, str):
+                try:
+                    self.server_requests.put_nowait(message)
+                except queue.Full:
+                    pass
+            elif isinstance(response_id, int):
                 with self._pending_lock:
                     target = self._pending.get(response_id)
                 if target is not None:
                     target.put(message)
-            elif isinstance(message.get("method"), str):
+            elif isinstance(method, str):
                 self.notifications.put(message)
         self._closed.set()
 
@@ -234,6 +244,10 @@ class AppServerClient:
             finally:
                 with self._pending_lock:
                     self._pending.pop(request_id, None)
+
+    def respond(self, request_id: int, result: Any) -> None:
+        """Answer a server-initiated request such as an approval prompt."""
+        self._send({"id": request_id, "result": result})
 
     def close(self) -> None:
         process = self.process

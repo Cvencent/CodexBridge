@@ -16,6 +16,12 @@ from codexbridge.devices.discovery import discover
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
+from codexbridge.companion import (
+    CompanionApi,
+    CompanionDiscovery,
+    CompanionService,
+    CompanionStore,
+)
 from codexbridge.speech import SpeechService
 
 
@@ -206,6 +212,44 @@ def main(argv: list[str] | None = None) -> int:
     manager = DeviceManager(registry, hub)
     codex_state = _CodexState()
 
+    companion_store = CompanionStore(data_dir / "companion.json")
+    companion_store.load()
+    companion_service = CompanionService(data_dir, codex_cwd, codex_command)
+    companion = CompanionApi(companion_service, companion_store, logger=print)
+    companion_discovery = CompanionDiscovery(companion_store, logger=print)
+
+    def companion_status() -> dict:
+        return companion.status_payload()
+
+    def companion_set_enabled(enabled: bool) -> None:
+        companion_store.set_enabled(enabled)
+        if enabled:
+            companion_service.start()
+            companion.start()
+            companion_discovery.start()
+        else:
+            companion_discovery.stop()
+            companion.stop()
+            companion_service.stop()
+
+    def companion_action(payload: dict) -> dict:
+        action = str(payload.get("action") or "")
+        if action == "new_code":
+            return {
+                "pairing": companion_store.pairing_code(regenerate=True),
+                "companion": companion.status_payload(),
+            }
+        if action == "remove_phone":
+            removed = companion_store.remove_phone(str(payload.get("phone_id") or ""))
+            return {"removed": removed, "companion": companion.status_payload()}
+        if "enabled" in payload:
+            value = payload.get("enabled")
+            if not isinstance(value, bool):
+                raise ValueError("enabled")
+            companion_set_enabled(value)
+            return {"companion": companion.status_payload()}
+        raise ValueError("action")
+
     def publish_codex(records: list) -> None:
         codex_state.record_snapshot()
         for record in records:
@@ -225,8 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         on_device_removed=manager.remove,
         codex_status=codex_state.snapshot,
         open_logs=open_logs,
+        companion_status=companion_status,
+        companion_action=companion_action,
     )
     admin.start()
+    if companion_store.enabled:
+        try:
+            companion_service.start()
+            companion.start()
+            companion_discovery.start()
+            print(f"CodexBridge companion API: {companion.url}", flush=True)
+        except Exception as error:  # noqa: BLE001
+            print(f"CodexBridge companion API 启动失败：{error}", flush=True)
     stop = threading.Event()
     codex_stop = threading.Event()
     codex_thread = threading.Thread(
@@ -280,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
         stop.set()
         manager.stop()
         speech.close()
+        companion_discovery.stop()
+        companion.stop()
+        companion_service.stop()
         admin.stop()
         speech_thread.join(timeout=1.0)
         codex_thread.join(timeout=1.0)
