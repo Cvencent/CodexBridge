@@ -198,8 +198,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: Exception) {
                 handleError(error)
             }
-            loadModels()
             loadProjects()
+            loadModels()
         }
     }
 
@@ -373,23 +373,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun newThread(model: String, cwd: String) {
+    fun newThread(cwd: String, model: String) {
         val client = api ?: return
         if (_state.value.busy) return
+        // The create-thread dialog also owns the project picker, so keep its (cwd, model)
+        // order here. The previous (model, cwd) order silently sent the project path as
+        // the model name, which made the desktop reject the new task.
+        val projectCwd = cwd.trim()
+        val safeModel = model.takeIf { it.isNotBlank() && !it.contains("\\") && !Regex("^[A-Za-z]:[\\/]").containsMatchIn(it) }.orEmpty()
         _state.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
-                val created = client.createThread(cwd, model)
+                val created = client.createThread(projectCwd, safeModel)
                 val thread = created.thread
-                settings.selectedCwd = cwd
-                if (model.isNotBlank()) {
-                    settings.selectedModel = model
+                settings.selectedCwd = projectCwd
+                if (safeModel.isNotBlank()) {
+                    settings.selectedModel = safeModel
                 }
                 _state.update {
                     it.copy(
                         busy = false,
-                        selectedModel = model.ifBlank { it.selectedModel },
-                        selectedCwd = cwd,
+                        selectedModel = safeModel.ifBlank { it.selectedModel },
+                        selectedCwd = projectCwd,
                         threads = listOf(thread) + it.threads.filterNot { row -> row.thread_id == thread.thread_id },
                     )
                 }

@@ -213,9 +213,10 @@ private fun NewThreadDialog(
     var cwd by remember { mutableStateOf(state.selectedCwd.ifBlank { state.projects.firstOrNull()?.cwd.orEmpty() }) }
     var model by remember {
         mutableStateOf(
-            state.selectedModel.ifBlank {
-                state.models.firstOrNull { it.is_default }?.slug ?: state.models.firstOrNull()?.slug.orEmpty()
-            },
+            state.models.firstOrNull { it.slug == state.selectedModel && it.slug.isNotBlank() }?.slug
+                ?: state.models.firstOrNull { it.is_default }?.slug
+                ?: state.models.firstOrNull()?.slug
+                ?: "",
         )
     }
     AlertDialog(
@@ -250,6 +251,7 @@ private fun NewThreadDialog(
                 }
                 Spacer(modifier = Modifier.height(2.dp))
                 Text("模型", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("默认（由电脑端决定）", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 state.models.take(10).forEach { option ->
                     Row(
                         modifier = Modifier.fillMaxWidth().clickable { model = option.slug },
