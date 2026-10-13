@@ -5,11 +5,20 @@ import json
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from codexbridge import VERSION
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
+from codexbridge.settings_page import SETTINGS_HTML
+from codexbridge.speech_source import (
+    load_speech_config,
+    prepare_speech_config,
+    probe_speech_config,
+    public_speech_config,
+    save_speech_config,
+)
 
 MAX_BODY_BYTES = 8 * 1024
 
@@ -24,12 +33,16 @@ def handle_request(
     registry: DeviceRegistry,
     on_device_removed: Callable[[str], None] | None = None,
     codex_status: Callable[[], dict] | None = None,
-) -> tuple[int, dict]:
+    speech_config_path: Path | None = None,
+):
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
 
     method = method.upper()
+    speech_path = speech_config_path or _speech_path(registry)
     try:
+        if method == "GET" and path == "/settings":
+            return 200, SETTINGS_HTML
         if method == "GET" and path == "/api/admin/status":
             return 200, {
                 "ok": True,
@@ -40,10 +53,11 @@ def handle_request(
             status = codex_status() if codex_status is not None else {}
             return 200, {"ok": True, "codex": status}
         if method == "GET" and path == "/api/admin/devices":
+            sessions = getattr(hub, "_sessions", {})
             return 200, {
                 "ok": True,
                 "devices": [
-                    _public_device(record)
+                    _public_device(record, record.device_id in sessions)
                     for record in registry._devices.values()
                 ],
             }
@@ -59,6 +73,45 @@ def handle_request(
                 "token": token,
                 "port": 8765,
             }
+        if method == "GET" and path == "/api/admin/settings/speech":
+            return 200, {
+                "ok": True,
+                "speech": public_speech_config(speech_path),
+            }
+        if method == "POST" and path == "/api/admin/settings/speech":
+            payload = _json_body(body)
+            try:
+                saved = save_speech_config(payload, speech_path)
+            except ValueError as error:
+                return 400, {
+                    "ok": False,
+                    "error": str(error),
+                    "speech": public_speech_config(speech_path),
+                }
+            return 200, {
+                "ok": True,
+                "speech": public_speech_config(speech_path),
+                "saved": {
+                    "source": saved["source"],
+                    "endpoint": saved["endpoint"],
+                    "model": saved["model"],
+                    "language": saved["language"],
+                },
+            }
+        if method == "POST" and path == "/api/admin/settings/speech/test":
+            payload = _json_body(body)
+            try:
+                config = (
+                    prepare_speech_config(payload, speech_path)
+                    if payload
+                    else load_speech_config(speech_path)
+                )
+            except ValueError as error:
+                return 400, {"ok": False, "error": str(error)}
+            ok, message = probe_speech_config(speech_path, config=config)
+            if not ok:
+                return 400, {"ok": False, "error": message, "message": message}
+            return 200, {"ok": True, "message": message}
         if method == "POST" and path == "/api/admin/devices/remove":
             payload = _json_body(body)
             device_id = payload.get("device_id")
@@ -94,6 +147,14 @@ def handle_request(
     return 404, {"ok": False, "error": "not_found"}
 
 
+def _speech_path(registry: DeviceRegistry) -> Path:
+    if registry.path is not None:
+        return Path(registry.path).parent / "speech-source.json"
+    from codexbridge.speech_source import speech_source_path
+
+    return speech_source_path()
+
+
 def _is_loopback(host: str) -> bool:
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -112,7 +173,7 @@ def _json_body(body: bytes) -> dict:
     return value
 
 
-def _public_device(record) -> dict:
+def _public_device(record, online: bool = False) -> dict:
     return {
         "device_id": record.device_id,
         "model": record.model,
@@ -120,6 +181,7 @@ def _public_device(record) -> dict:
         "supported": sorted(record.supported),
         "enabled": sorted(record.enabled),
         "last_seen": record.last_seen,
+        "online": online,
     }
 
 
@@ -136,6 +198,7 @@ class AdminApi:
         port: int = 8788,
         on_device_removed: Callable[[str], None] | None = None,
         codex_status: Callable[[], dict] | None = None,
+        speech_config_path: Path | None = None,
     ):
         self.hub = hub
         self.registry = registry
@@ -143,6 +206,7 @@ class AdminApi:
         self.port = port
         self.on_device_removed = on_device_removed
         self.codex_status = codex_status
+        self.speech_config_path = speech_config_path
         self._server: _AdminServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -195,14 +259,20 @@ class AdminApi:
                             api.registry,
                             api.on_device_removed,
                             api.codex_status,
+                            api.speech_config_path,
                         )
-                encoded = json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
+                if isinstance(payload, str):
+                    encoded = payload.encode("utf-8")
+                    content_type = "text/html; charset=utf-8"
+                else:
+                    encoded = json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
                 self.wfile.write(encoded)

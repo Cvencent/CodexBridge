@@ -12,6 +12,7 @@ from codexbridge.devices.discovery import discover
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
+from codexbridge.speech import SpeechService
 
 
 def _data_dir() -> Path:
@@ -87,7 +88,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run the host and loopback admin API without a tray icon",
     )
+    parser.add_argument(
+        "--settings",
+        action="store_true",
+        help="open the local settings page and exit",
+    )
     args = parser.parse_args(argv)
+
+    if args.settings:
+        import webbrowser
+
+        webbrowser.open("http://127.0.0.1:8788/settings")
+        return 0
 
     data_dir = _data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +107,8 @@ def main(argv: list[str] | None = None) -> int:
     registry.load()
     _migrate_legacy(registry)
 
-    hub = BridgeHub(registry)
+    speech = SpeechService(output_dir=data_dir / "recordings")
+    hub = BridgeHub(registry, speech=speech)
     manager = DeviceManager(registry, hub)
     codex_state = _CodexState()
 
@@ -135,6 +148,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     discovery_thread.start()
 
+    def poll_speech() -> None:
+        while not stop.wait(0.25):
+            hub.poll_speech()
+
+    speech_thread = threading.Thread(target=poll_speech, daemon=True)
+    speech_thread.start()
+
     try:
         if args.no_tray:
             print(f"CodexBridge admin API: {admin.url}", flush=True)
@@ -150,7 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         codex_stop.set()
         stop.set()
         manager.stop()
+        speech.close()
         admin.stop()
+        speech_thread.join(timeout=1.0)
         codex_thread.join(timeout=1.0)
         discovery_thread.join(timeout=1.0)
     return 0

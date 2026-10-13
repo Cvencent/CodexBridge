@@ -87,3 +87,67 @@ class HubTest(unittest.TestCase):
         self.hub.publish(record)
         self.assertEqual(self.s1.sent[-1]["data"], record.data)
         self.assertEqual(self.s2.sent, [])
+
+
+class FakeSpeechJob:
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return True
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class FakeSpeechRecognizer:
+    last_error = ""
+    recognition_timeout_seconds = 5.0
+
+    def start(self, wav_path):
+        return FakeSpeechJob()
+
+    def result(self, process):
+        return True, "统一语音结果"
+
+
+class HubSpeechTest(unittest.TestCase):
+    def test_audio_events_use_the_shared_transcription_service(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        from codexbridge.speech import SpeechService
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+        registry.upsert(
+            "d1",
+            model="dotii",
+            supported=["audio"],
+        )
+        registry.set_enabled("d1", ["audio"])
+        speech = SpeechService(
+            recognizer=FakeSpeechRecognizer(),
+            output_dir=Path(tmp.name),
+        )
+        hub = BridgeHub(registry, speech=speech)
+        session = FakeSession()
+        hub.attach("d1", session)
+
+        hub.handle_device_event("d1", {"type": "record_start"})
+        pcm = b"\x00\x00" * 16000
+        hub.handle_device_event(
+            "d1",
+            {"type": "audio_chunk", "data": base64.b64encode(pcm).decode()},
+        )
+        hub.handle_device_event("d1", {"type": "record_stop", "bytes": len(pcm)})
+        hub.poll_speech()
+
+        self.assertEqual(
+            session.sent[-1],
+            {"type": "transcript", "text": "统一语音结果"},
+        )

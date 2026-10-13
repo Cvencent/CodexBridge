@@ -29,9 +29,11 @@ class BridgeHub:
         self,
         registry: DeviceRegistry,
         store: MessageStore | None = None,
+        speech=None,
     ):
         self.registry = registry
         self.store = store or MessageStore()
+        self.speech = speech
         self._sessions: dict[str, Any] = {}
         self._lock = threading.RLock()
 
@@ -69,6 +71,16 @@ class BridgeHub:
             return
         if capability not in self.capabilities_for(device_id):
             self._send_error(device_id, "capability_not_enabled")
+            return
+        if capability == "audio" and self.speech is not None:
+            for message in self.speech.handle_event(device_id, event):
+                self._send(device_id, message)
+
+    def poll_speech(self) -> None:
+        if self.speech is None:
+            return
+        for device_id, message in self.speech.poll():
+            self._send(device_id, message)
 
     def capabilities_for(self, device_id: str) -> set[str]:
         record = self.registry.get(device_id)

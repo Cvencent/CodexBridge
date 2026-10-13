@@ -21,7 +21,7 @@ class MenuItem:
 
 def build_menu_model(registry: DeviceRegistry, hub: BridgeHub) -> list[MenuItem]:
     model = [
-        MenuItem("打开管理中心", "action", "open_admin"),
+        MenuItem("打开设置", "action", "open_settings"),
         MenuItem("打开日志目录", "action", "open_logs"),
     ]
     sessions = getattr(hub, "_sessions", {})
@@ -82,6 +82,7 @@ def make_tray_menu(pystray, registry: DeviceRegistry, hub: BridgeHub, make_dispa
                     make_dispatch(item.action_id),
                     checked=checked,
                     radio=False,
+                    default=(item.action_id == "open_settings"),
                 )
 
         return pystray.Menu(entries)
@@ -133,8 +134,8 @@ def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
                 toggle(action_id)
             elif action_id.startswith("remove_device:"):
                 remove(action_id)
-            elif action_id == "open_admin":
-                webbrowser.open("http://127.0.0.1:8787/")
+            elif action_id == "open_settings":
+                webbrowser.open("http://127.0.0.1:8788/settings")
             elif action_id == "open_logs":
                 data_dir = Path(
                     os.environ.get("LOCALAPPDATA", str(Path.home()))

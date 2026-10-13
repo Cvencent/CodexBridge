@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codexbridge"
-version = "0.1.0"
+version = "1.1.0"
 description = "Unified LAN bridge for Codex-aware devices"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,3 +20,6 @@ packages = [
     "codexbridge.protocol",
     "codexbridge.devices",
 ]
+
+[tool.setuptools.package-data]
+codexbridge = ["windows_speech_recognize.ps1"]

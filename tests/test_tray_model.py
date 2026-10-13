@@ -8,11 +8,12 @@ from codexbridge.tray import build_menu_model, make_tray_menu
 
 
 class FakeMenuItem:
-    def __init__(self, text, action, checked=None, radio=False):
+    def __init__(self, text, action, checked=None, radio=False, default=False):
         self.text = text
         self.action = action
         self.checked = checked
         self.radio = radio
+        self.default = default
 
 
 class FakeMenu:
@@ -75,3 +76,17 @@ class TrayModelTest(unittest.TestCase):
         self.assertTrue(
             any("桌面屏" in item.text for item in menu.items)
         )
+
+    def test_first_menu_item_opens_settings_by_default(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+        model = build_menu_model(registry, BridgeHub(registry))
+        self.assertEqual(model[0].action_id, "open_settings")
+        menu = make_tray_menu(
+            FakePystray,
+            registry,
+            BridgeHub(registry),
+            lambda _action_id: (lambda *_args: None),
+        )
+        self.assertTrue(menu.items[0].default)
