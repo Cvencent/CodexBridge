@@ -482,17 +482,55 @@ CodexBridge 会将该设备写入消息的 `read_by`，并向其他支持 `read_
 
 ### 9.6 Codex 目录与线程事件
 
-以下事件当前都要求能力 `tasks`，用于设备侧发起目录、项目或线程操作：
+以下事件都要求能力 `tasks`，用于设备侧发起目录、项目或线程操作。除
+`codex_catalog_cancel` 和 `codex_selection_confirm` 外，设备应在事件中携带
+递增的 `request_id`；CodexBridge 会在对应的目录、选中或错误响应中回显同一个
+`request_id`。设备应按 `request_id` 过滤过期响应。
 
 ```json
-{"type":"codex_catalog_request"}
-{"type":"codex_project_select","project_id":"p1"}
-{"type":"codex_thread_select","thread_id":"t1"}
-{"type":"codex_thread_new"}
+{"type":"codex_catalog_request","request_id":1}
+{"type":"codex_project_select","id":"p1","request_id":2}
+{"type":"codex_thread_select","id":"t1","request_id":3}
+{"type":"codex_thread_new","request_id":4}
+{"type":"codex_selection_confirm","request_id":3}
+{"type":"codex_catalog_cancel"}
 ```
 
-通用协议层当前只做事件识别与能力校验。未授权事件返回
-`capability_not_enabled`；已授权事件目前不会产生额外的通用协议应答，具体业务处理取决于后续实现。
+目录请求返回当前 Codex Desktop 的项目和线程。项目和线程使用短 ID：项目为
+`p0`、`p1` 等，线程为 `t0`、`t1` 等；项目多于 7 个时最后一项为
+`p_more`，用于切换下一页。线程按项目的目录归属或桌面端项目 assignment
+过滤，只返回属于当前项目的任务。`id` 字段是设备后续选择和确认时使用的目录
+ID，不是 Codex 的原始 UUID。
+
+选择线程只读取本地会话记录并返回摘要，不会调用 `thread/read` 或启动新的
+任务，因此不会把任务从 Codex Desktop 抢到 Bridge 进程。
+
+项目目录示例：
+
+```json
+{"type":"codex_catalog_begin","scope":"projects","request_id":1}
+{"type":"codex_catalog_item","scope":"projects","id":"p0","title":"项目名","detail":"项目 1/6","request_id":1}
+{"type":"codex_catalog_end","scope":"projects","request_id":1}
+```
+
+选择项目后返回线程目录，`scope` 为 `threads`。线程目录只包含真实任务；
+“新建任务”由设备界面自行添加。选择线程成功后返回：
+
+```json
+{"type":"codex_selected","title":"任务名","project":"项目名","last_message":"最后一段文本","request_id":3}
+```
+
+`last_message` 只包含最后一个可展示的助手文本片段，长度受设备协议单行上限
+约束。选择成功由设备发送 `codex_selection_confirm` 确认，放弃浏览时发送
+`codex_catalog_cancel`；两者都不要求 CodexBridge 返回额外应答。
+
+当前 Bridge 不通过 `codex_thread_new` 创建任务，事件返回：
+
+```json
+{"type":"error","text":"请先在电脑 Codex 新建任务，再回设备选择"}
+```
+
+未授权事件返回 `capability_not_enabled`。
 
 ### 9.7 能力对应表
 

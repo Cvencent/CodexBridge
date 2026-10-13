@@ -30,12 +30,18 @@ class BridgeHub:
         registry: DeviceRegistry,
         store: MessageStore | None = None,
         speech=None,
+        codex_catalog=None,
     ):
         self.registry = registry
         self.store = store or MessageStore()
         self.speech = speech
+        self.codex_catalog = codex_catalog
         self._sessions: dict[str, Any] = {}
         self._lock = threading.RLock()
+
+    def set_codex_catalog(self, codex_catalog: Any) -> None:
+        with self._lock:
+            self.codex_catalog = codex_catalog
 
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
@@ -66,15 +72,51 @@ class BridgeHub:
                 self._send_error(device_id, "capability_not_enabled")
             return
 
+        if event_type in {"codex_catalog_cancel", "codex_selection_confirm"}:
+            if "tasks" not in self.capabilities_for(device_id):
+                self._send_error(device_id, "capability_not_enabled")
+                return
+            self._handle_codex_catalog(device_id, event)
+            return
+
         capability = DEVICE_EVENT_CAPABILITY.get(event_type)
         if capability is None:
             return
         if capability not in self.capabilities_for(device_id):
             self._send_error(device_id, "capability_not_enabled")
             return
+        if event_type in {
+            "codex_catalog_request",
+            "codex_project_select",
+            "codex_thread_select",
+            "codex_thread_new",
+        }:
+            self._handle_codex_catalog(device_id, event)
+            return
         if capability == "audio" and self.speech is not None:
             for message in self.speech.handle_event(device_id, event):
                 self._send(device_id, message)
+
+    def _handle_codex_catalog(self, device_id: str, event: dict) -> None:
+        with self._lock:
+            service = self.codex_catalog
+        if service is None:
+            self._send_error(device_id, "codex_catalog_unavailable")
+            return
+        try:
+            messages = service.handle_device_event(device_id, event)
+        except Exception:
+            self._send_error(device_id, "codex_catalog_failed")
+            return
+        request_id = event.get("request_id")
+        has_request_id = "request_id" in event
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            payload = dict(message)
+            if has_request_id:
+                payload["request_id"] = request_id
+            self._send(device_id, payload)
 
     def poll_speech(self) -> None:
         if self.speech is None:

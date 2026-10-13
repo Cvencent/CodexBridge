@@ -13,6 +13,26 @@ class FakeSession:
         self.sent.append(message)
 
 
+class FakeCatalog:
+    def __init__(self):
+        self.events = []
+
+    def handle_device_event(self, device_id, event):
+        del device_id
+        self.events.append(event)
+        return [
+            {"type": "codex_catalog_begin", "scope": "projects"},
+            {
+                "type": "codex_catalog_item",
+                "scope": "projects",
+                "id": "p0",
+                "title": "项目一",
+                "detail": "项目 1/1",
+            },
+            {"type": "codex_catalog_end", "scope": "projects"},
+        ]
+
+
 class HubTest(unittest.TestCase):
     def setUp(self):
         self.hub = BridgeHub(DeviceRegistry(None))
@@ -87,6 +107,49 @@ class HubTest(unittest.TestCase):
         self.hub.publish(record)
         self.assertEqual(self.s1.sent[-1]["data"], record.data)
         self.assertEqual(self.s2.sent, [])
+
+    def test_catalog_request_uses_service_and_echoes_request_id(self):
+        catalog = FakeCatalog()
+        self.hub.set_codex_catalog(catalog)
+
+        self.hub.handle_device_event(
+            "d1",
+            {"type": "codex_catalog_request", "request_id": 7},
+        )
+
+        self.assertEqual(len(catalog.events), 1)
+        self.assertEqual(catalog.events[0]["request_id"], 7)
+        self.assertEqual(
+            [message["type"] for message in self.s1.sent],
+            ["codex_catalog_begin", "codex_catalog_item", "codex_catalog_end"],
+        )
+        self.assertTrue(all(message["request_id"] == 7 for message in self.s1.sent))
+
+    def test_catalog_selection_and_cancel_are_routed_to_service(self):
+        catalog = FakeCatalog()
+        self.hub.set_codex_catalog(catalog)
+
+        self.hub.handle_device_event(
+            "d1",
+            {"type": "codex_project_select", "id": "p0", "request_id": 8},
+        )
+        self.hub.handle_device_event(
+            "d1",
+            {"type": "codex_catalog_cancel"},
+        )
+        self.hub.handle_device_event(
+            "d1",
+            {"type": "codex_selection_confirm", "request_id": 8},
+        )
+
+        self.assertEqual(
+            [event["type"] for event in catalog.events],
+            [
+                "codex_project_select",
+                "codex_catalog_cancel",
+                "codex_selection_confirm",
+            ],
+        )
 
 
 class FakeSpeechJob:

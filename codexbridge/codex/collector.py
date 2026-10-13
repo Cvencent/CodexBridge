@@ -157,6 +157,7 @@ def run_codex_collector(
     restart: threading.Event | None = None,
     enabled: Callable[[], bool] | None = None,
     source_factory: Callable[[], Any] | None = None,
+    on_source: Callable[[Any | None], None] | None = None,
 ) -> None:
     backoff = 2.0
     while not stop.is_set():
@@ -178,6 +179,8 @@ def run_codex_collector(
                 else CodexAppServerSource(runtime_folder, cwd, codex_command)
             )
             source.start()
+            if on_source is not None:
+                on_source(source)
             if report is not None:
                 report("online", "Codex App Server 已连接")
             backoff = 2.0
@@ -216,6 +219,8 @@ def run_codex_collector(
                 stop.wait(min(0.25, remaining))
             backoff = min(30.0, backoff * 2)
         finally:
+            if on_source is not None:
+                on_source(None)
             if source is not None and hasattr(source, "close"):
                 source.close()
         if restart is not None and restart.is_set():

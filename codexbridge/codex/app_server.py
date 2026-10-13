@@ -138,6 +138,7 @@ class AppServerClient:
         self.timeout = timeout
         self.process: subprocess.Popen[str] | None = None
         self._next_id = 1
+        self._request_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
@@ -209,29 +210,30 @@ class AppServerClient:
         self._send({"method": method, "params": params})
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        request_id = self._next_id
-        self._next_id += 1
-        target: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
-        with self._pending_lock:
-            self._pending[request_id] = target
-        try:
-            message: dict[str, Any] = {"method": method, "id": request_id}
-            if params is not None:
-                message["params"] = params
-            self._send(message)
-            try:
-                response = target.get(timeout=self.timeout)
-            except queue.Empty as error:
-                raise AppServerError(f"App Server 请求超时：{method}") from error
-            if "error" in response:
-                detail = response.get("error")
-                if isinstance(detail, dict):
-                    detail = detail.get("message", detail)
-                raise AppServerError(f"App Server 请求失败 {method}：{detail}")
-            return response.get("result")
-        finally:
+        with self._request_lock:
+            request_id = self._next_id
+            self._next_id += 1
+            target: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
             with self._pending_lock:
-                self._pending.pop(request_id, None)
+                self._pending[request_id] = target
+            try:
+                message: dict[str, Any] = {"method": method, "id": request_id}
+                if params is not None:
+                    message["params"] = params
+                self._send(message)
+                try:
+                    response = target.get(timeout=self.timeout)
+                except queue.Empty as error:
+                    raise AppServerError(f"App Server 请求超时：{method}") from error
+                if "error" in response:
+                    detail = response.get("error")
+                    if isinstance(detail, dict):
+                        detail = detail.get("message", detail)
+                    raise AppServerError(f"App Server 请求失败 {method}：{detail}")
+                return response.get("result")
+            finally:
+                with self._pending_lock:
+                    self._pending.pop(request_id, None)
 
     def close(self) -> None:
         process = self.process

@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 from codexbridge.admin_api import AdminApi
+from codexbridge.codex.app_server import AppServerClient, AppServerError, _resolve_codex_command
+from codexbridge.codex.catalog import CodexCatalogService
 from codexbridge.codex.collector import records_from_snapshot, run_codex_collector
 from codexbridge.devices.discovery import discover
 from codexbridge.devices.manager import DeviceManager
@@ -76,6 +78,62 @@ class _CodexState:
             }
 
 
+class _CodexSourceHolder:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._source = None
+        self._fallback = None
+        self._fallback_command = None
+        self._fallback_cwd = None
+        self._fallback_runtime = None
+
+    def configure(self, command: str | None, cwd: Path, runtime_folder: Path) -> None:
+        with self._lock:
+            self._fallback_command = command
+            self._fallback_cwd = cwd
+            self._fallback_runtime = runtime_folder
+
+    def set(self, source) -> None:
+        with self._lock:
+            self._source = source
+            if source is None:
+                fallback = self._fallback
+                self._fallback = None
+            else:
+                fallback = None
+        if fallback is not None:
+            fallback.close()
+
+    def request(self, method: str, params: dict) -> object:
+        with self._lock:
+            source = self._source
+            if source is not None:
+                return source.client.request(method, params)
+            fallback = self._fallback
+            if fallback is None:
+                if self._fallback_cwd is None:
+                    raise AppServerError("Codex App Server 尚未连接")
+                command = _resolve_codex_command(
+                    self._fallback_command,
+                    self._fallback_runtime,
+                )
+                fallback = AppServerClient(command, self._fallback_cwd)
+                fallback.start()
+                self._fallback = fallback
+            return fallback.request(method, params)
+
+    def close(self) -> None:
+        with self._lock:
+            primary = self._source
+            fallback = self._fallback
+            self._source = None
+            self._fallback = None
+        if fallback is not None:
+            fallback.close()
+        if primary is not None and hasattr(primary, "close"):
+            primary.close()
+
+
 def _codex_working_directory() -> Path:
     configured = os.environ.get("CODEXBRIDGE_CODEX_CWD")
     if configured:
@@ -136,7 +194,15 @@ def main(argv: list[str] | None = None) -> int:
     _migrate_legacy(registry)
 
     speech = SpeechService(output_dir=data_dir / "recordings")
-    hub = BridgeHub(registry, speech=speech)
+    source_holder = _CodexSourceHolder()
+    codex_cwd = _codex_working_directory()
+    codex_command = os.environ.get("CODEXBRIDGE_CODEX_COMMAND")
+    source_holder.configure(codex_command, codex_cwd, data_dir)
+    codex_catalog = CodexCatalogService(
+        source_holder.request,
+        workspace=codex_cwd,
+    )
+    hub = BridgeHub(registry, speech=speech, codex_catalog=codex_catalog)
     manager = DeviceManager(registry, hub)
     codex_state = _CodexState()
 
@@ -167,13 +233,14 @@ def main(argv: list[str] | None = None) -> int:
         target=run_codex_collector,
         kwargs={
             "runtime_folder": data_dir,
-            "cwd": _codex_working_directory(),
+            "cwd": codex_cwd,
             "interval": 5.0,
             "stop": codex_stop,
             "publish": publish_codex,
-            "codex_command": os.environ.get("CODEXBRIDGE_CODEX_COMMAND"),
+            "codex_command": codex_command,
             "report": codex_state.report,
             "enabled": lambda: codex_state.snapshot()["enabled"],
+            "on_source": source_holder.set,
         },
         daemon=True,
     )
@@ -217,6 +284,9 @@ def main(argv: list[str] | None = None) -> int:
         speech_thread.join(timeout=1.0)
         codex_thread.join(timeout=1.0)
         discovery_thread.join(timeout=1.0)
+        # Close the fallback client only after the collector has stopped using
+        # the source holder; closing it first can race an in-flight request.
+        source_holder.close()
     if restart_requested.is_set():
         _launch_restarted_process(data_dir)
     return 0

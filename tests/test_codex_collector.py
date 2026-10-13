@@ -190,6 +190,28 @@ class CodexCollectorTest(unittest.TestCase):
         self.assertTrue(sources[0].started)
         self.assertTrue(sources[0].closed)
 
+    def test_collector_registers_and_clears_active_source(self):
+        stop = threading.Event()
+        source = FakeSource(SNAPSHOT)
+        active = []
+
+        def publish(records):
+            del records
+            stop.set()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_codex_collector(
+                runtime_folder=Path(temp_dir),
+                cwd=Path(temp_dir),
+                interval=0.01,
+                stop=stop,
+                publish=publish,
+                source_factory=lambda: source,
+                on_source=lambda current: active.append(current),
+            )
+
+        self.assertEqual(active, [source, None])
+
 
 if __name__ == "__main__":
     unittest.main()
