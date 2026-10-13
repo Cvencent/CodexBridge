@@ -19,7 +19,16 @@ packages = [
     "codexbridge.codex",
     "codexbridge.protocol",
     "codexbridge.devices",
+    "codexbridge.management",
+    "codexbridge.management.platforms",
 ]
 
 [tool.setuptools.package-data]
 codexbridge = ["windows_speech_recognize.ps1"]
+"codexbridge.management" = [
+    "state.json",
+    "assets/*",
+    "web/*",
+    "web/assets/*",
+    "web/assets/expressions/*",
+]
