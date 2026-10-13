@@ -15,6 +15,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "packaging/CodexBridge.iss",
             "packaging/build_windows.ps1",
             ".github/workflows/release-windows.yml",
+            f"release-notes/v{codexbridge.VERSION}.md",
         ]
         for relative in expected:
             with self.subTest(relative=relative):
@@ -31,6 +32,8 @@ class WindowsPackagingTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("CodexBridge-Setup-", workflow)
         self.assertIn("gh release upload", workflow)
+        self.assertIn("--notes-file", workflow)
+        self.assertNotIn("--generate-notes", workflow)
 
     def test_installer_configuration_is_valid(self):
         installer = (ROOT / "packaging/CodexBridge.iss").read_text(
@@ -58,3 +61,4 @@ class WindowsPackagingTest(unittest.TestCase):
         match = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
         self.assertIsNotNone(match)
         self.assertEqual(match.group(1), codexbridge.VERSION)
+

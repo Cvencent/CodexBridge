@@ -39,10 +39,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $version = (python -c "import codexbridge; print(codexbridge.VERSION)")
+          $notes = Join-Path $PWD "release-notes/v$version.md"
+          if (-not (Test-Path -LiteralPath $notes)) {
+            throw "Missing Chinese release notes: release-notes/v$version.md"
+          }
           gh release view "v$version" 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create "v$version" --title "CodexBridge v$version" --generate-notes
+            gh release create "v$version" --title "CodexBridge v$version" --notes-file $notes
           }
           gh release upload "v$version" release/* --clobber
           Write-Host "Uploaded CodexBridge-Setup-$version-win64.exe and portable package"
-          gh release edit "v$version" --title "CodexBridge v$version"
+          gh release edit "v$version" --title "CodexBridge v$version" --notes-file $notes
