@@ -16,6 +16,7 @@ class FakeMenuItem:
         radio=False,
         default=False,
         visible=True,
+        enabled=True,
     ):
         self.text = text
         self.action = action
@@ -23,6 +24,7 @@ class FakeMenuItem:
         self.radio = radio
         self.default = default
         self.visible = visible
+        self.enabled = enabled
 
     def __call__(self, icon):
         return self.action(icon, self)
@@ -34,7 +36,11 @@ class FakeMenu:
 
     @property
     def items(self):
-        if len(self._items) == 1 and callable(self._items[0]):
+        if (
+            len(self._items) == 1
+            and callable(self._items[0])
+            and not isinstance(self._items[0], FakeMenuItem)
+        ):
             return tuple(self._items[0]())
         return self._items
 
@@ -55,34 +61,50 @@ class FakePystray:
 
 
 class TrayModelTest(unittest.TestCase):
-    def test_menu_has_only_restart_about_and_exit(self):
+    def build_registry(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         registry = DeviceRegistry(Path(tmp.name) / "devices.json")
         registry.upsert(
             "d1", model="dotii", name="桌面屏", supported=["status", "text"]
         )
+        return registry
+
+    def test_menu_exposes_devices_and_system_actions(self):
+        registry = self.build_registry()
         model = build_menu_model(registry, BridgeHub(registry))
-        self.assertEqual([item.label for item in model], ["重启", "关于", "退出"])
         self.assertEqual(
-            [item.action_id for item in model],
-            ["restart", "about", "exit"],
+            [item.label for item in model],
+            ["设备", "打开设置", "重启", "关于", "退出"],
+        )
+        self.assertEqual(model[0].kind, "submenu")
+        self.assertEqual(
+            [item.action_id for item in model[1:]],
+            ["open_settings", "restart", "about", "exit"],
         )
 
-    def test_tray_has_no_device_submenus(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
-        registry.upsert(
-            "d1", model="dotii", name="桌面屏", supported=["status", "text"]
-        )
+    def test_device_submenu_lists_each_device_and_capability(self):
+        registry = self.build_registry()
         model = build_menu_model(registry, BridgeHub(registry))
-        self.assertFalse(any(item.kind == "submenu" for item in model))
+        device_menu = model[0]
+        self.assertEqual(device_menu.children[0].label, "桌面屏")
+        capability_menu = device_menu.children[0].children[0]
+        self.assertEqual(capability_menu.label, "能力")
+        self.assertEqual(
+            [item.label for item in capability_menu.children],
+            ["status", "text"],
+        )
+        self.assertEqual(
+            [item.checked for item in capability_menu.children],
+            [True, True],
+        )
+        self.assertEqual(
+            capability_menu.children[0].action_id,
+            "capability:d1:status",
+        )
 
-    def test_tray_menu_exposes_three_items(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+    def test_tray_menu_exposes_device_submenu_and_system_actions(self):
+        registry = self.build_registry()
         menu = make_tray_menu(
             FakePystray,
             registry,
@@ -91,13 +113,15 @@ class TrayModelTest(unittest.TestCase):
         )
         self.assertEqual(
             [item.text for item in menu.visible_items],
-            ["重启", "关于", "退出"],
+            ["设备", "打开设置", "重启", "关于", "退出"],
+        )
+        self.assertEqual(
+            [item.text for item in menu.visible_items[0].action.items],
+            ["桌面屏"],
         )
 
     def test_tray_left_click_opens_settings(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+        registry = self.build_registry()
         actions = []
         menu = make_tray_menu(
             FakePystray,
@@ -109,3 +133,13 @@ class TrayModelTest(unittest.TestCase):
         )
         menu(object())
         self.assertEqual(actions, ["open_settings"])
+
+    def test_device_menu_reflects_current_enabled_capabilities(self):
+        registry = self.build_registry()
+        model = build_menu_model(registry, BridgeHub(registry))
+        capability = model[0].children[0].children[0].children[0]
+        self.assertTrue(capability.checked)
+        registry.set_enabled("d1", ["text"])
+        updated = build_menu_model(registry, BridgeHub(registry))
+        reversed_capability = updated[0].children[0].children[0].children[0]
+        self.assertFalse(reversed_capability.checked)

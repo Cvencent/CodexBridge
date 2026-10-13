@@ -19,15 +19,51 @@ class MenuItem:
     kind: str
     action_id: str | None = None
     checked: bool | None = None
-    children: list[MenuItem] = field(default_factory=list)
+    children: list["MenuItem"] = field(default_factory=list)
+
+
+def _device_label(record) -> str:
+    name = record.name or record.device_id
+    return name
+
+
+def _device_menu(record, hub: BridgeHub) -> MenuItem:
+    capabilities = sorted(record.supported)
+    enabled = set(record.enabled)
+    capability_items = [
+        MenuItem(
+            label=feature,
+            kind="check",
+            action_id=f"capability:{record.device_id}:{feature}",
+            checked=feature in enabled,
+        )
+        for feature in capabilities
+    ]
+    children: list[MenuItem] = []
+    if capability_items:
+        children.append(MenuItem("能力", "submenu", children=capability_items))
+    else:
+        children.append(MenuItem("能力（设备未上报）", "info"))
+    children.append(
+        MenuItem("移除设备", "action", f"remove:{record.device_id}")
+    )
+    return MenuItem(_device_label(record), "submenu", children=children)
 
 
 def build_menu_model(
     registry: DeviceRegistry | None = None,
     hub: BridgeHub | None = None,
 ) -> list[MenuItem]:
-    del registry, hub
+    registry = registry or DeviceRegistry(None)
+    hub = hub or BridgeHub(registry)
+    devices = [
+        _device_menu(record, hub)
+        for record in registry._devices.values()
+    ]
+    device_menu = MenuItem("设备", "submenu", children=devices)
     return [
+        device_menu,
+        MenuItem("打开设置", "action", "open_settings"),
         MenuItem("重启", "action", "restart"),
         MenuItem("关于", "action", "about"),
         MenuItem("退出", "action", "exit"),
@@ -40,24 +76,37 @@ def make_tray_menu(
     hub: BridgeHub,
     make_dispatch,
 ):
-    def entries():
-        for item in build_menu_model(registry, hub):
+    def menu_items(items):
+        for item in items:
+            if item.kind == "info":
+                yield pystray.MenuItem(
+                    item.label,
+                    lambda *_args: None,
+                    enabled=False,
+                    visible=True,
+                )
+                continue
+            if item.kind == "submenu":
+                yield pystray.MenuItem(
+                    item.label,
+                    pystray.Menu(lambda children=item.children: tuple(menu_items(children))),
+                    checked=None,
+                    radio=False,
+                    default=False,
+                )
+                continue
             yield pystray.MenuItem(
                 item.label,
                 make_dispatch(item.action_id),
-                checked=None,
+                checked=(lambda _item, value=item.checked: value) if item.kind == "check" else None,
                 radio=False,
-                default=False,
+                default=item.action_id == "open_settings",
             )
-        yield pystray.MenuItem(
-            "打开设置",
-            make_dispatch("open_settings"),
-            visible=False,
-            default=True,
-        )
+
+    def entries():
+        return tuple(menu_items(build_menu_model(registry, hub)))
 
     return pystray.Menu(entries)
-
 
 def about_text() -> str:
     return (
@@ -110,6 +159,24 @@ def run(
                 webbrowser.open(SETTINGS_URL)
             elif action_id == "exit":
                 icon.stop()
+            elif action_id and action_id.startswith("capability:"):
+                _, device_id, feature = action_id.split(":", 2)
+                record = registry.get(device_id)
+                if record is None:
+                    return
+                enabled = set(record.enabled)
+                if feature in enabled:
+                    enabled.discard(feature)
+                else:
+                    enabled.add(feature)
+                registry.set_enabled(device_id, enabled)
+                registry.save()
+                hub.push_capabilities(device_id)
+            elif action_id and action_id.startswith("remove:"):
+                device_id = action_id.split(":", 1)[1]
+                if registry.remove(device_id):
+                    registry.save()
+                    hub.detach(device_id)
 
         return dispatch
 
@@ -117,6 +184,12 @@ def run(
         "CodexBridge",
         image,
         "CodexBridge",
-        make_tray_menu(pystray, registry, hub, make_dispatch),
+        make_tray_menu(
+            pystray,
+            registry,
+            hub,
+            make_dispatch,
+            on_device_removed=manager,
+        ),
     )
     icon.run()
