@@ -302,6 +302,28 @@ SETTINGS_HTML = r'''<!doctype html>
       border-left: 3px solid var(--border-strong);
       font-size: 13px;
     }
+    .general-list { display: grid; gap: 10px; }
+    .general-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 58px;
+      padding: 12px 13px;
+      background: var(--surface-muted);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .general-row strong { display: block; font-size: 15px; }
+    .general-row p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+    .switch {
+      position: relative;
+      flex: 0 0 auto;
+      width: 48px;
+      height: 28px;
+      accent-color: var(--accent);
+    }
+    .general-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
     @media (max-width: 900px) {
       .layout { grid-template-columns: 1fr; }
     }
@@ -340,6 +362,35 @@ SETTINGS_HTML = r'''<!doctype html>
     </div>
 
     <div class="layout">
+      <section class="panel" aria-labelledby="general-title">
+        <div class="panel-header">
+          <h2 id="general-title">常规设置</h2>
+          <p>这些设置在下次启动或重新打开管理中心后仍然保留。</p>
+        </div>
+        <div class="panel-body">
+          <div class="general-list">
+            <div class="general-row">
+              <div>
+                <strong>开机自启动</strong>
+                <p>登录 Windows 后自动运行 CodexBridge。</p>
+              </div>
+              <input id="startup-enabled" class="switch" type="checkbox" role="switch" aria-label="开机自启动">
+            </div>
+            <div class="general-row">
+              <div>
+                <strong>日志目录</strong>
+                <p>打开存放运行日志、录音和设备配置的目录。</p>
+              </div>
+              <button id="open-logs" class="button" type="button">打开日志目录</button>
+            </div>
+          </div>
+          <div class="general-actions">
+            <button id="refresh-general" class="button" type="button">刷新状态</button>
+          </div>
+          <div id="general-message" class="form-message" role="status" aria-live="polite">正在读取常规设置...</div>
+        </div>
+      </section>
+
       <section class="panel" aria-labelledby="devices-title">
         <div class="panel-header">
           <h2 id="devices-title">设备</h2>
@@ -783,6 +834,65 @@ SETTINGS_HTML = r'''<!doctype html>
       }
     }
 
+    async function loadGeneral() {
+      const toggle = $("#startup-enabled");
+      try {
+        const payload = await requestJson("/api/admin/settings/general");
+        toggle.checked = Boolean(payload.general.startup_enabled);
+        setMessage($("#general-message"), "常规设置已读取。");
+      } catch (error) {
+        toggle.disabled = true;
+        setMessage($("#general-message"), `读取失败：${error.message}`, "error");
+      }
+    }
+
+    async function saveStartup() {
+      const toggle = $("#startup-enabled");
+      toggle.disabled = true;
+      setMessage($("#general-message"), "正在保存开机自启动设置...", "working");
+      try {
+        const payload = await requestJson("/api/admin/settings/general", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({startup_enabled: toggle.checked})
+        });
+        toggle.checked = Boolean(payload.general.startup_enabled);
+        setMessage(
+          $("#general-message"),
+          toggle.checked ? "已开启开机自启动。" : "已关闭开机自启动。",
+          "success"
+        );
+      } catch (error) {
+        setMessage($("#general-message"), `保存失败：${error.message}`, "error");
+      } finally {
+        toggle.disabled = false;
+      }
+    }
+
+    async function openLogs() {
+      const button = $("#open-logs");
+      setBusy(button, true, "打开中...");
+      try {
+        await requestJson("/api/admin/settings/general", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "open_logs"})
+        });
+        setMessage($("#general-message"), "已打开日志目录。", "success");
+      } catch (error) {
+        setMessage($("#general-message"), `打开失败：${error.message}`, "error");
+      } finally {
+        setBusy(button, false, "打开中...");
+      }
+    }
+
+    $("#startup-enabled").addEventListener("change", saveStartup);
+    $("#open-logs").addEventListener("click", openLogs);
+    $("#refresh-general").addEventListener("click", () => {
+      $("#startup-enabled").disabled = false;
+      loadGeneral();
+    });
+
     $$('input[name="source"]').forEach((input) => input.addEventListener("change", syncRemoteFields));
     $("#speech-form").addEventListener("submit", saveSpeech);
     $("#test-speech").addEventListener("click", testSpeech);
@@ -794,6 +904,7 @@ SETTINGS_HTML = r'''<!doctype html>
     });
 
     loadStatus();
+    loadGeneral();
     loadDevices();
     loadSpeech();
   </script>

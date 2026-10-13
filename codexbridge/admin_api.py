@@ -34,6 +34,9 @@ def handle_request(
     on_device_removed: Callable[[str], None] | None = None,
     codex_status: Callable[[], dict] | None = None,
     speech_config_path: Path | None = None,
+    startup_enabled: Callable[[], bool] | None = None,
+    set_startup_enabled: Callable[[bool], bool] | None = None,
+    open_logs: Callable[[], None] | None = None,
 ):
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -48,6 +51,41 @@ def handle_request(
                 "ok": True,
                 "version": VERSION,
                 "device_count": len(registry._devices),
+            }
+        if method == "GET" and path == "/api/admin/settings/general":
+            enabled = (
+                startup_enabled()
+                if startup_enabled is not None
+                else _startup_enabled()
+            )
+            return 200, {
+                "ok": True,
+                "general": {"startup_enabled": bool(enabled)},
+            }
+        if method == "POST" and path == "/api/admin/settings/general":
+            payload = _json_body(body)
+            if payload.get("action") == "open_logs":
+                if open_logs is not None:
+                    open_logs()
+                return 200, {"ok": True}
+            if "startup_enabled" not in payload:
+                return 400, {"ok": False, "error": "startup_enabled_required"}
+            value = payload.get("startup_enabled")
+            if not isinstance(value, bool):
+                return 400, {"ok": False, "error": "startup_enabled_invalid"}
+            requested = value
+            if set_startup_enabled is not None:
+                set_startup_enabled(requested)
+            else:
+                _set_startup_enabled(requested)
+            enabled = (
+                startup_enabled()
+                if startup_enabled is not None
+                else _startup_enabled()
+            )
+            return 200, {
+                "ok": True,
+                "general": {"startup_enabled": bool(enabled)},
             }
         if method == "GET" and path == "/api/admin/codex-status":
             status = codex_status() if codex_status is not None else {}
@@ -147,6 +185,18 @@ def handle_request(
     return 404, {"ok": False, "error": "not_found"}
 
 
+def _startup_enabled() -> bool:
+    from codexbridge.startup import is_startup_enabled
+
+    return is_startup_enabled()
+
+
+def _set_startup_enabled(enabled: bool) -> bool:
+    from codexbridge.startup import set_startup_enabled
+
+    return set_startup_enabled(enabled)
+
+
 def _speech_path(registry: DeviceRegistry) -> Path:
     if registry.path is not None:
         return Path(registry.path).parent / "speech-source.json"
@@ -199,6 +249,9 @@ class AdminApi:
         on_device_removed: Callable[[str], None] | None = None,
         codex_status: Callable[[], dict] | None = None,
         speech_config_path: Path | None = None,
+        startup_enabled: Callable[[], bool] | None = None,
+        set_startup_enabled: Callable[[bool], bool] | None = None,
+        open_logs: Callable[[], None] | None = None,
     ):
         self.hub = hub
         self.registry = registry
@@ -207,6 +260,9 @@ class AdminApi:
         self.on_device_removed = on_device_removed
         self.codex_status = codex_status
         self.speech_config_path = speech_config_path
+        self.startup_enabled = startup_enabled
+        self.set_startup_enabled = set_startup_enabled
+        self.open_logs = open_logs
         self._server: _AdminServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -260,6 +316,9 @@ class AdminApi:
                             api.on_device_removed,
                             api.codex_status,
                             api.speech_config_path,
+                            api.startup_enabled,
+                            api.set_startup_enabled,
+                            api.open_logs,
                         )
                 if isinstance(payload, str):
                     encoded = payload.encode("utf-8")

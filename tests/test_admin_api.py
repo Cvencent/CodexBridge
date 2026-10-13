@@ -133,6 +133,73 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(payload["codex"], status)
         self.assertTrue(payload["ok"])
 
+    def test_general_settings_default_to_disabled(self):
+        status, payload = handle_request(
+            "GET",
+            "/api/admin/settings/general",
+            {},
+            b"",
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            startup_enabled=lambda: False,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["general"]["startup_enabled"])
+
+    def test_general_settings_can_enable_startup(self):
+        state = {"enabled": False}
+
+        def set_enabled(value):
+            state["enabled"] = bool(value)
+
+        body = json.dumps({"startup_enabled": True}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/settings/general",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            startup_enabled=lambda: state["enabled"],
+            set_startup_enabled=set_enabled,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["general"]["startup_enabled"])
+        self.assertTrue(state["enabled"])
+
+    def test_general_settings_reject_non_boolean_startup(self):
+        body = json.dumps({"startup_enabled": "yes"}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/settings/general",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+
+    def test_general_settings_support_opening_logs(self):
+        opened = []
+        body = json.dumps({"action": "open_logs"}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/settings/general",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            open_logs=lambda: opened.append(True),
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(opened, [True])
+
     def test_settings_page_is_served(self):
         status, payload = handle_request(
             "GET",

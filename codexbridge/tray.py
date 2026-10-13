@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import webbrowser
 from dataclasses import dataclass, field
-from pathlib import Path
 
+from codexbridge import VERSION
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
-from codexbridge.protocol.capabilities import FEATURES
+
+REPOSITORY_URL = "https://github.com/Cvencent/CodexBridge"
+SETTINGS_URL = "http://127.0.0.1:8788/settings"
 
 
 @dataclass
@@ -19,78 +22,69 @@ class MenuItem:
     children: list[MenuItem] = field(default_factory=list)
 
 
-def build_menu_model(registry: DeviceRegistry, hub: BridgeHub) -> list[MenuItem]:
-    model = [
-        MenuItem("打开设置", "action", "open_settings"),
-        MenuItem("打开日志目录", "action", "open_logs"),
+def build_menu_model(
+    registry: DeviceRegistry | None = None,
+    hub: BridgeHub | None = None,
+) -> list[MenuItem]:
+    del registry, hub
+    return [
+        MenuItem("重启", "action", "restart"),
+        MenuItem("关于", "action", "about"),
+        MenuItem("退出", "action", "exit"),
     ]
-    sessions = getattr(hub, "_sessions", {})
-    records = sorted(
-        registry._devices.values(),
-        key=lambda record: record.device_id,
+
+
+def make_tray_menu(
+    pystray,
+    registry: DeviceRegistry,
+    hub: BridgeHub,
+    make_dispatch,
+):
+    def entries():
+        for item in build_menu_model(registry, hub):
+            yield pystray.MenuItem(
+                item.label,
+                make_dispatch(item.action_id),
+                checked=None,
+                radio=False,
+                default=False,
+            )
+        yield pystray.MenuItem(
+            "打开设置",
+            make_dispatch("open_settings"),
+            visible=False,
+            default=True,
+        )
+
+    return pystray.Menu(entries)
+
+
+def about_text() -> str:
+    return (
+        "CodexBridge\n"
+        f"版本 {VERSION}\n\n"
+        f"{REPOSITORY_URL}"
     )
-    for record in records:
-        title = record.name or record.device_id
-        online = record.device_id in sessions
-        children = [
-            MenuItem("配对设备...", "action", f"pair_device:{record.device_id}"),
-            MenuItem("手动添加 IP...", "action", f"manual_add:{record.device_id}"),
-        ]
-        for feature in FEATURES:
-            children.append(
-                MenuItem(
-                    feature,
-                    "check",
-                    f"toggle_capability:{record.device_id}:{feature}",
-                    feature in record.enabled,
-                )
-            )
-        children.append(
-            MenuItem("移除设备", "action", f"remove_device:{record.device_id}")
+
+
+def _show_about() -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            about_text(),
+            "关于 CodexBridge",
+            0x00000040,
         )
-        state = "在线" if online else "离线"
-        model.append(
-            MenuItem(
-                f"{title} ({record.model}) - {state}",
-                "submenu",
-                children=children,
-            )
-        )
-    model.append(MenuItem("退出", "action", "exit"))
-    return model
+    except Exception:
+        return
 
 
-def make_tray_menu(pystray, registry: DeviceRegistry, hub: BridgeHub, make_dispatch):
-    def make_menu(items):
-        def entries():
-            for item in items():
-                if item.kind == "submenu":
-                    yield pystray.MenuItem(
-                        item.label,
-                        make_menu(
-                            lambda children=tuple(item.children): children
-                        ),
-                    )
-                    continue
-                checked = None
-                if item.kind == "check":
-                    checked = lambda _item, action_id=item.action_id: (
-                        _capability_checked(registry, action_id)
-                    )
-                yield pystray.MenuItem(
-                    item.label,
-                    make_dispatch(item.action_id),
-                    checked=checked,
-                    radio=False,
-                    default=(item.action_id == "open_settings"),
-                )
-
-        return pystray.Menu(entries)
-
-    return make_menu(lambda: build_menu_model(registry, hub))
-
-
-def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
+def run(
+    hub: BridgeHub,
+    registry: DeviceRegistry,
+    manager=None,
+    on_restart=None,
+) -> None:
     try:
         import pystray
         from PIL import Image, ImageDraw
@@ -99,49 +93,21 @@ def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
             'Tray dependencies are missing; install with pip install -e ".[tray]".'
         ) from error
 
+    del manager
     image = Image.new("RGB", (64, 64), "#1f2933")
     draw = ImageDraw.Draw(image)
     draw.rectangle((14, 14, 50, 50), fill="#f4c95d")
 
-    def toggle(action_id: str) -> None:
-        _, device_id, feature = action_id.split(":", 2)
-        record = registry.get(device_id)
-        if record is None:
-            return
-        enabled = set(record.enabled)
-        if feature in enabled:
-            enabled.remove(feature)
-        else:
-            enabled.add(feature)
-        registry.set_enabled(device_id, enabled)
-        registry.save()
-        hub.push_capabilities(device_id)
-
-    def remove(action_id: str) -> None:
-        device_id = action_id.split(":", 1)[1]
-        if registry.remove(device_id):
-            registry.save()
-            if manager is not None:
-                manager.remove(device_id)
-            else:
-                hub.detach(device_id)
-
     def make_dispatch(action_id: str | None):
         def dispatch(icon, _item) -> None:
-            if action_id is None:
-                return
-            if action_id.startswith("toggle_capability:"):
-                toggle(action_id)
-            elif action_id.startswith("remove_device:"):
-                remove(action_id)
+            if action_id == "restart":
+                if on_restart is not None:
+                    on_restart()
+                icon.stop()
+            elif action_id == "about":
+                _show_about()
             elif action_id == "open_settings":
-                webbrowser.open("http://127.0.0.1:8788/settings")
-            elif action_id == "open_logs":
-                data_dir = Path(
-                    os.environ.get("LOCALAPPDATA", str(Path.home()))
-                ) / "CodexBridge"
-                data_dir.mkdir(parents=True, exist_ok=True)
-                os.startfile(data_dir)
+                webbrowser.open(SETTINGS_URL)
             elif action_id == "exit":
                 icon.stop()
 
@@ -154,11 +120,3 @@ def run(hub: BridgeHub, registry: DeviceRegistry, manager=None) -> None:
         make_tray_menu(pystray, registry, hub, make_dispatch),
     )
     icon.run()
-
-
-def _capability_checked(registry: DeviceRegistry, action_id: str | None) -> bool:
-    if action_id is None:
-        return False
-    _, device_id, feature = action_id.split(":", 2)
-    record = registry.get(device_id)
-    return record is not None and feature in record.enabled

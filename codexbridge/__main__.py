@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -81,6 +83,27 @@ def _codex_working_directory() -> Path:
     return Path.home()
 
 
+def _restart_command() -> list[str]:
+    executable = str(Path(sys.executable).resolve())
+    if getattr(sys, "frozen", False):
+        return [executable]
+    return [executable, "-m", "codexbridge"]
+
+
+def _launch_restarted_process(
+    data_dir: Path,
+    popen=None,
+) -> None:
+    launcher = subprocess.Popen if popen is None else popen
+    project_root = Path(__file__).resolve().parents[1]
+    cwd = data_dir if getattr(sys, "frozen", False) else project_root
+    launcher(
+        _restart_command(),
+        cwd=str(cwd),
+        close_fds=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="codexbridge")
     parser.add_argument(
@@ -117,11 +140,20 @@ def main(argv: list[str] | None = None) -> int:
         for record in records:
             hub.publish(record)
 
+    def open_logs() -> None:
+        os.startfile(data_dir)
+
+    restart_requested = threading.Event()
+
+    def restart_process() -> None:
+        restart_requested.set()
+
     admin = AdminApi(
         hub,
         registry,
         on_device_removed=manager.remove,
         codex_status=codex_state.snapshot,
+        open_logs=open_logs,
     )
     admin.start()
     stop = threading.Event()
@@ -163,7 +195,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from codexbridge import tray
 
-            tray.run(hub, registry, manager)
+            tray.run(
+                hub,
+                registry,
+                manager,
+                on_restart=restart_process,
+            )
     except KeyboardInterrupt:
         pass
     finally:
@@ -175,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
         speech_thread.join(timeout=1.0)
         codex_thread.join(timeout=1.0)
         discovery_thread.join(timeout=1.0)
+    if restart_requested.is_set():
+        _launch_restarted_process(data_dir)
     return 0
 
 

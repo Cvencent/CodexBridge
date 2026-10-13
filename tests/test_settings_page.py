@@ -8,6 +8,12 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("<html lang=\"zh-CN\">", SETTINGS_HTML)
         self.assertIn("CodexBridge 管理中心", SETTINGS_HTML)
 
+    def test_page_has_general_settings(self):
+        self.assertIn("常规设置", SETTINGS_HTML)
+        self.assertIn("开机自启动", SETTINGS_HTML)
+        self.assertIn("打开日志目录", SETTINGS_HTML)
+        self.assertIn("/api/admin/settings/general", SETTINGS_HTML)
+
     def test_page_has_device_and_speech_sections(self):
         self.assertIn("设备", SETTINGS_HTML)
         self.assertIn("语音识别", SETTINGS_HTML)
