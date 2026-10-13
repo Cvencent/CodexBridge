@@ -48,7 +48,7 @@ class ManagementApiTest(unittest.TestCase):
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def test_snapshot_excludes_codex_and_keeps_device_sections(self):

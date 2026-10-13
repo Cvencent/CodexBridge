@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import webbrowser
 from dataclasses import dataclass, field
 
@@ -118,28 +119,26 @@ def about_text() -> str:
     )
 
 
+def _show_dialog(message: str, title: str, flags: int) -> None:
+    def show() -> None:
+        try:
+            ctypes.windll.user32.MessageBoxW(None, message, title, flags)
+        except Exception:
+            return
+
+    threading.Thread(target=show, name="codexbridge-dialog", daemon=True).start()
+
+
 def _show_about() -> None:
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            about_text(),
-            "关于 CodexBridge",
-            0x00000040,
-        )
-    except Exception:
-        return
+    _show_dialog(about_text(), "关于 CodexBridge", 0x00000040)
 
 
 def _show_management_error() -> None:
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "管理中心子进程多次异常退出，请重启 CodexBridge 后重试。",
-            "管理中心不可用",
-            0x00000010,
-        )
-    except Exception:
-        return
+    _show_dialog(
+        "管理中心子进程多次异常退出，请重启 CodexBridge 后重试。",
+        "管理中心不可用",
+        0x00000010,
+    )
 
 
 def run(

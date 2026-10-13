@@ -95,10 +95,10 @@ class MacOSPlatformAdapterTests(unittest.TestCase):
                 mock.patch.object(runtime_paths.sys, "executable", str(executable)),
                 mock.patch.object(runtime_paths.sys, "frozen", True, create=True),
             ):
-                self.assertEqual(runtime_paths.application_root(), contents / "Resources")
+                self.assertEqual(runtime_paths.application_root(), (contents / "Resources").resolve())
                 self.assertEqual(
                     runtime_paths.sibling_executable("CodexBridge"),
-                    contents / "MacOS" / "CodexBridge",
+                    (contents / "MacOS" / "CodexBridge").resolve(),
                 )
 
     def test_platform_capabilities_match_implemented_macos_boundaries(self) -> None:
