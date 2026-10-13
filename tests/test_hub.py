@@ -151,6 +151,20 @@ class HubTest(unittest.TestCase):
             ],
         )
 
+    def test_replay_state_prime_catalog_for_task_devices(self):
+        catalog = FakeCatalog()
+        self.hub.set_codex_catalog(catalog)
+
+        self.hub.replay_state("d1")
+        self.hub.replay_state("d2")
+
+        self.assertEqual(
+            [message["type"] for message in self.s1.sent],
+            ["codex_catalog_begin", "codex_catalog_item", "codex_catalog_end"],
+        )
+        self.assertNotIn("request_id", self.s1.sent[0])
+        self.assertEqual(self.s2.sent, [])
+
 
 class FakeSpeechJob:
     def poll(self):

@@ -174,6 +174,26 @@ class BridgeHub:
         for read_state in state["read_state"]:
             self._send(device_id, {"type": "read_state", **read_state})
 
+        self._prime_codex_catalog(device_id)
+
+    def _prime_codex_catalog(self, device_id: str) -> None:
+        if "tasks" not in self.capabilities_for(device_id):
+            return
+        with self._lock:
+            service = self.codex_catalog
+        if service is None:
+            return
+        try:
+            messages = service.handle_device_event(
+                device_id,
+                {"type": "codex_catalog_request"},
+            )
+        except Exception:
+            return
+        for message in messages or []:
+            if isinstance(message, dict):
+                self._send(device_id, message)
+
     def _handle_read_ack(self, device_id: str, event: dict) -> None:
         with self._lock:
             if "read_ack" not in self.capabilities_for(device_id):

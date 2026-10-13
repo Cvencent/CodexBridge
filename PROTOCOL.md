@@ -186,6 +186,10 @@ CodexBridge 在发现设备并取得已保存令牌后建立独立会话。当�
 
 1. 该设备尚未读过、且符合其能力的 `message`。
 2. 有已读记录的可见消息对应的最新 `read_state`。
+3. 如果设备具备 `tasks` 能力，CodexBridge 会主动补发一次项目目录
+   `codex_catalog_begin` / `codex_catalog_item` / `codex_catalog_end`，
+   不带 `request_id`，用于固件在重连后已经处于目录加载态时退出加载。
+   设备在正常目录请求期间仍应按 `request_id` 过滤响应。
 
 已读按 `message_id` 和设备维度保存。重放的是在线期间仍存在于消息中心的消息；
 消息中心当前最多保留 `200` 条记录。
