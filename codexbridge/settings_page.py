@@ -95,10 +95,16 @@ SETTINGS_HTML = r'''<!doctype html>
     .page-heading p { margin: 7px 0 0; color: var(--muted); }
     .layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
-      gap: 22px;
+      grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+      grid-template-areas:
+        "general general"
+        "devices speech";
+      gap: 20px;
       align-items: start;
     }
+    .general-panel { grid-area: general; }
+    .devices-panel { grid-area: devices; }
+    .speech-panel { grid-area: speech; }
     .panel {
       overflow: hidden;
       background: var(--surface);
@@ -113,18 +119,22 @@ SETTINGS_HTML = r'''<!doctype html>
     .panel-header h2 { margin: 0; font-size: 18px; line-height: 1.35; }
     .panel-header p { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
     .panel-body { padding: 20px; }
-    .device-list { display: grid; gap: 14px; }
+    .device-list { display: grid; gap: 0; }
     .device-card {
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      background: var(--surface-muted);
+      min-width: 0;
+      background: transparent;
+    }
+    .device-card + .device-card {
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
     }
     .device-title {
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
       gap: 14px;
-      padding: 15px 16px;
+      padding: 0 0 12px;
       border-bottom: 1px solid var(--border);
     }
     .device-title h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
@@ -139,7 +149,7 @@ SETTINGS_HTML = r'''<!doctype html>
       background: var(--success-soft);
     }
     .device-state.offline { color: var(--muted); background: #edf0f2; }
-    .device-content { padding: 15px 16px 16px; }
+    .device-content { padding: 14px 0 0; }
     .subsection-title {
       margin: 0 0 9px;
       color: var(--muted);
@@ -201,7 +211,15 @@ SETTINGS_HTML = r'''<!doctype html>
       border-radius: var(--radius);
       background: var(--surface-muted);
     }
-    .source-options { display: grid; gap: 10px; margin-bottom: 18px; }
+    .source-options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0 0 18px;
+      padding: 0;
+      border: 0;
+    }
+    .source-options legend { grid-column: 1 / -1; }
     .source-option {
       display: flex;
       align-items: flex-start;
@@ -302,7 +320,11 @@ SETTINGS_HTML = r'''<!doctype html>
       border-left: 3px solid var(--border-strong);
       font-size: 13px;
     }
-    .general-list { display: grid; gap: 10px; }
+    .general-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
     .general-row {
       display: flex;
       align-items: center;
@@ -325,7 +347,13 @@ SETTINGS_HTML = r'''<!doctype html>
     }
     .general-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
     @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
+      .layout {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+          "general"
+          "devices"
+          "speech";
+      }
     }
     @media (max-width: 560px) {
       .topbar-inner, main { width: min(100% - 24px, 1120px); }
@@ -334,6 +362,9 @@ SETTINGS_HTML = r'''<!doctype html>
       main { margin-top: 20px; }
       .page-heading h1 { font-size: 23px; }
       .panel-header, .panel-body, .device-title, .device-content { padding-left: 14px; padding-right: 14px; }
+      .device-title { padding-left: 0; padding-right: 0; }
+      .device-content { padding-left: 0; padding-right: 0; }
+      .general-list, .source-options { grid-template-columns: 1fr; }
       .field-row { grid-template-columns: 1fr; }
       .key-row { align-items: stretch; }
       .form-actions .button { flex: 1 1 145px; }
@@ -362,7 +393,7 @@ SETTINGS_HTML = r'''<!doctype html>
     </div>
 
     <div class="layout">
-      <section class="panel" aria-labelledby="general-title">
+      <section class="panel general-panel" aria-labelledby="general-title">
         <div class="panel-header">
           <h2 id="general-title">常规设置</h2>
           <p>这些设置在下次启动或重新打开管理中心后仍然保留。</p>
@@ -391,7 +422,7 @@ SETTINGS_HTML = r'''<!doctype html>
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="devices-title">
+      <section class="panel devices-panel" aria-labelledby="devices-title">
         <div class="panel-header">
           <h2 id="devices-title">设备</h2>
           <p>设备只有在开启对应能力后，才会收到该类消息。</p>
@@ -403,14 +434,14 @@ SETTINGS_HTML = r'''<!doctype html>
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="speech-title">
+      <section class="panel speech-panel" aria-labelledby="speech-title">
         <div class="panel-header">
           <h2 id="speech-title">语音识别</h2>
           <p>Dotii 和 AI Passport 共用这一套设备语音配置。</p>
         </div>
         <div class="panel-body">
           <form id="speech-form" novalidate>
-            <fieldset class="source-options" style="border:0;padding:0;margin:0 0 18px">
+            <fieldset class="source-options">
               <legend class="subsection-title">识别方式</legend>
               <label class="source-option">
                 <input type="radio" name="source" value="default" checked>

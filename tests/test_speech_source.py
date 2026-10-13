@@ -19,6 +19,77 @@ class SpeechSourceConfigTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "speech-source.json"
 
+    def test_probe_treats_no_speech_as_a_reachable_endpoint(self):
+        import io
+        from unittest.mock import patch
+        from urllib import error as urlerror
+
+        from codexbridge.speech_source import OpenAICompatibleSpeechRecognizer
+
+        save_speech_config(
+            {
+                "source": SOURCE_OPENAI,
+                "endpoint": "https://example.test/v1/audio/transcriptions",
+                "api_key": "secret-token",
+            },
+            self.path,
+        )
+        recognizer = OpenAICompatibleSpeechRecognizer(
+            config_loader=lambda: load_speech_config(self.path)
+        )
+
+        body = b'{"error":{"message":"[doubaoime] no speech detected","type":"invalid_request_error"}}'
+        failure = urlerror.HTTPError(
+            "https://example.test/v1/audio/transcriptions",
+            422,
+            "Unprocessable Entity",
+            {},
+            io.BytesIO(body),
+        )
+        with patch(
+            "codexbridge.speech_source.urlrequest.urlopen",
+            side_effect=failure,
+        ):
+            ok, message = recognizer.probe()
+
+        self.assertTrue(ok, message)
+        self.assertIn("连接成功", message)
+
+    def test_probe_still_reports_other_http_failures(self):
+        import io
+        from unittest.mock import patch
+        from urllib import error as urlerror
+
+        from codexbridge.speech_source import OpenAICompatibleSpeechRecognizer
+
+        save_speech_config(
+            {
+                "source": SOURCE_OPENAI,
+                "endpoint": "https://example.test/v1/audio/transcriptions",
+                "api_key": "secret-token",
+            },
+            self.path,
+        )
+        recognizer = OpenAICompatibleSpeechRecognizer(
+            config_loader=lambda: load_speech_config(self.path)
+        )
+
+        failure = urlerror.HTTPError(
+            "https://example.test/v1/audio/transcriptions",
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(b'{"error":{"message":"upstream exploded"}}'),
+        )
+        with patch(
+            "codexbridge.speech_source.urlrequest.urlopen",
+            side_effect=failure,
+        ):
+            ok, message = recognizer.probe()
+
+        self.assertFalse(ok)
+        self.assertIn("HTTP 500", message)
+
     def test_defaults_to_builtin_source(self):
         config = load_speech_config(self.path)
         self.assertEqual(config["source"], SOURCE_DEFAULT)

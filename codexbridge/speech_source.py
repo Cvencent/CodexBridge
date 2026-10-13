@@ -233,6 +233,20 @@ def _error_message(raw: bytes, content_type: str = "") -> str:
     return text[:300] or "服务器未返回错误详情"
 
 
+PROBE_EXPECTED_SILENCE_MARKERS = (
+    "no speech detected",
+    "no speech was recognised",
+    "no speech was recognized",
+)
+
+
+def _is_expected_silence_probe_error(code: int, detail: str) -> bool:
+    if code != 422:
+        return False
+    lowered = detail.lower()
+    return any(marker in lowered for marker in PROBE_EXPECTED_SILENCE_MARKERS)
+
+
 def _parse_transcription_response(raw: bytes, content_type: str = "") -> str:
     text = _decode_body(raw)
     if not text:
@@ -378,8 +392,13 @@ class OpenAICompatibleSpeechRecognizer:
             try:
                 self._request(path)
             except Exception as error:  # noqa: BLE001 - report probe failure
-                self.last_error = str(error)
-                return False, self.last_error
+                detail = str(error)
+                if not (
+                    "HTTP 422" in detail
+                    and _is_expected_silence_probe_error(422, detail)
+                ):
+                    self.last_error = detail
+                    return False, self.last_error
         self.last_error = ""
         return True, f"连接成功：{_endpoint_label(config['endpoint'])}"
 
