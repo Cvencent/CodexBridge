@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from codexbridge.codex.collector import records_from_snapshot, run_codex_collector
+from codexbridge.protocol.messages import MAX_LINE_BYTES, wire_messages
 
 
 def _task(
@@ -50,6 +51,49 @@ SNAPSHOT = {
 
 
 class CodexRecordTests(unittest.TestCase):
+    def test_quota_record_stays_within_the_wire_line_limit(self):
+        snapshot = {
+            "generated_at_epoch": 1_000,
+            "account": {
+                "five_hour_available": True,
+                "five_hour_remaining_percent": 100,
+                "five_hour_reset_at_epoch": 9_999_999_999,
+                "weekly_available": True,
+                "weekly_remaining_percent": 100,
+                "weekly_reset_at_epoch": 9_999_999_999,
+                "weekly_tokens_available": True,
+                "weekly_tokens": 999_999_999,
+                "plan_type": "P" * 200,
+            },
+            "task": {
+                "status": "waiting_user",
+                "thread_id": "T" * 200,
+                "current_action": "工" * 200,
+                "token_count": 999_999_999,
+                "plan_completed": 65535,
+                "plan_total": 65535,
+            },
+        }
+        quota = next(
+            record
+            for record in records_from_snapshot(snapshot)
+            if record.kind == "codex_status"
+        )
+        payload = {
+            "type": "message",
+            "message_id": quota.message_id,
+            "thread_id": quota.thread_id,
+            "kind": quota.kind,
+            "status": quota.status,
+            "title": quota.title,
+            "body": quota.body,
+            "created_at": quota.created_at,
+            "data": quota.data,
+        }
+        wires = wire_messages(payload)
+        self.assertTrue(wires)
+        self.assertLessEqual(max(len(chunk) for chunk in wires), MAX_LINE_BYTES)
+
     def test_snapshot_records_separate_status_tasks_and_results(self):
         records = records_from_snapshot(SNAPSHOT, now=1_000.0)
         by_kind = {record.kind: record for record in records}
@@ -87,6 +131,7 @@ class CodexRecordTests(unittest.TestCase):
                 "status:active-thread:working",
                 "task:active-thread",
                 "result:done-thread:900",
+                "codex_status:active-thread",
             },
         )
 
@@ -134,7 +179,13 @@ class CodexCollectorTest(unittest.TestCase):
                 report=lambda state, detail: reports.append((state, detail)),
             )
 
-        self.assertEqual({item.kind for item in published}, {"status", "task", "result"})
+        self.assertEqual(
+            {item.kind for item in published},
+            {"status", "task", "result", "codex_status"},
+        )
+        quota = next(item for item in published if item.kind == "codex_status")
+        self.assertEqual(quota.data["quota"]["weekly_remaining_percent"], 68)
+        self.assertEqual(quota.data["quota"]["plan_type"], "plus")
         self.assertEqual(reports[0], ("online", "Codex App Server 已连接"))
         self.assertTrue(sources[0].started)
         self.assertTrue(sources[0].closed)

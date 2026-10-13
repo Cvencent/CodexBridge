@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from codexbridge.messages_store import MessageRecord
 from codexbridge.codex.app_server import AppServerError, CodexAppServerSource
+from codexbridge.codex.quota import MAX_THREAD_BYTES, quota_from_snapshot
 
 
 STATUS_FIELDS = (
@@ -120,6 +121,26 @@ def records_from_snapshot(
                     "generated_at_epoch": generated_at,
                     "task": result,
                 },
+            )
+        )
+
+    quota = quota_from_snapshot(snapshot)
+    if quota:
+        quota_thread = str(quota.get("thread_id") or primary_thread or "account")
+        if len(quota_thread.encode("utf-8")) > MAX_THREAD_BYTES:
+            quota_thread = quota_thread.encode("utf-8")[:MAX_THREAD_BYTES].decode(
+                "utf-8", "ignore"
+            )
+        records.append(
+            MessageRecord(
+                f"codex_status:{quota_thread}",
+                quota_thread,
+                "codex_status",
+                str(quota.get("task_status") or primary_status),
+                "Codex 配额与状态",
+                "",
+                generated_at,
+                data={"quota": quota, "generated_at_epoch": generated_at},
             )
         )
     return records

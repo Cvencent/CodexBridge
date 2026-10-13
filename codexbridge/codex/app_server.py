@@ -301,10 +301,12 @@ def account_snapshot(rate_result: Any, usage_result: Any, now: datetime | None =
         "five_hour_available": False,
         "five_hour_remaining_percent": 0,
         "five_hour_reset_date": "",
+        "five_hour_reset_at_epoch": 0,
         "weekly_available": False,
         "weekly_remaining_percent": 0,
         "weekly_used_percent": 0,
         "reset_date": "",
+        "weekly_reset_at_epoch": 0,
         "weekly_tokens_available": False,
         "weekly_tokens": 0,
         "weekly_tokens_as_of": "",
@@ -319,6 +321,7 @@ def account_snapshot(rate_result: Any, usage_result: Any, now: datetime | None =
             account["five_hour_available"] = True
             account["five_hour_remaining_percent"] = round(100 - used)
         if reset:
+            account["five_hour_reset_at_epoch"] = reset
             account["five_hour_reset_date"] = datetime.fromtimestamp(reset).astimezone().strftime("%m-%d %H:%M")
     if weekly is not None:
         used = _as_number(weekly.get("usedPercent"))
@@ -329,6 +332,7 @@ def account_snapshot(rate_result: Any, usage_result: Any, now: datetime | None =
             account["weekly_used_percent"] = round(used)
             account["weekly_remaining_percent"] = round(100 - used)
         if reset:
+            account["weekly_reset_at_epoch"] = reset
             account["reset_date"] = datetime.fromtimestamp(reset).astimezone().strftime("%m-%d %H:%M")
 
     if isinstance(rate_result, dict):

@@ -15,3 +15,7 @@ class CapabilityTest(unittest.TestCase):
 
     def test_ai_passport_default_is_minimal(self):
         self.assertEqual(default_for("FoloOS-AI-Passport"), set(MINIMAL))
+
+    def test_quota_is_known_and_dotii_default(self):
+        self.assertEqual(normalize(["quota", "nope"]), {"quota"})
+        self.assertIn("quota", default_for("dotii"))

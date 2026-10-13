@@ -9,6 +9,7 @@ KIND_CAPABILITY: dict[str, str] = {
     "task": "tasks",
     "result": "results",
     "approval": "approval",
+    "codex_status": "quota",
 }
 
 

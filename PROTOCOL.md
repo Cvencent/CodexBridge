@@ -206,6 +206,7 @@ audio
 read_ack
 voice
 word_bear
+quota
 ```
 
 未知能力不会写入设备配置，也不会下发。`word_bear` 当前是已知的预留能力；本文尚未定义它的专用消息。
@@ -225,7 +226,7 @@ read_ack
 | 型号 | 默认能力 |
 | --- | --- |
 | `FoloOS-AI-Passport` | `status`, `text`, `read_ack` |
-| `dotii` | `status`, `text`, `tasks`, `results`, `read_ack` |
+| `dotii` | `status`, `text`, `tasks`, `results`, `read_ack`, `quota` |
 | 未知型号 | `status`, `text`, `read_ack` |
 
 设备首次出现时，当前默认计算为 `default_for(model) ∩ (supported ∪ MINIMAL)`，因此最小能力集中的能力不会被设备漏报直接抹掉。
@@ -304,11 +305,66 @@ CodexBridge 只向设备下发生效能力对应的数据，也只接受生效�
 | `task` | `tasks` | 任务列表或当前任务 |
 | `result` | `results` | 已完成或失败的任务结果 |
 | `approval` | `approval` | 等待审批的消息 |
+| `codex_status` | `quota` | Codex 配额、用量与运行状态快照 |
 
 `text` 不是单独的 `kind`；文字消息使用上述消息模型下发，能力开关决定设备是否
 接收对应类别。
 
-### 8.5 `read_state`
+### 8.5 `codex_status`
+
+配额与用量消息。`data.quota` 中所有字段都是可选的，缺失或类型错误时设备应显示
+`--`，不得外推。年份/日期使用 Unix 时间戳（秒）。
+
+```json
+{
+  "type": "message",
+  "message_id": "codex_status:t1",
+  "thread_id": "t1",
+  "kind": "codex_status",
+  "status": "working",
+  "title": "Codex 配额与状态",
+  "body": "",
+  "created_at": 1234567890.0,
+  "data": {
+    "quota": {
+      "five_hour_remaining_percent": 64,
+      "weekly_remaining_percent": 71,
+      "weekly_tokens": 12345,
+      "seven_day_tokens": 43210,
+      "five_hour_reset_at": 1770000000,
+      "weekly_reset_at": 1771000000,
+      "plan_type": "plus",
+      "task_status": "working",
+      "thread_id": "t1",
+      "current_action": "Running tests",
+      "token_count": 42,
+      "plan_completed": 2,
+      "plan_total": 5
+    }
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `five_hour_remaining_percent` | number | 5 小时窗口剩余百分比 |
+| `weekly_remaining_percent` | number | 周窗口剩余百分比 |
+| `weekly_tokens` | number | 近 7 日 Token |
+| `seven_day_tokens` | number | 7 日 Token（若上游提供该独立字段） |
+| `five_hour_reset_at` | number | 5 小时额度重置时间（epoch 秒） |
+| `weekly_reset_at` | number | 周额度重置时间（epoch 秒） |
+| `plan_type` | string | 套餐类型 |
+| `task_status` | string | 当前任务状态 |
+| `thread_id` | string | 当前线程 ID |
+| `current_action` | string | 当前动作 |
+| `token_count` | number | 当前任务 Token 数 |
+| `plan_completed` | number | 已完成计划项 |
+| `plan_total` | number | 计划项总数 |
+
+`thread_id`、`current_action` 与 `plan_type` 会被截断到适合单行 768 字节上限的长度，
+设备端字段不足时仍按缺失处理。
+
+### 8.6 `read_state`
 
 已读状态广播：
 
@@ -324,7 +380,7 @@ CodexBridge 只向设备下发生效能力对应的数据，也只接受生效�
 `read_by` 是已经上报已读的设备 ID 列表，按字典序排序。重放状态下可能不包含
 `read_at`；实时广播包含该字段。
 
-### 8.6 语音处理结果
+### 8.7 语音处理结果
 
 设备上传录音后，CodexBridge 通过同一会话返回：
 

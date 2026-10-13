@@ -10,12 +10,13 @@ FEATURES: tuple[str, ...] = (
     "read_ack",
     "voice",
     "word_bear",
+    "quota",
 )
 
 MINIMAL: frozenset[str] = frozenset({"status", "text", "read_ack"})
 MODEL_DEFAULTS: dict[str, frozenset[str]] = {
     "FoloOS-AI-Passport": MINIMAL,
-    "dotii": MINIMAL | frozenset({"tasks", "results"}),
+    "dotii": MINIMAL | frozenset({"tasks", "results", "quota"}),
 }
 
 
