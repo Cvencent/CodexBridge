@@ -53,14 +53,14 @@ or set `CODEXBRIDGE_VOSK_MODEL` to the model directory.
 Download the Windows installer from the GitHub Releases page:
 
 ```text
-CodexBridge-Setup-1.3.1-win64.exe
+CodexBridge-Setup-1.3.2-win64.exe
 ```
 
 A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 1.3.1 -FirmwareRoot D:\dotii\firmware
+./packaging/build_windows.ps1 -Version 1.3.2 -FirmwareRoot D:\dotii\firmware
 ```
 
 The EXE contains the Dotii firmware package, so flashing and BLE provisioning
