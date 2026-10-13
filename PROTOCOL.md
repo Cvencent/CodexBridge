@@ -1,0 +1,633 @@
+# CodexBridge 通用设备协议
+
+> **文档导航：** [项目说明](README.md) · **通用协议**
+
+本文档描述 CodexBridge 当前代码实现的通用设备协议，供 Dotii、AI Passport
+以及其他局域网设备实现接入。协议字段名、消息 `type` 和 JSON 示例保持英文，
+说明文字使用中文。
+
+本文档以仓库当前实现为准。设计稿中未在代码中落地的字段或行为不会写成既有
+协议；后续只增加可选字段或新消息类型，不建立第二套握手。
+
+## 维护要求
+
+任何会改变设备发现、TCP 会话、握手、能力、消息字段、事件、错误码、分片规则
+或本文件记录的管理接口的改动，都必须在同一个提交中同步更新本文件。修改协议
+行为时，同时更新相关测试和示例；不确定是否影响协议时，按需要更新处理。
+
+## 1. 范围与角色
+
+CodexBridge 是 PC 端协议主机，负责：
+
+- 通过 UDP 发现局域网设备。
+- 主动连接设备 TCP 服务端并完成鉴权握手。
+- 保存每台设备的 `supported` 和 `enabled` 能力。
+- 汇总 Codex 状态、任务、结果与通知，统一为 `message` 下发。
+- 接收设备已读、审批、语音和任务相关事件。
+- 在设备重连后重放未读消息和最新已读状态。
+
+设备负责：
+
+- 监听 UDP `8764`，响应固定发现请求。
+- 监听 TCP `8765`，接受 CodexBridge 的连接。
+- 校验配对令牌，返回稳定的设备身份和声明能力。
+- 按生效能力处理消息；未知消息类型必须忽略。
+- 在支持 `read_ack` 时上报已读，在支持 `audio` 时上传录音分片。
+
+协议是局域网内点对点会话，不经过云端中转，也不经过 CodexBridge 的本机管理
+HTTP API。
+
+## 2. 端口与连接拓扑
+
+| 用途 | 传输 | 端口 | 发起方 |
+| --- | --- | --- | --- |
+| 设备发现 | UDP | `8764` | CodexBridge |
+| 设备会话 | TCP | `8765` | CodexBridge 主动连接设备 |
+| CodexBridge 本机管理 | HTTP | `127.0.0.1:8788` | 本机浏览器或本机程序 |
+| Dotii 管理中心 | HTTP | `127.0.0.1:8787` | 本机浏览器；设备端仅访问其快照接口 |
+
+设备 TCP 会话使用 UTF-8 JSON，每条消息一行，以 `\n` 分隔。设备是 TCP 服务端，
+CodexBridge 是 TCP 客户端。设备切换 IP 后仍必须上报同一个稳定
+`device_id`。
+
+## 3. UDP 发现协议
+
+### 3.1 请求
+
+CodexBridge 向目标地址的 UDP `8764` 发送以下明文请求，不带换行：
+
+```text
+CODEXBRIDGE_DISCOVER
+```
+
+默认目标是广播地址 `255.255.255.255`。发现超时由 CodexBridge 发起方控制，
+`discover()` 的默认单轮超时为 `3.0` 秒；常驻程序的发现循环使用 `1.0` 秒一轮、约每 `5` 秒重新扫描。
+
+### 3.2 应答
+
+设备向请求来源地址和端口返回一个 UTF-8 JSON 对象，最大 `1024` 字节：
+
+```json
+{
+  "device": "dotii",
+  "device_id": "a1",
+  "name": "Desk",
+  "port": 8765,
+  "capabilities": ["status", "tasks"]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `device` | string | 是 | 设备型号或设备类别，不能为空 |
+| `device_id` | string | 是 | 稳定设备 ID；IP 变化不得改变 |
+| `port` | integer | 是 | TCP 会话端口，必须在 `1..65535` |
+| `name` | string | 否 | 显示名称；空值按未提供处理 |
+| `capabilities` | string[] | 否 | 设备声明的能力；未知能力会被忽略 |
+
+应答不是有效 JSON、超过 1024 字节、缺少必填字段，或 `port` 非法时，CodexBridge
+忽略该应答。
+
+### 3.3 稳定身份
+
+`device_id` 与设备令牌、能力配置和消息记录关联。设备重启、换 IP 或 DHCP
+重新分配地址后必须继续使用原 `device_id`。建议由硬件唯一信息派生，例如 MAC
+地址的稳定哈希。
+
+## 4. TCP 会话与 JSON 行协议
+
+### 4.1 传输规则
+
+- 字符编码：UTF-8。
+- 消息格式：换行分隔 JSON，每条消息一行。
+- 单行上限：`768` 字节，包含末尾换行。
+- 接收方必须缓存不完整分片，按 `\n` 切分后解析。
+- 非 JSON 行、非对象 JSON、超长行均忽略，不因单行错误断开会话。
+- 协议消息的 `type` 使用小写字符串；未知类型必须忽略。
+
+### 4.2 时间与连接参数
+
+| 参数 | 当前值 | 说明 |
+| --- | --- | --- |
+| 心跳间隔 | `5` 秒 | CodexBridge 重复发送 `bridge_ready` |
+| 连接超时 | `15` 秒 | TCP 建连与等待握手应答的超时 |
+| 令牌最短长度 | `16` 字符 | 少于 16 字符的令牌会被拒绝 |
+
+设备可在 `15` 秒未收到 CodexBridge 任何消息时判定连接失效并重新等待连接。
+
+## 5. 鉴权握手
+
+握手顺序固定如下，不提供版本分支或并行握手：
+
+### 5.1 CodexBridge -> 设备
+
+```json
+{"type":"bridge_auth","token":"<配对令牌>"}
+```
+
+### 5.2 设备 -> CodexBridge
+
+设备校验令牌并返回：
+
+```json
+{
+  "type": "bridge_auth_ok",
+  "device_id": "a1",
+  "model": "dotii",
+  "name": "Desk",
+  "firmware": "1.0.0",
+  "capabilities": ["status", "text", "read_ack"]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `type` | string | 是 | 固定为 `bridge_auth_ok` |
+| `device_id` | string | 是 | 必须与注册记录一致 |
+| `model` | string | 建议 | 用于型号默认能力 |
+| `name` | string | 否 | 显示名称 |
+| `firmware` | string | 否 | 固件版本，当前只透传记录，不参与握手判断 |
+| `capabilities` | string[] | 是 | 设备固件实际支持的能力 |
+
+如果令牌错误、回包不是 `bridge_auth_ok`，或 `device_id` 与预期不一致，
+CodexBridge 结束本次会话，不进入在线状态。
+
+### 5.3 CodexBridge -> 设备
+
+握手成功后，CodexBridge 发送：
+
+```json
+{
+  "type": "bridge_ready",
+  "bridge": "CodexBridge",
+  "version": "1.3.3",
+  "capabilities": ["read_ack", "status", "text"]
+}
+```
+
+`capabilities` 是本次会话握手时计算出的生效能力，即设备 `supported` 与用户
+`enabled` 的交集。首次 `bridge_ready` 完成能力授予；之后每 5 秒重复发送
+`bridge_ready` 作为心跳，并继续携带本次会话已授予的能力。运行时权限变化通过
+`capabilities_update` 推送。
+
+设备收到 `bridge_ready` 后会话进入在线状态，可以发送已授权事件，也可以接收
+CodexBridge 下发的消息。
+
+## 6. 重连与状态重放
+
+CodexBridge 在发现设备并取得已保存令牌后建立独立会话。当前实现的重连策略是：
+
+- 设备离线后从活动会话表移除。
+- 发现线程周期性重新发现设备。
+- 再次发现后重新执行同一套握手。
+- 不限制重试次数，也不建立协议版本协商。
+
+设备重新在线后，CodexBridge 按生效能力推送：
+
+1. 该设备尚未读过、且符合其能力的 `message`。
+2. 有已读记录的可见消息对应的最新 `read_state`。
+
+已读按 `message_id` 和设备维度保存。重放的是在线期间仍存在于消息中心的消息；
+消息中心当前最多保留 `200` 条记录。
+
+## 7. 能力协商与权限模型
+
+### 7.1 能力全集
+
+当前代码认识的能力：
+
+```text
+status
+text
+tasks
+results
+approval
+audio
+read_ack
+voice
+word_bear
+```
+
+未知能力不会写入设备配置，也不会下发。`word_bear` 当前是已知的预留能力；本文尚未定义它的专用消息。
+
+### 7.2 最小能力集与型号默认值
+
+最小能力集：
+
+```text
+status
+text
+read_ack
+```
+
+当前型号默认值：
+
+| 型号 | 默认能力 |
+| --- | --- |
+| `FoloOS-AI-Passport` | `status`, `text`, `read_ack` |
+| `dotii` | `status`, `text`, `tasks`, `results`, `read_ack` |
+| 未知型号 | `status`, `text`, `read_ack` |
+
+设备首次出现时，当前默认计算为 `default_for(model) ∩ (supported ∪ MINIMAL)`，因此最小能力集中的能力不会被设备漏报直接抹掉。
+`supported` 来自 `bridge_auth_ok.capabilities`，`enabled` 是本机用户允许的
+能力，二者都必须是已知能力。
+
+### 7.3 生效能力
+
+```text
+effective = supported ∩ enabled
+```
+
+CodexBridge 只向设备下发生效能力对应的数据，也只接受生效能力对应的事件。
+设备发送未授权事件时，CodexBridge 返回：
+
+```json
+{"type":"error","code":"capability_not_enabled"}
+```
+
+### 7.4 运行时更新
+
+本机管理页面保存能力后，CodexBridge 向在线设备推送：
+
+```json
+{"type":"capabilities_update","enabled":["status","text","read_ack"]}
+```
+
+`enabled` 是重新计算后的生效能力集合，不是用户界面上所有勾选项的原始数组。
+设备收到后应立即更新本地可用页面或菜单，不需要重连。
+
+## 8. CodexBridge -> 设备消息
+
+### 8.1 `bridge_ready`
+
+握手确认和心跳。字段见第 5.3 节。
+
+### 8.2 `capabilities_update`
+
+能力更新。字段见第 7.4 节。
+
+### 8.3 `message`
+
+统一消息。基本字段：
+
+```json
+{
+  "type": "message",
+  "message_id": "task:t1",
+  "thread_id": "t1",
+  "kind": "task",
+  "status": "working",
+  "title": "Codex 任务",
+  "body": "正在处理",
+  "created_at": 1234567890.0
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `message_id` | string | 是 | 消息唯一 ID |
+| `thread_id` | string | 是 | 对应 Codex 线程 |
+| `kind` | string | 是 | 见第 8.4 节 |
+| `status` | string | 是 | 当前状态，例如 `working`、`completed`、`failed` |
+| `title` | string | 是 | 标题，UTF-8 最长 160 字节 |
+| `body` | string | 是 | 正文；长文本会分片 |
+| `created_at` | number | 是 | Unix 时间戳，单位秒 |
+| `data` | object | 否 | 结构化上下文；设备可按需读取 |
+| `seq` | integer | 分片时是 | 分片序号，从 `0` 开始 |
+| `total` | integer | 分片时是 | 分片总数 |
+
+### 8.4 `kind` 与能力映射
+
+| `kind` | 所需能力 | 用途 |
+| --- | --- | --- |
+| `status` | `status` | Codex 运行状态 |
+| `task` | `tasks` | 任务列表或当前任务 |
+| `result` | `results` | 已完成或失败的任务结果 |
+| `approval` | `approval` | 等待审批的消息 |
+
+`text` 不是单独的 `kind`；文字消息使用上述消息模型下发，能力开关决定设备是否
+接收对应类别。
+
+### 8.5 `read_state`
+
+已读状态广播：
+
+```json
+{
+  "type": "read_state",
+  "message_id": "task:t1",
+  "read_by": ["device-a", "device-b"],
+  "read_at": 1234567890.0
+}
+```
+
+`read_by` 是已经上报已读的设备 ID 列表，按字典序排序。重放状态下可能不包含
+`read_at`；实时广播包含该字段。
+
+### 8.6 语音处理结果
+
+设备上传录音后，CodexBridge 通过同一会话返回：
+
+```json
+{"type":"transcript","text":"识别出的文字"}
+```
+
+识别失败或录音无效时返回：
+
+```json
+{"type":"error","text":"可读的错误说明"}
+```
+
+语音识别来源在本机管理页面配置，设备协议不需要知道当前使用的是内置识别还是
+OpenAI 兼容接口。
+
+## 9. 设备 -> CodexBridge 事件
+
+### 9.1 `read_ack`
+
+上报一条消息已读：
+
+```json
+{"type":"read_ack","message_id":"task:t1"}
+```
+
+要求能力：`read_ack`。
+
+CodexBridge 会将该设备写入消息的 `read_by`，并向其他支持 `read_ack` 的在线
+设备广播 `read_state`。
+
+### 9.2 `cancel_task`
+
+```json
+{"type":"cancel_task","thread_id":"t1"}
+```
+
+要求能力：`tasks`。
+
+当前代码只校验该事件所需能力，并把未授权事件转为
+`capability_not_enabled`；已授权事件不会产生额外的协议应答。
+
+### 9.3 `approval_decision`
+
+```json
+{"type":"approval_decision","request_id":"r1","decision":"approve"}
+```
+
+要求能力：`approval`。
+
+通用协议层当前只做事件识别与能力校验；已授权事件不会产生额外的通用协议应答。
+`request_id` 和 `decision` 的具体取值由设备业务侧与 Codex 侧约定。
+
+### 9.4 `voice_command`
+
+```json
+{"type":"voice_command","text":"帮我检查构建结果"}
+```
+
+要求能力：`voice`。当前通用协议层只做识别与能力校验，不返回额外的通用协议应答。
+
+### 9.5 录音事件
+
+录音事件要求能力：`audio`。
+
+开始录音：
+
+```json
+{"type":"record_start","sample_rate":16000,"channels":1,"bits":16}
+```
+
+音频分片使用 Base64 编码的 16-bit 单声道 PCM：
+
+```json
+{"type":"audio_chunk","data":"<base64-pcm>"}
+```
+
+结束录音，`bytes` 为设备侧发送的 PCM 总字节数，用于完整性校验：
+
+```json
+{"type":"record_stop","bytes":32000}
+```
+
+取消录音：
+
+```json
+{"type":"record_cancel"}
+```
+
+约束：
+
+| 参数 | 当前值 |
+| --- | --- |
+| 采样率 | `8000..48000` Hz |
+| 声道 | `1` |
+| 位深 | `16` |
+| 最短录音 | `0.4` 秒 |
+| 最长录音 | `120` 秒 |
+
+### 9.6 Codex 目录与线程事件
+
+以下事件当前都要求能力 `tasks`，用于设备侧发起目录、项目或线程操作：
+
+```json
+{"type":"codex_catalog_request"}
+{"type":"codex_project_select","project_id":"p1"}
+{"type":"codex_thread_select","thread_id":"t1"}
+{"type":"codex_thread_new"}
+```
+
+通用协议层当前只做事件识别与能力校验。未授权事件返回
+`capability_not_enabled`；已授权事件目前不会产生额外的通用协议应答，具体业务处理取决于后续实现。
+
+### 9.7 能力对应表
+
+| 事件 | 所需能力 |
+| --- | --- |
+| `read_ack` | `read_ack` |
+| `approval_decision` | `approval` |
+| `cancel_task` | `tasks` |
+| `record_start` | `audio` |
+| `audio_chunk` | `audio` |
+| `record_stop` | `audio` |
+| `record_cancel` | `audio` |
+| `voice_command` | `voice` |
+| `codex_catalog_request` | `tasks` |
+| `codex_project_select` | `tasks` |
+| `codex_thread_select` | `tasks` |
+| `codex_thread_new` | `tasks` |
+
+未知事件类型由 CodexBridge 忽略，不会因此断开会话。
+
+## 10. 统一消息模型与长文本分片
+
+### 10.1 消息归一
+
+Codex 状态、任务和结果在 CodexBridge 内部统一为 `MessageRecord`，再转换为设备
+可见的 `message`：
+
+| 内部字段 | 线上字段 | 说明 |
+| --- | --- | --- |
+| `message_id` | `message_id` | 消息 ID |
+| `thread_id` | `thread_id` | 线程 ID |
+| `kind` | `kind` | 消息类别 |
+| `status` | `status` | 当前状态 |
+| `title` | `title` | 标题 |
+| `body` | `body` | 正文 |
+| `created_at` | `created_at` | 创建时间 |
+| `data` | `data` | 可选结构化数据 |
+
+### 10.2 分片规则
+
+| 参数 | 当前值 |
+| --- | --- |
+| 单行上限 | `768` 字节 |
+| 正文分片目标 | `480` 字节 |
+| 标题上限 | `160` 字节 |
+| 截断后缀 | `...` |
+
+正文按 UTF-8 字符边界切片，不会切断多字节字符。所有分片共享同一个
+`message_id`，通过 `seq` 和 `total` 重组。`seq` 从 `0` 开始。设备应至少保留
+每个消息当前分片的拼接缓存，并在完成后按消息 ID 替换已有内容。
+
+标题超过 160 字节时截断并追加 `...`。如果消息编码后仍然超过单行上限，发送方会
+继续降低正文分片大小，保证每行不超过协议上限。
+
+## 11. 已读同步
+
+### 11.1 上报
+
+设备显示消息后发送：
+
+```json
+{"type":"read_ack","message_id":"task:t1"}
+```
+
+### 11.2 广播
+
+CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发送：
+
+```json
+{
+  "type": "read_state",
+  "message_id": "task:t1",
+  "read_by": ["device-a"],
+  "read_at": 1234567890.0
+}
+```
+
+### 11.3 重连重放
+
+设备重新连接后，CodexBridge 推送该设备尚未读过且符合能力的消息，并推送带有
+已读记录的 `read_state`。这保证同一消息在多台设备之间保持一致，不依赖设备
+本地缓存。
+
+## 12. 错误与边界
+
+### 12.1 协议错误
+
+当前通用协议只定义一种结构化错误码：
+
+```json
+{"type":"error","code":"capability_not_enabled"}
+```
+
+含义：设备发起了未生效能力对应的事件。其他业务错误可能以 `text` 字段返回，
+例如语音识别失败、录音格式无效或录音不完整。
+
+### 12.2 必须忽略的输入
+
+- 未知消息类型。
+- 未知能力名称。
+- 非 JSON 行、JSON 数组或标量。
+- 超过 768 字节的单行。
+- 缺少必要字段的消息。
+- 设备未授权能力对应的事件。
+
+忽略单条消息不等同于断开连接。鉴权失败、身份不一致或 TCP 关闭会结束会话；
+握手完成后的会话不会因为暂时收不到设备消息而被 PC 侧超时断开。
+
+## 13. 本机管理接口
+
+本节接口仅用于 CodexBridge 本机管理页面，不属于设备通用协议。管理服务默认
+监听 `127.0.0.1:8788`，并拒绝非回环来源。
+
+### 13.1 状态与设备
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/admin/status` | 版本与设备数量 |
+| `GET` | `/api/admin/devices` | 设备列表、在线状态、`supported`、`enabled` |
+| `POST` | `/api/admin/devices/remove` | 移除设备 |
+| `POST` | `/api/admin/devices/capabilities` | 更新设备生效能力 |
+| `GET` | `/api/admin/pairing?device_id=...` | 生成并返回配对令牌 |
+
+### 13.2 语音与常规设置
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/admin/settings/speech` | 读取语音识别配置，隐藏 API Key |
+| `POST` | `/api/admin/settings/speech` | 保存语音识别配置 |
+| `POST` | `/api/admin/settings/speech/test` | 测试 OpenAI 兼容转写接口 |
+| `GET` | `/api/admin/settings/general` | 读取开机自启动设置 |
+| `POST` | `/api/admin/settings/general` | 更新开机自启动或打开日志目录 |
+
+管理接口最多接受 `8192` 字节请求体；JSON 请求必须使用
+`Content-Type: application/json`。API Key 不会通过 GET 返回；留空表示保留已
+保存的 Key，使用 `clear_api_key: true` 才清除。
+
+### 13.3 Dotii 管理中心快照接口
+
+Dotii 管理中心默认监听 `127.0.0.1:8787`，它与通用设备 TCP 协议并行存在：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/health` | 管理中心健康检查 |
+| `GET` | `/api/v1/snapshot` | 读取 Dotii 管理快照 |
+| `POST` | `/api/v1/snapshot` | 写入 `schema_version = 1` 的管理快照信封 |
+
+`/api/v1/snapshot` 使用请求头 `X-Bridge-Token` 鉴权。快照只承载
+Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、结果和统一消息
+明确不在这里，仍然只走本文件第 4 至第 12 节的设备 TCP 协议。因此，Dotii
+管理中心接口不是第二套 Codex 设备协议。
+
+## 14. 安全要求
+
+- 每台设备使用独立配对令牌，长度至少 `16` 字符。
+- TCP `8765` 和 UDP `8764` 只在可信局域网内使用，不要暴露到公网。
+- 本机管理 API 只监听回环地址，非回环请求返回 `403`。
+- 设备 ID、令牌、能力、消息文本和音频都有明确长度或大小边界。
+- 日志和错误响应不得泄露配对令牌或 API Key。
+- 设备必须在 `bridge_auth_ok` 中上报自身稳定的 `device_id`，CodexBridge 会严格比对。
+- 设备端必须忽略未知消息类型，避免协议扩展导致旧固件断线。
+
+## 15. 协议演进
+
+- 保持同一套发现、握手和 JSON 行格式。
+- 新功能优先增加可选字段或新消息类型。
+- 新能力加入能力清单，由 `supported ∩ enabled` 决定是否启用。
+- 不增加协议版本分支、并行握手或旧设备专用通道。
+- 不兼容变更必须在设备固件、CodexBridge 和测试中同步完成。
+
+## 16. 最小接入示例
+
+设备实现的最小可行流程：
+
+1. 监听 UDP `8764`，收到 `CODEXBRIDGE_DISCOVER` 后返回身份和 TCP 端口。
+2. 监听 TCP `8765`，接受 CodexBridge 连接。
+3. 收到 `bridge_auth` 后校验令牌，返回 `bridge_auth_ok`。
+4. 收到 `bridge_ready` 后保存 `capabilities`。
+5. 收到 `message` 后按 `seq` 和 `total` 拼接正文。
+6. 支持 `read_ack` 时，用户读完消息后发送 `read_ack`。
+7. 对未知事件类型不做处理；对未授权事件不主动发送。
+
+完整交互示例：
+
+```text
+PC -> 设备: CODEXBRIDGE_DISCOVER
+设备 -> PC: {"device":"dotii","device_id":"a1","name":"Desk","port":8765,"capabilities":["status","text","read_ack"]}
+PC -> 设备: {"type":"bridge_auth","token":"..."}
+设备 -> PC: {"type":"bridge_auth_ok","device_id":"a1","model":"dotii","name":"Desk","firmware":"1.0.0","capabilities":["status","text","read_ack"]}
+PC -> 设备: {"type":"bridge_ready","bridge":"CodexBridge","version":"1.3.3","capabilities":["read_ack","status","text"]}
+PC -> 设备: {"type":"message","message_id":"task:t1","thread_id":"t1","kind":"task","status":"working","title":"Codex 任务","body":"正在处理","created_at":1234567890.0,"seq":0,"total":1}
+设备 -> PC: {"type":"read_ack","message_id":"task:t1"}
+PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read_at":1234567890.0}
+```

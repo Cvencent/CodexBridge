@@ -1,5 +1,7 @@
 # CodexBridge
 
+> **文档导航：** **项目说明** · [通用协议](PROTOCOL.md)
+
 CodexBridge is the PC-side host for Codex-aware devices on a local network.
 It owns Codex collection, a line-delimited JSON device protocol, per-device
 capabilities, unified messages, read-state synchronization, shared speech
