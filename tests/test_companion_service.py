@@ -126,6 +126,7 @@ class CompanionServiceTests(unittest.TestCase):
         }
         self.client.responses["account/rateLimits/read"] = {"rateLimits": {}}
         self.client.responses["account/usage/read"] = {}
+        self.client.responses["thread/resume"] = {"thread": thread_row()}
         self.client.responses["turn/start"] = {"turn": {"id": "turn-2", "status": "inProgress"}}
         self.client.responses["turn/interrupt"] = {}
         self.service = CompanionService(
@@ -168,6 +169,63 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(method, "turn/start")
         self.assertEqual(params["input"][0]["text"], "继续修复")
         self.assertEqual(params["model"], "gpt-5.1-codex")
+
+    def test_start_turn_resumes_disk_thread_first(self) -> None:
+        self.service.start_turn("t1", "继续修复", model="gpt-5.1-codex")
+        methods = [method for method, _ in self.client.requests]
+        self.assertIn("thread/resume", methods)
+        self.assertLess(methods.index("thread/resume"), methods.index("turn/start"))
+        resume_params = next(
+            params for method, params in self.client.requests if method == "thread/resume"
+        )
+        self.assertEqual(resume_params["threadId"], "t1")
+        self.assertTrue(resume_params["excludeTurns"])
+
+    def test_start_turn_skips_repeat_resume_for_same_thread(self) -> None:
+        self.service.start_turn("t1", "第一次")
+        self.service.start_turn("t1", "第二次")
+        resumes = [method for method, _ in self.client.requests if method == "thread/resume"]
+        self.assertEqual(len(resumes), 1)
+        turns = [method for method, _ in self.client.requests if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+
+    def test_steer_turn_resumes_thread(self) -> None:
+        self.client.responses["turn/steer"] = {"turn": {"id": "turn-2", "status": "inProgress"}}
+        self.service.steer_turn("t1", "改一下方向")
+        methods = [method for method, _ in self.client.requests]
+        self.assertLess(methods.index("thread/resume"), methods.index("turn/steer"))
+
+    def test_resume_cleared_after_client_reset(self) -> None:
+        clients = []
+
+        def factory(command, cwd):
+            client = FakeClient()
+            clients.append(client)
+            client.responses["thread/resume"] = {"thread": thread_row()}
+            client.responses["turn/start"] = {"turn": {"id": "turn-2", "status": "inProgress"}}
+            return client
+
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=factory,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+        )
+        try:
+            service.start_turn("t1", "第一次")
+            service._reset_client()
+            service.start_turn("t1", "第二次")
+        finally:
+            service.stop()
+        self.assertGreaterEqual(len(clients), 2)
+        self.assertEqual(
+            [method for method, _ in clients[0].requests if method == "thread/resume"],
+            ["thread/resume"],
+        )
+        self.assertEqual(
+            [method for method, _ in clients[1].requests if method == "thread/resume"],
+            ["thread/resume"],
+        )
 
     def test_notification_pump_forwards_agent_delta(self) -> None:
         self.service.start()

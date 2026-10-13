@@ -170,6 +170,8 @@ class CompanionService:
         self._account_cache: dict[str, Any] = {}
         self._account_cache_epoch = 0.0
         self._log: list[str] = []
+        self._resumed_threads: set[str] = set()
+        self._resumed_lock = threading.Lock()
 
     def start(self) -> None:
         self._stop.clear()
@@ -181,6 +183,8 @@ class CompanionService:
             client = self._client
             self._client = None
             self._generation += 1
+        with self._resumed_lock:
+            self._resumed_threads.clear()
         if client is not None:
             try:
                 client.close()
@@ -221,11 +225,50 @@ class CompanionService:
             client = self._client
             self._client = None
             self._generation += 1
+        with self._resumed_lock:
+            self._resumed_threads.clear()
         if client is not None:
             try:
                 client.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _thread_note(self, thread_id: str) -> None:
+        with self._resumed_lock:
+            self._resumed_threads.add(thread_id)
+
+    def _ensure_thread(self, thread_id: str) -> None:
+        """Load a disk-backed thread into the live app-server before acting on it.
+
+        Threads that predate the current app-server process (or were created
+        before a client reset) are readable from the rollout files but unknown
+        to ``turn/start``, which fails with "thread not found". Resuming by id
+        hydrates the thread without forking or rewriting history.
+        """
+        if not thread_id:
+            return
+        with self._resumed_lock:
+            known = thread_id in self._resumed_threads
+        if known:
+            return
+        client = self._ensure_client()
+        error: AppServerError | None = None
+        for attempt in range(2):
+            try:
+                client.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+                self._thread_note(thread_id)
+                return
+            except AppServerError as exc:
+                error = exc
+                message = str(exc)
+                if "not found" in message.lower():
+                    raise
+                self._reset_client()
+                client = self._ensure_client()
+                if attempt == 1:
+                    raise
+        if error is not None:
+            raise error
 
     def _read(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None
@@ -759,6 +802,7 @@ class CompanionService:
             params["effort"] = str(effort)
         if client_message_id:
             params["clientUserMessageId"] = str(client_message_id)[:64]
+        self._ensure_thread(thread_id)
         result = self._ensure_client().request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str((turn or {}).get("id") or "")
@@ -779,6 +823,7 @@ class CompanionService:
         content = (text or "").strip()
         if not content:
             raise ValueError("text")
+        self._ensure_thread(thread_id)
         result = self._ensure_client().request(
             "turn/steer",
             {
@@ -797,6 +842,7 @@ class CompanionService:
         if not thread_id:
             raise ValueError("thread_id")
         params: dict[str, Any] = {"threadId": thread_id}
+        self._ensure_thread(thread_id)
         if turn_id:
             params["turnId"] = turn_id
         else:

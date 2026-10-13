@@ -21,6 +21,7 @@ class CompanionApiTests(unittest.TestCase):
         self.client = FakeClient()
         self.client.responses["thread/list"] = {"data": [thread_row()], "nextCursor": None}
         self.client.responses["thread/read"] = thread_detail()
+        self.client.responses["thread/resume"] = {"thread": thread_row()}
         self.client.responses["turn/start"] = {"turn": {"id": "turn-2"}}
         self.client.responses["account/rateLimits/read"] = {"rateLimits": {}}
         self.client.responses["account/usage/read"] = {}
