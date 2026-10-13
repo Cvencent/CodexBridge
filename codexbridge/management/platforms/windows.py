@@ -17,7 +17,7 @@ DOTII_USB_VID = "303A"
 DOTII_USB_PID = "1001"
 PORT_PATTERN = re.compile(r"^COM(?:[1-9]|[1-9][0-9]|[12][0-9]{2})$", re.IGNORECASE)
 STARTUP_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_REGISTRY_VALUE = "DotiiManagementCenter"
+STARTUP_REGISTRY_VALUE = "CodexBridge"
 
 
 def parse_serial_ports(payload: str) -> list[dict[str, object]]:

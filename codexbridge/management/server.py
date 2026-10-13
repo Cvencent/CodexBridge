@@ -177,9 +177,7 @@ SCREEN_OFF_PAGE_OPTIONS = {"none", "custom", "dotii"}
 CUSTOM_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{6}$")
 MANAGEMENT_ROOT = management_root()
 WEB_ROOT = MANAGEMENT_ROOT / "web"
-MANAGEMENT_CENTER_EXECUTABLE = (
-    "DotiiManagementCenter.exe" if os.name == "nt" else "DotiiManagementCenter"
-)
+MANAGEMENT_CENTER_EXECUTABLE = "CodexBridge.exe" if os.name == "nt" else "CodexBridge"
 
 
 def _bounded_text(value: Any, maximum: int, field: str) -> str:

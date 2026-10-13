@@ -4,7 +4,7 @@
   #define AppVersion "1.3.1"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\dist\CodexBridge"
+#define SourceDir "..\dist"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\release"
@@ -45,7 +45,7 @@ Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\CodexBridge.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\CodexBridge"; Filename: "{app}\CodexBridge.exe"

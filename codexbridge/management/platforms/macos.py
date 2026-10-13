@@ -62,7 +62,7 @@ class MacOSPlatformAdapter:
         executable = Path(sys.executable).resolve()
         for parent in executable.parents:
             if parent.name == "Contents" and parent.parent.suffix.lower() == ".app":
-                candidate = parent / "MacOS" / "DotiiManagementCenter"
+                candidate = parent / "MacOS" / "CodexBridge"
                 return candidate if candidate.is_file() else None
         return None
 
@@ -78,7 +78,7 @@ class MacOSPlatformAdapter:
 
     def packaged_startup_command(self, management_center: Path) -> str:
         if not management_center.is_file():
-            raise OSError("当前安装包缺少 macOS 菜单栏宿主")
+            raise OSError("当前安装包缺少 CodexBridge 宿主")
         return str(management_center.resolve())
 
     def current_startup_command(

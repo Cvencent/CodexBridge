@@ -75,12 +75,12 @@ class TrayModelTest(unittest.TestCase):
         model = build_menu_model(registry, BridgeHub(registry))
         self.assertEqual(
             [item.label for item in model],
-            ["设备", "打开设置", "重启", "关于", "退出"],
+            ["设备", "打开设置", "打开管理中心", "重启", "关于", "退出"],
         )
         self.assertEqual(model[0].kind, "submenu")
         self.assertEqual(
             [item.action_id for item in model[1:]],
-            ["open_settings", "restart", "about", "exit"],
+            ["open_settings", "open_admin", "restart", "about", "exit"],
         )
 
     def test_device_submenu_lists_each_device_and_capability(self):
@@ -113,7 +113,7 @@ class TrayModelTest(unittest.TestCase):
         )
         self.assertEqual(
             [item.text for item in menu.visible_items],
-            ["设备", "打开设置", "重启", "关于", "退出"],
+            ["设备", "打开设置", "打开管理中心", "重启", "关于", "退出"],
         )
         self.assertEqual(
             [item.text for item in menu.visible_items[0].action.items],

@@ -9,3 +9,7 @@ dist/
 *.log
 dist-test/
 release/
+firmware/
+.playwright-cli/
+.superpowers/
+output/

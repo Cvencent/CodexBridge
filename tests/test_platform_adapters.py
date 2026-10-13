@@ -43,12 +43,12 @@ class WindowsPlatformAdapterTests(unittest.TestCase):
                     Path(temporary) / "StateDisplay",
                 )
 
-    def test_packaged_startup_keeps_management_center_entry(self) -> None:
+    def test_packaged_startup_launches_the_single_codexbridge_host(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            executable = Path(temporary) / "DotiiManagementCenter.exe"
+            executable = Path(temporary) / "CodexBridge.exe"
             command = WindowsPlatformAdapter().packaged_startup_command(executable)
             self.assertEqual(command, f'"{executable.resolve()}" --startup')
-            self.assertNotIn("DotiiBridge.exe", command)
+            self.assertNotIn("DotiiManagementCenter", command)
 
     def test_serial_payload_stays_sorted_with_dotii_first(self) -> None:
         payload = json.dumps([
@@ -97,8 +97,8 @@ class MacOSPlatformAdapterTests(unittest.TestCase):
             ):
                 self.assertEqual(runtime_paths.application_root(), contents / "Resources")
                 self.assertEqual(
-                    runtime_paths.sibling_executable("DotiiManagementCenter"),
-                    contents / "MacOS" / "DotiiManagementCenter",
+                    runtime_paths.sibling_executable("CodexBridge"),
+                    contents / "MacOS" / "CodexBridge",
                 )
 
     def test_platform_capabilities_match_implemented_macos_boundaries(self) -> None:
@@ -116,7 +116,7 @@ class MacOSPlatformAdapterTests(unittest.TestCase):
             bridge = macos.parent / "Resources" / "DotiiBridgeRuntime" / "DotiiBridge"
             bridge.parent.mkdir(parents=True)
             bridge.touch()
-            host = macos / "DotiiManagementCenter"
+            host = macos / "CodexBridge"
             host.touch()
             responses = [
                 mock.Mock(returncode=0, stdout="enabled\n", stderr=""),
