@@ -200,6 +200,42 @@ class AdminApiTest(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(opened, [True])
 
+    def test_companion_port_rejection_reports_the_specific_error(self):
+        def reject_port(_payload):
+            raise ValueError("port_reserved")
+
+        body = json.dumps({"action": "set_port", "port": 8790}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/companion",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            companion_action=reject_port,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "port_reserved")
+
+    def test_companion_busy_port_reports_conflict(self):
+        def busy_port(_payload):
+            raise OSError("busy")
+
+        body = json.dumps({"action": "set_port", "port": 9000}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/companion",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            companion_action=busy_port,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "port_in_use")
+
     def test_settings_page_is_served(self):
         status, payload = handle_request(
             "GET",

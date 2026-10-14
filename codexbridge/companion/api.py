@@ -15,13 +15,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 from codexbridge import VERSION
 from codexbridge.codex.app_server import AppServerError
 from codexbridge.companion.service import CompanionService
-from codexbridge.companion.store import CompanionStore
+from codexbridge.companion.store import DEFAULT_PORT, LEGACY_PORT, CompanionStore
+from codexbridge.ports import validate_companion_port
 
 MAX_BODY_BYTES = 64 * 1024
 SSE_HEARTBEAT_SECONDS = 15.0
 SSE_MAX_SECONDS = 60 * 60
 PAIR_WINDOW_SECONDS = 600
 PAIR_MAX_PER_WINDOW = 20
+FALLBACK_PORT_ATTEMPTS = 20
 
 
 class CompanionApi:
@@ -39,9 +41,12 @@ class CompanionApi:
         self.store = store
         self.host = host
         self.port = int(port if port is not None else store.port)
+        if self.port == LEGACY_PORT:
+            self.port = DEFAULT_PORT
         self._logger = logger
         self._server: _CompanionServer | None = None
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.RLock()
         self._pair_attempts: dict[str, list[float]] = {}
         self._pair_lock = threading.Lock()
 
@@ -51,28 +56,94 @@ class CompanionApi:
         return f"http://{host}:{self.port}"
 
     def start(self) -> None:
-        if self._server is not None:
-            return
-        server = _CompanionServer((self.host, self.port), _CompanionHandler)
-        server.app = self
-        self._server = server
-        self._thread = threading.Thread(
-            target=server.serve_forever,
-            name="companion-api",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._server is not None:
+                return
+            server = self._bind_server()
+            server.app = self
+            self._server = server
+            self.port = int(server.server_address[1])
+            self.store.set_port(self.port)
+            self._thread = threading.Thread(
+                target=server.serve_forever,
+                name="companion-api",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _bind_server(self) -> "_CompanionServer":
+        candidates = [self.port]
+        if self.port:
+            candidates.extend(self.port + offset for offset in range(1, FALLBACK_PORT_ATTEMPTS + 1))
+        last_error: OSError | None = None
+        for port in candidates:
+            if not 1 <= port <= 65535:
+                continue
+            if port == LEGACY_PORT:
+                continue
+            try:
+                return _CompanionServer((self.host, port), _CompanionHandler)
+            except OSError as error:
+                last_error = error
+        # Port zero has no deterministic fallback; retrying zero asks the OS for
+        # any currently free port and keeps the API available on locked-down hosts.
+        try:
+            return _CompanionServer((self.host, 0), _CompanionHandler)
+        except OSError:
+            raise last_error or OSError("no available companion port")
+
+    @property
+    def running(self) -> bool:
+        with self._lifecycle_lock:
+            return self._server is not None
+
+    def set_port(self, port: int) -> int:
+        """Switch to an exact port without dropping the current connection.
+
+        The new listener is bound before the old one is closed, so a busy or
+        invalid target leaves the working companion API untouched.
+        """
+        requested = validate_companion_port(port)
+        with self._lifecycle_lock:
+            if self._server is None:
+                self.port = requested
+                self.store.set_port(requested)
+                return requested
+            if requested == self.port:
+                self.store.set_port(requested)
+                return requested
+            server = _CompanionServer((self.host, requested), _CompanionHandler)
+            server.app = self
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="companion-api",
+                daemon=True,
+            )
+            old_server = self._server
+            old_thread = self._thread
+            self._server = server
+            self._thread = thread
+            self.port = requested
+            self.store.set_port(requested)
+            thread.start()
+            if old_server is not None:
+                old_server.shutdown()
+                old_server.server_close()
+            if old_thread is not None:
+                old_thread.join(timeout=2.0)
+            return requested
 
     def stop(self) -> None:
-        server = self._server
-        self._server = None
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        thread = self._thread
-        self._thread = None
-        if thread is not None:
-            thread.join(timeout=2.0)
+        with self._lifecycle_lock:
+            server = self._server
+            self._server = None
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            thread = self._thread
+            self._thread = None
+            if thread is not None:
+                thread.join(timeout=2.0)
 
     def log(self, message: str) -> None:
         if self._logger is not None:

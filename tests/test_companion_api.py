@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from codexbridge.companion.api import CompanionApi
 from codexbridge.companion.service import CompanionService
-from codexbridge.companion.store import CompanionStore
+from codexbridge.companion.store import DEFAULT_PORT, LEGACY_PORT, CompanionStore
 from tests.test_companion_service import FakeClient, thread_detail, thread_row
 
 
@@ -138,6 +139,53 @@ class CompanionApiTests(unittest.TestCase):
         payload = json.loads(data_line[len("data: "):])
         self.assertEqual(payload["type"], "hello")
         connection.close()
+
+    def test_start_uses_a_fallback_port_when_preferred_port_is_busy(self) -> None:
+        self.api.stop()
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy_port = holder.getsockname()[1]
+        try:
+            recovered = CompanionApi(self.service, self.store, host="127.0.0.1", port=busy_port)
+            recovered.start()
+            self.assertNotEqual(recovered.port, busy_port)
+            self.assertGreater(recovered.port, 0)
+            recovered.stop()
+        finally:
+            holder.close()
+
+    def test_start_never_uses_the_reserved_legacy_port(self) -> None:
+        self.api.stop()
+        recovered = CompanionApi(self.service, self.store, host="127.0.0.1", port=LEGACY_PORT)
+        recovered.start()
+        try:
+            self.assertNotEqual(recovered.port, LEGACY_PORT)
+            self.assertGreater(recovered.port, 0)
+        finally:
+            recovered.stop()
+
+    def test_fallback_starts_after_the_default_port(self) -> None:
+        self.api.stop()
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            holder.bind(("127.0.0.1", DEFAULT_PORT))
+            holder.listen(1)
+            busy_port = DEFAULT_PORT
+        except OSError:
+            holder.close()
+            holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            busy_port = holder.getsockname()[1]
+        try:
+            recovered = CompanionApi(self.service, self.store, host="127.0.0.1", port=busy_port)
+            recovered.start()
+            self.assertNotEqual(recovered.port, busy_port)
+            self.assertNotEqual(recovered.port, LEGACY_PORT)
+            recovered.stop()
+        finally:
+            holder.close()
 
 
 if __name__ == "__main__":

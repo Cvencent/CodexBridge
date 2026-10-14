@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_PORT = 8790
+DEFAULT_PORT = 8791
+LEGACY_PORT = 8790
 PAIRING_CODE_TTL_SECONDS = 10 * 60
 PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
@@ -55,7 +56,7 @@ class CompanionStore:
 
     def __init__(self, path: Path | None, port: int = DEFAULT_PORT) -> None:
         self.path = Path(path) if path is not None else None
-        self.port = port
+        self.port = DEFAULT_PORT if port == LEGACY_PORT else port
         self.enabled = True
         self.phones: dict[str, PhoneRecord] = {}
         self._code = ""
@@ -78,15 +79,22 @@ class CompanionStore:
         if not isinstance(payload, dict):
             return
         with self._lock:
-            self._apply_payload(payload)
+            migrated = self._apply_payload(payload)
+        if migrated:
+            self.save()
 
-    def _apply_payload(self, payload: dict) -> None:
+    def _apply_payload(self, payload: dict) -> bool:
+        migrated = False
         enabled = payload.get("enabled")
         if isinstance(enabled, bool):
             self.enabled = enabled
         port = payload.get("port")
         if isinstance(port, int) and 1 <= port <= 65535:
-            self.port = port
+            if port == LEGACY_PORT:
+                self.port = DEFAULT_PORT
+                migrated = True
+            else:
+                self.port = port
 
         phones = payload.get("phones")
         refreshed: dict[str, PhoneRecord] = {}
@@ -117,6 +125,7 @@ class CompanionStore:
             ):
                 self._code = code
                 self._code_expires_at = float(expires)
+        return migrated
 
     def _reload_locked(self) -> None:
         """Refresh disk state before a mutation.
@@ -134,8 +143,8 @@ class CompanionStore:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if isinstance(payload, dict):
-            self._apply_payload(payload)
+        if isinstance(payload, dict) and self._apply_payload(payload):
+            self.save()
 
     @staticmethod
     def _record_from(value: object) -> PhoneRecord | None:
@@ -202,6 +211,8 @@ class CompanionStore:
     def set_port(self, port: int) -> None:
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("port")
+        if port == LEGACY_PORT:
+            raise ValueError("port_reserved")
         with self._lock:
             self._reload_locked()
             self.port = port
@@ -209,6 +220,11 @@ class CompanionStore:
 
     def snapshot(self) -> dict:
         with self._lock:
+            # The management page can be opened by a process that started
+            # before another instance paired a phone. Re-read first so the
+            # displayed list matches the durable file instead of stale
+            # in-memory state.
+            self._reload_locked()
             return {
                 "enabled": self.enabled,
                 "port": self.port,

@@ -14,6 +14,12 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("打开日志目录", SETTINGS_HTML)
         self.assertIn("/api/admin/settings/general", SETTINGS_HTML)
 
+    def test_page_can_view_and_change_companion_port(self):
+        self.assertIn("端口状态", SETTINGS_HTML)
+        self.assertIn('id="companion-port"', SETTINGS_HTML)
+        self.assertIn('action: "set_port"', SETTINGS_HTML)
+        self.assertIn("8790 已保留", SETTINGS_HTML)
+
     def test_page_has_device_and_speech_sections(self):
         self.assertIn("设备", SETTINGS_HTML)
         self.assertIn("语音识别", SETTINGS_HTML)

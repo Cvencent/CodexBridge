@@ -22,6 +22,7 @@ from codexbridge.companion import (
     CompanionService,
     CompanionStore,
 )
+from codexbridge.ports import ADMIN_PORT, build_port_statuses
 from codexbridge.speech import SpeechService
 
 
@@ -219,7 +220,16 @@ def main(argv: list[str] | None = None) -> int:
     companion_discovery = CompanionDiscovery(companion_store, logger=print)
 
     def companion_status() -> dict:
-        return companion.status_payload()
+        payload = companion.status_payload()
+        payload["ports"] = build_port_statuses(
+            admin_port=ADMIN_PORT,
+            companion_port=int(payload.get("port") or companion.store.port),
+            companion_enabled=bool(payload.get("enabled")),
+            companion_running=companion.running,
+            discovery_running=companion_discovery.running,
+            admin_running=True,
+        )
+        return payload
 
     def companion_set_enabled(enabled: bool) -> None:
         companion_store.set_enabled(enabled)
@@ -242,6 +252,9 @@ def main(argv: list[str] | None = None) -> int:
         if action == "remove_phone":
             removed = companion_store.remove_phone(str(payload.get("phone_id") or ""))
             return {"removed": removed, "companion": companion.status_payload()}
+        if action == "set_port":
+            companion.set_port(payload.get("port"))
+            return {"companion": companion_status()}
         if "enabled" in payload:
             value = payload.get("enabled")
             if not isinstance(value, bool):

@@ -9,6 +9,7 @@ dist/
 *.log
 dist-test/
 release/
+!mobile/release/
 firmware/
 .playwright-cli/
 .superpowers/

@@ -16,7 +16,7 @@ data class DiscoveryPayload(
     val service: String = "",
     val name: String = "",
     val version: String = "",
-    val port: Int = 8790,
+    val port: Int = 8791,
     val discovery_port: Int = 8766,
     val requires_pairing: Boolean = true,
 )

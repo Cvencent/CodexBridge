@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from codexbridge import VERSION
+from codexbridge.companion.store import DEFAULT_PORT
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
 from codexbridge.settings_page import SETTINGS_HTML
@@ -168,14 +169,19 @@ def handle_request(
             payload = (
                 companion_status()
                 if companion_status is not None
-                else {"enabled": False, "urls": [], "phones": [], "port": 8790}
+                else {"enabled": False, "urls": [], "phones": [], "port": DEFAULT_PORT, "ports": []}
             )
             return 200, {"ok": True, "companion": payload}
         if method == "POST" and path == "/api/admin/companion":
             payload = _json_body(body)
             if companion_action is None:
                 return 400, {"ok": False, "error": "companion_unavailable"}
-            result = companion_action(payload)
+            try:
+                result = companion_action(payload)
+            except ValueError as error:
+                return 400, {"ok": False, "error": str(error) or "invalid_request"}
+            except OSError:
+                return 409, {"ok": False, "error": "port_in_use"}
             return 200, {"ok": True, **(result or {})}
         if method == "POST" and path == "/api/admin/devices/capabilities":
             payload = _json_body(body)

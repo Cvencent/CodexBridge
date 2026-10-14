@@ -353,6 +353,35 @@ SETTINGS_HTML = r'''<!doctype html>
     .phone-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
     .phone-row strong { display: block; font-size: 14px; }
     .phone-row p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .port-list { display: grid; gap: 8px; margin-top: 8px; }
+    .port-row {
+      display: grid;
+      grid-template-columns: minmax(120px, 1fr) auto auto;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .port-row strong { display: block; font-size: 14px; }
+    .port-row p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .port-number { font-family: Consolas, "Courier New", monospace; font-weight: 700; }
+    .port-state {
+      padding: 3px 8px;
+      border-radius: 999px;
+      color: var(--success);
+      background: var(--success-soft);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .port-state[data-state="error"] { color: var(--danger); background: var(--danger-soft); }
+    .port-state[data-state="disabled"] { color: var(--muted); background: #edf0f2; }
+    .port-state[data-state="reserved"] { color: var(--warning); background: var(--warning-soft); }
+    .port-actions { display: flex; align-items: end; gap: 8px; margin-top: 12px; }
+    .port-actions .field { flex: 1 1 180px; }
+    .port-actions input { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 6px; }
     @media (max-width: 900px) {
       .layout {
         grid-template-columns: minmax(0, 1fr);
@@ -450,13 +479,28 @@ SETTINGS_HTML = r'''<!doctype html>
             </div>
             <div class="general-row">
               <div>
+                <strong>手机服务端口</strong>
+                <p>修改后会立即切换到新端口，已配对手机仍会重新发现电脑。</p>
+              </div>
+              <input id="companion-port" class="port-input" type="number" min="1" max="65535" inputmode="numeric" aria-label="手机服务端口">
+            </div>
+            <div class="general-row">
+              <div>
                 <strong>配对码</strong>
                 <p>在手机端输入，10 分钟内有效，使用一次后立即失效。</p>
               </div>
               <button id="companion-new-code" class="button" type="button">生成配对码</button>
             </div>
           </div>
+          <div class="port-actions">
+            <button id="companion-save-port" class="button button-primary" type="button">修改端口</button>
+            <button id="companion-refresh-ports" class="button" type="button">刷新端口状态</button>
+          </div>
           <div id="companion-code" class="pair-code" hidden></div>
+          <div class="subsection-title">端口状态</div>
+          <div id="companion-port-list" class="port-list" aria-live="polite">
+            <div class="empty-state">正在读取...</div>
+          </div>
           <div class="subsection-title">已配对手机</div>
           <div id="companion-phones" class="phone-list" aria-live="polite">
             <div class="empty-state">正在读取...</div>
@@ -1028,6 +1072,50 @@ SETTINGS_HTML = r'''<!doctype html>
       });
     }
 
+    function portStateText(state) {
+      return ({
+        running: "正常",
+        active: "正常",
+        error: "异常",
+        disabled: "已关闭",
+        reserved: "已保留"
+      })[state] || state || "未知";
+    }
+
+    function renderCompanionPorts(ports) {
+      const list = $("#companion-port-list");
+      list.textContent = "";
+      if (!ports.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "暂时没有端口状态。";
+        list.appendChild(empty);
+        return;
+      }
+      ports.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "port-row";
+        const info = document.createElement("div");
+        const title = document.createElement("strong");
+        title.textContent = item.label || item.key;
+        const detail = document.createElement("p");
+        detail.textContent = `${item.protocol} · ${item.purpose || ""}`;
+        info.appendChild(title);
+        info.appendChild(detail);
+        const number = document.createElement("span");
+        number.className = "port-number";
+        number.textContent = String(item.port || "--");
+        const state = document.createElement("span");
+        state.className = "port-state";
+        state.dataset.state = item.state || "";
+        state.textContent = item.key === "reserved" ? "8790 已保留" : portStateText(item.state);
+        row.appendChild(info);
+        row.appendChild(number);
+        row.appendChild(state);
+        list.appendChild(row);
+      });
+    }
+
     async function loadCompanion() {
       const toggle = $("#companion-enabled");
       try {
@@ -1036,6 +1124,8 @@ SETTINGS_HTML = r'''<!doctype html>
         toggle.checked = Boolean(companion.enabled);
         const urls = companion.urls || [];
         $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
+        $("#companion-port").value = companion.port || "";
+        renderCompanionPorts(companion.ports || []);
         renderCompanionPhones(companion.phones || []);
         if (!companion.enabled) {
           setMessage($("#companion-message"), "手机连接已关闭。");
@@ -1098,8 +1188,42 @@ SETTINGS_HTML = r'''<!doctype html>
       }
     }
 
+    async function saveCompanionPort() {
+      const button = $("#companion-save-port");
+      const input = $("#companion-port");
+      const port = Number(input.value);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        setMessage($("#companion-message"), "端口必须是 1 到 65535 之间的整数。", "error");
+        return;
+      }
+      if (port === 8790) {
+        setMessage($("#companion-message"), "8790 已保留给其他程序，CodexBridge 不能使用。", "error");
+        return;
+      }
+      setBusy(button, true, "切换中...");
+      setMessage($("#companion-message"), "正在验证并切换端口...", "working");
+      try {
+        const payload = await requestJson("/api/admin/companion", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "set_port", port})
+        });
+        const companion = payload.companion || {};
+        $("#companion-port").value = companion.port || port;
+        $("#companion-addresses").textContent = (companion.urls || []).join(" · ") || "未检测到局域网地址";
+        renderCompanionPorts(companion.ports || []);
+        setMessage($("#companion-message"), `手机连接端口已切换为 ${companion.port || port}。`, "success");
+      } catch (error) {
+        setMessage($("#companion-message"), `切换失败：${error.message}。原端口仍保持可用。`, "error");
+      } finally {
+        setBusy(button, false, "切换中...");
+      }
+    }
+
     $("#companion-enabled").addEventListener("change", saveCompanionEnabled);
     $("#companion-new-code").addEventListener("click", newCompanionCode);
+    $("#companion-save-port").addEventListener("click", saveCompanionPort);
+    $("#companion-refresh-ports").addEventListener("click", loadCompanion);
 
     loadStatus();
     loadGeneral();

@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 
 from codexbridge.companion.store import (
+    DEFAULT_PORT,
+    LEGACY_PORT,
     PAIRING_CODE_TTL_SECONDS,
     CompanionStore,
 )
@@ -102,6 +104,26 @@ class CompanionStoreTests(unittest.TestCase):
         payload = json.loads(raw)
         self.assertEqual(payload["version"], 1)
         self.assertEqual(len(payload["phones"]), 1)
+
+    def test_default_port_is_not_the_reserved_legacy_port(self) -> None:
+        self.assertEqual(LEGACY_PORT, 8790)
+        self.assertEqual(DEFAULT_PORT, 8791)
+
+    def test_legacy_port_is_migrated_and_persisted(self) -> None:
+        payload = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {"version": 1}
+        payload["port"] = LEGACY_PORT
+        payload["phones"] = payload.get("phones") or []
+        self.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        migrated = CompanionStore(self.path)
+        migrated.load()
+
+        self.assertEqual(migrated.port, DEFAULT_PORT)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["port"], DEFAULT_PORT)
+
+    def test_set_port_rejects_the_reserved_legacy_port(self) -> None:
+        with self.assertRaisesRegex(ValueError, "port_reserved"):
+            self.store.set_port(LEGACY_PORT)
 
 
 if __name__ == "__main__":

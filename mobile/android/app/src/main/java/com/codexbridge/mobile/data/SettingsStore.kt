@@ -8,7 +8,7 @@ class SettingsStore(context: Context) {
         context.getSharedPreferences("codexbridge_mobile", Context.MODE_PRIVATE)
 
     var baseUrl: String
-        get() = prefs.getString("base_url", "") ?: ""
+        get() = migrateLegacyPort(prefs.getString("base_url", "") ?: "")
         set(value) = prefs.edit().putString("base_url", value).apply()
 
     var token: String
@@ -73,6 +73,15 @@ class SettingsStore(context: Context) {
 
     fun clearAll() {
         prefs.edit().clear().apply()
+    }
+
+    private fun migrateLegacyPort(value: String): String {
+        val text = value.trim()
+        val migrated = ApiClient.migrateStoredBase(text)
+        if (migrated != text) {
+            prefs.edit().putString("base_url", migrated).apply()
+        }
+        return migrated
     }
 
     private fun completionSeenKey(threadId: String): String = "completion_seen_$threadId"

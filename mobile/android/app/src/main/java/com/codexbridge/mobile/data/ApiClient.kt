@@ -207,6 +207,14 @@ class ApiClient(
     }
 
     companion object {
+        const val DEFAULT_PORT = 8791
+        private const val LEGACY_DEFAULT_PORT = 8790
+
+        fun migrateStoredBase(value: String): String {
+            val text = value.trim()
+            return if (text.isEmpty()) "" else normalizeBase(text)
+        }
+
         fun normalizeBase(value: String): String {
             var text = value.trim()
             if (text.isEmpty()) {
@@ -220,7 +228,12 @@ class ApiClient(
             val hostPart = rest.substringBefore('/')
             val tail = rest.substring(hostPart.length)
             if (hostPart.isNotBlank() && !hostPart.contains(':')) {
-                text = text.substring(0, schemeEnd) + hostPart + ":8790" + tail
+                text = text.substring(0, schemeEnd) + hostPart + ":$DEFAULT_PORT" + tail
+            } else if (hostPart.endsWith(":$LEGACY_DEFAULT_PORT")) {
+                text = text.substring(0, schemeEnd) +
+                    hostPart.removeSuffix(":$LEGACY_DEFAULT_PORT") +
+                    ":$DEFAULT_PORT" +
+                    tail
             }
             return text.trimEnd('/')
         }

@@ -39,6 +39,10 @@ class CompanionDiscovery:
         self._thread = threading.Thread(target=self._loop, name="companion-discovery", daemon=True)
         self._thread.start()
 
+    @property
+    def running(self) -> bool:
+        return self._socket is not None
+
     def stop(self) -> None:
         self._stop.set()
         sock = self._socket
