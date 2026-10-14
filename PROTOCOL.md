@@ -743,7 +743,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.10","port":8791,"discovery_port":8766,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.11","port":8791,"discovery_port":8766,"requires_pairing":true}
 ```
 
 默认连接端口为 `8791`，默认发现端口为 `8766`，并在管理页面显示每个端口的健康状态。

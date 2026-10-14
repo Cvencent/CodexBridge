@@ -1,10 +1,11 @@
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from codexbridge.codex.app_server import AppServerError
+from codexbridge.codex.app_server import AppServerError, _resolve_codex_command
 from codexbridge.__main__ import (
     _CodexSourceHolder,
     _apply_companion_action,
@@ -41,6 +42,45 @@ class MainRestartTest(unittest.TestCase):
         ):
             command = _restart_command()
         self.assertEqual(command, [r"C:\Apps\CodexBridge\CodexBridge.exe"])
+
+
+class CodexCommandResolutionTest(unittest.TestCase):
+    def test_finds_official_cli_when_path_was_not_inherited(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            executable = root / "OpenAI" / "Codex" / "bin" / "version-2" / "codex.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"")
+
+            with patch.dict(
+                "os.environ",
+                {"LOCALAPPDATA": str(root), "APPDATA": str(root / "npm")},
+                clear=False,
+            ), patch(
+                "codexbridge.codex.app_server.shutil.which",
+                return_value=None,
+            ):
+                command = _resolve_codex_command(None, root)
+
+        self.assertEqual(command, [str(executable)])
+
+    def test_explicit_command_wins_over_install_discovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            explicit = root / "custom-codex.exe"
+            explicit.write_bytes(b"")
+
+            with patch.dict(
+                "os.environ",
+                {"LOCALAPPDATA": str(root / "missing"), "APPDATA": str(root / "npm")},
+                clear=False,
+            ), patch(
+                "codexbridge.codex.app_server.shutil.which",
+                return_value=None,
+            ):
+                command = _resolve_codex_command(str(explicit), root)
+
+        self.assertEqual(command, [str(explicit)])
 
 
 class CodexSourceHolderTest(unittest.TestCase):

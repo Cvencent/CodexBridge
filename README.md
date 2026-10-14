@@ -51,7 +51,7 @@ Android 手机端应用源码与成品 APK 位于本仓库 [mobile/](mobile/READ
 
 ``text
 mobile/android/    Kotlin + Jetpack Compose 工程
-mobile/release/    CodexBridgeMobile-0.2.4-release.apk 及校验文件
+mobile/release/    CodexBridgeMobile-0.2.5-release.apk 及校验文件
 ``
 
 ## Development
@@ -74,14 +74,14 @@ or set `CODEXBRIDGE_VOSK_MODEL` to the model directory.
 Download the Windows installer from the GitHub Releases page:
 
 ```text
-CodexBridge-Setup-1.3.10-win64.exe
+CodexBridge-Setup-1.3.11-win64.exe
 ```
 
 A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 1.3.10
+./packaging/build_windows.ps1 -Version 1.3.11
 ```
 
 `CodexBridge.exe` stays in the system tray and only handles the Codex side:

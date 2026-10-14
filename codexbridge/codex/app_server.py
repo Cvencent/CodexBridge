@@ -106,6 +106,31 @@ def _safe_message(value: str, maximum: int | None = None) -> str:
     return visible + marker.decode("ascii")
 
 
+def _codex_install_candidates() -> list[Path]:
+    """Return known per-user Codex CLI locations when PATH is not inherited."""
+    candidates: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        bin_root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+        if bin_root.is_dir():
+            versioned = sorted(
+                (path / "codex.exe" for path in bin_root.iterdir() if path.is_dir()),
+                key=lambda path: path.parent.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(versioned)
+        candidates.append(bin_root / "codex.exe")
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        candidates.extend(
+            [
+                Path(app_data) / "npm" / "codex.cmd",
+                Path(app_data) / "npm" / "codex.exe",
+            ]
+        )
+    return candidates
+
+
 def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[str]:
     candidates: list[str] = []
     if explicit:
@@ -128,6 +153,9 @@ def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[s
     executable = shutil.which("codex")
     if executable:
         return [executable]
+    for candidate in _codex_install_candidates():
+        if candidate.is_file():
+            return [str(candidate)]
     raise AppServerError("未找到 Codex CLI，请确认 Codex 已安装并位于 PATH 中")
 
 
