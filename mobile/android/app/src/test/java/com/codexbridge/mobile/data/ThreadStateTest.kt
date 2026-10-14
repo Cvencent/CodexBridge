@@ -6,23 +6,6 @@ import org.junit.Test
 
 class ThreadStateTest {
     @Test
-    fun completedThreadBecomesIdleAfterItWasOpened() {
-        assertEquals("idle", resolveThreadStatus("completed", 1000, 1000))
-        assertEquals("idle", resolveThreadStatus("completed", 900, 1000))
-    }
-
-    @Test
-    fun newerCompletionIsNotHiddenByAnOldSeenMarker() {
-        assertEquals("completed", resolveThreadStatus("completed", 1001, 1000))
-    }
-
-    @Test
-    fun nonCompletedStatusesAreUnchanged() {
-        assertEquals("working", resolveThreadStatus("working", 1000, 1000))
-        assertEquals("failed", resolveThreadStatus("failed", 1000, 1000))
-    }
-
-    @Test
     fun runningTaskIsNotReplacedByAStaleDetailFailure() {
         assertEquals("working", coherentTaskStatus("working", "failed"))
         assertEquals("waiting_user", coherentTaskStatus("waiting_user", "failed"))

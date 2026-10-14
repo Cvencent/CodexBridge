@@ -16,6 +16,7 @@ from codexbridge.devices.discovery import discover
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
+from codexbridge.read_state import ReadStateStore
 from codexbridge.companion import (
     CompanionApi,
     CompanionDiscovery,
@@ -254,13 +255,19 @@ def main(argv: list[str] | None = None) -> int:
         source_holder.request,
         workspace=codex_cwd,
     )
-    hub = BridgeHub(registry, speech=speech, codex_catalog=codex_catalog)
+    read_state = ReadStateStore(data_dir / "read-state.json")
+    hub = BridgeHub(registry, speech=speech, codex_catalog=codex_catalog, read_state=read_state)
     manager = DeviceManager(registry, hub)
     codex_state = _CodexState()
 
     companion_store = CompanionStore(data_dir / "companion.json")
     companion_store.load()
-    companion_service = CompanionService(data_dir, codex_cwd, codex_command)
+    companion_service = CompanionService(
+        data_dir,
+        codex_cwd,
+        codex_command,
+        read_state=read_state,
+    )
     companion = CompanionApi(companion_service, companion_store, logger=print)
     companion_discovery = CompanionDiscovery(
         companion_store,

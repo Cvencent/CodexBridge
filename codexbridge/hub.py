@@ -8,6 +8,7 @@ from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.messages_store import KIND_CAPABILITY, MessageRecord, MessageStore
 from codexbridge.protocol.capabilities import effective
 from codexbridge.protocol.messages import decode, wire_messages
+from codexbridge.read_state import ReadStateStore
 
 DEVICE_EVENT_CAPABILITY: dict[str, str] = {
     "voice_command": "voice",
@@ -31,9 +32,11 @@ class BridgeHub:
         store: MessageStore | None = None,
         speech=None,
         codex_catalog=None,
+        read_state: ReadStateStore | None = None,
     ):
         self.registry = registry
         self.store = store or MessageStore()
+        self.read_state = read_state or ReadStateStore(None)
         self.speech = speech
         self.codex_catalog = codex_catalog
         self._sessions: dict[str, Any] = {}
@@ -133,7 +136,16 @@ class BridgeHub:
     def state_for(self, device_id: str) -> dict:
         with self._lock:
             capabilities = self.capabilities_for(device_id)
-            pending = self.store.pending_for(device_id, capabilities)
+            pending = [
+                record
+                for record in self.store.pending_for(device_id, capabilities)
+                if not self.read_state.is_message_read(record.message_id)
+                and not (
+                    record.thread_id
+                    and record.created_at > 0
+                    and self.read_state.is_thread_read(record.thread_id, int(record.created_at))
+                )
+            ]
             visible = self.store.pending_for(
                 device_id,
                 capabilities,
@@ -205,6 +217,9 @@ class BridgeHub:
             record = self.store.mark_read(message_id, device_id)
             if record is None:
                 return
+            self.read_state.mark_message(record.message_id)
+            if record.thread_id and record.created_at > 0:
+                self.read_state.mark_thread(record.thread_id, int(record.created_at))
             payload = {
                 "type": "read_state",
                 "message_id": record.message_id,

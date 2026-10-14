@@ -193,8 +193,10 @@ CodexBridge 在发现设备并取得已保存令牌后建立独立会话。当�
    不带 `request_id`，用于固件在重连后已经处于目录加载态时退出加载。
    设备在正常目录请求期间仍应按 `request_id` 过滤响应。
 
-已读按 `message_id` 和设备维度保存。重放的是在线期间仍存在于消息中心的消息；
-消息中心当前最多保留 `200` 条记录。
+设备维度的已读按 `message_id` 和设备维度保存，用于兼容各设备的本地去重。除此之外
+CodexBridge 维护一份全局已读标记：任一客户端（手机伴侣或 ESP 设备）读过一条消息后，
+其他客户端重连或刷新时都不会再把它当作未读下发。重放的是在线期间仍存在于消息中心
+的消息；消息中心当前最多保留 `200` 条记录。
 
 ## 7. 能力协商与权限模型
 
@@ -616,9 +618,10 @@ CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发�
 
 ### 11.3 重连重放
 
-设备重新连接后，CodexBridge 推送该设备尚未读过且符合能力的消息，并推送带有
-已读记录的 `read_state`。这保证同一消息在多台设备之间保持一致，不依赖设备
-本地缓存。
+设备重新连接后，CodexBridge 推送尚未被任何客户端读过的消息，并推送带有已读
+记录的 `read_state`。任一设备上报 `read_ack` 后，CodexBridge 同时更新全局已读标记，
+因此其他在线设备会收到 `read_state`，稍后重连的设备也不会再收到该消息。这保证同一
+消息在多台设备之间保持一致，不依赖设备本地缓存。
 
 ## 12. 错误与边界
 
@@ -743,7 +746,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.12","port":8568,"discovery_port":8569,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.13","port":8568,"discovery_port":8569,"requires_pairing":true}
 ```
 
 默认连接端口为 `8568`，默认发现端口为 `8569`，并在管理页面显示每个端口的健康状态。
@@ -769,6 +772,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 | GET | `/api/companion/threads` | 线程列表，支持 `limit`、`search`、`cursor` |
 | POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model` |
 | GET | `/api/companion/threads/<id>` | 线程详情与归一化消息 |
+| POST | `/api/companion/threads/<id>/read` | 标记该线程当前完成状态为已读，返回最新 `status` |
 | POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务 |
 | POST | `/api/companion/threads/<id>/interrupt` | 中断任务，`turn_id` 可省略 |
 | POST | `/api/companion/approvals/<request_id>` | 审批决定，`decision` 取 `accept`、`acceptForSession`、`decline`、`cancel` |
@@ -795,7 +799,12 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
 `turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
 `token_usage`、`thread_status`、`thread_name`、`rate_limits`、`approval_request`、
-`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳；手机端应使用它判断完成先后并给状态栏提醒去重。审批请求超过 `600` 秒未处理会在电脑端失效。
+`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳与 `read` 布尔值；手机端应使用它们判断完成先后、给状态栏提醒去重，并在 `read=true` 时不再提醒。审批请求超过 `600` 秒未处理会在电脑端失效。
+
+完成与失败的提醒在多台客户端之间保持一致：`completed`/`failed` 的线程在任一台设备
+打开（`GET /api/companion/threads/<id>` 或 `POST /api/companion/threads/<id>/read`）后即被
+标记为全局已读，线程列表状态回落为 `idle`，并向所有在线客户端广播 `thread_status`
+的 `idle` 事件，其他设备据此撤回尚未展示的完成提醒。
 
 ### 17.4 本机管理
 

@@ -47,16 +47,6 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt("discovery_port", ApiClient.DEFAULT_DISCOVERY_PORT)
         set(value) = prefs.edit().putInt("discovery_port", value).apply()
 
-    fun completionSeenAt(threadId: String): Long =
-        prefs.getLong(completionSeenKey(threadId), 0L)
-
-    fun markCompletionSeen(threadId: String, completedAt: Long) {
-        if (threadId.isBlank() || completedAt <= 0) return
-        val key = completionSeenKey(threadId)
-        if (completedAt <= prefs.getLong(key, 0L)) return
-        prefs.edit().putLong(key, completedAt).apply()
-    }
-
     fun markNotificationSent(threadId: String, notificationKey: String): Boolean {
         if (threadId.isBlank() || notificationKey.isBlank()) return false
         val key = "notified_$notificationKey"
@@ -88,6 +78,4 @@ class SettingsStore(context: Context) {
         }
         return migrated
     }
-
-    private fun completionSeenKey(threadId: String): String = "completion_seen_$threadId"
 }

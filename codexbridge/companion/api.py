@@ -343,6 +343,10 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(200, {"ok": True, **result})
                 return
+            if len(parts) == 5 and parts[:3] == ["api", "companion", "threads"] and parts[4] == "read":
+                result = self.app.service.mark_thread_read(parts[3])
+                self._send_json(200, {"ok": True, **result})
+                return
             if len(parts) == 5 and parts[:3] == ["api", "companion", "threads"] and parts[4] == "messages":
                 text = str(payload.get("text") or "")
                 model = str(payload.get("model") or "")

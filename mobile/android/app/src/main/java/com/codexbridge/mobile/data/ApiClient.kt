@@ -153,6 +153,15 @@ class ApiClient(
             ),
         )
 
+    suspend fun markThreadRead(threadId: String): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            postText(
+                "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/read",
+                buildJsonObject { },
+            ),
+        )
+
     suspend fun interrupt(threadId: String, turnId: String = ""): SendResponse =
         json.decodeFromString(
             SendResponse.serializer(),

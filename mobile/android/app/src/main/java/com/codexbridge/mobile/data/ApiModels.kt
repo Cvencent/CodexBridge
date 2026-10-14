@@ -35,6 +35,7 @@ data class SendResponse(
     val thread_id: String = "",
     val turn_id: String = "",
     val status: String = "",
+    val read_at: Long = 0,
 )
 
 @Serializable
@@ -256,6 +257,7 @@ data class StreamEvent(
     val delta: String = "",
     val status: String = "",
     val completed_at: Long = 0,
+    val read: Boolean = false,
     val title: String = "",
     val message: String = "",
     val decision: String = "",

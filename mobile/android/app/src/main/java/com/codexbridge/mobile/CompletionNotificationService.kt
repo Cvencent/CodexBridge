@@ -93,11 +93,34 @@ class CompletionNotificationService : Service() {
             try {
                 val client = ApiClient(settings.baseUrl, settings.token)
                 client.events().collect { event ->
-                    if (event.type != "turn_completed" || event.status == "failed") return@collect
-                    if (event.thread_id.isBlank() || event.turn_id.isBlank()) return@collect
-                    val key = completionNotificationKey(event.thread_id, event.turn_id, event.completed_at)
-                    if (!settings.markNotificationSent(event.thread_id, key)) return@collect
-                    notifyCompletion(event.thread_id, key)
+                    when (event.type) {
+                        "turn_completed" -> {
+                            if (event.thread_id.isBlank()) return@collect
+                            // Any device opening the task publishes an idle thread
+                            // status, and completions that another device already
+                            // read arrive with read=true: never alert twice there.
+                            if (event.read) {
+                                cancelCompletion(event.thread_id)
+                                return@collect
+                            }
+                            if (event.turn_id.isBlank() && event.completed_at <= 0) return@collect
+                            val failed = event.status == "failed"
+                            val key = completionNotificationKey(
+                                event.thread_id,
+                                event.turn_id,
+                                event.completed_at,
+                            )
+                            if (!settings.markNotificationSent(event.thread_id, key)) return@collect
+                            notifyCompletion(event.thread_id, failed)
+                        }
+                        "thread_status" -> {
+                            // Another client (phone or ESP device) marked the task
+                            // read, so drop this device's pending alert.
+                            if (event.thread_id.isNotBlank() && event.status == "idle") {
+                                cancelCompletion(event.thread_id)
+                            }
+                        }
+                    }
                 }
                 delay(RETRY_MS)
             } catch (_: Exception) {
@@ -117,10 +140,13 @@ class CompletionNotificationService : Service() {
                 val client = ApiClient(settings.baseUrl, settings.token)
                 val threads = client.threads().threads
                 threads.forEach { thread ->
-                    if (thread.status != "completed" || thread.completed_at <= 0) return@forEach
+                    val failed = thread.status == "failed"
+                    if ((!failed && thread.status != "completed") || thread.completed_at <= 0) {
+                        return@forEach
+                    }
                     val key = completionNotificationKey(thread.thread_id, "", thread.completed_at)
                     if (settings.markNotificationSent(thread.thread_id, key)) {
-                        notifyCompletion(thread.thread_id, key)
+                        notifyCompletion(thread.thread_id, failed)
                     }
                 }
             } catch (_: Exception) {
@@ -129,20 +155,20 @@ class CompletionNotificationService : Service() {
         }
     }
 
-    private fun notifyCompletion(threadId: String, turnId: String) {
+    private fun notifyCompletion(threadId: String, failed: Boolean) {
         val intent = Intent(this, MainActivity::class.java)
             .putExtra(EXTRA_THREAD_ID, threadId)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         val pending = PendingIntent.getActivity(
             this,
-            threadId.hashCode(),
+            completionId(threadId),
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(this, COMPLETION_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle("Codex 任务已完成")
-            .setContentText("点开查看结果")
+            .setContentTitle(if (failed) "Codex 任务失败" else "Codex 任务已完成")
+            .setContentText(if (failed) "点开查看错误详情" else "点开查看结果")
             .setContentIntent(pending)
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
@@ -151,7 +177,12 @@ class CompletionNotificationService : Service() {
             .setVibrate(longArrayOf(0, 250, 150, 250))
             .setDefaults(NotificationCompat.DEFAULT_SOUND or NotificationCompat.DEFAULT_VIBRATE)
             .build()
-        NotificationManagerCompat.from(this).notify(completionId(threadId, turnId), notification)
+        NotificationManagerCompat.from(this).notify(completionId(threadId), notification)
+    }
+
+    private fun cancelCompletion(threadId: String) {
+        if (threadId.isBlank()) return
+        NotificationManagerCompat.from(this).cancel(completionId(threadId))
     }
 
     private fun createChannels() {
@@ -195,7 +226,7 @@ class CompletionNotificationService : Service() {
             context.stopService(Intent(context, CompletionNotificationService::class.java))
         }
 
-        private fun completionId(threadId: String, turnId: String): Int =
-            5000 + (threadId + turnId).hashCode() % 100000
+        private fun completionId(threadId: String): Int =
+            5000 + (Math.floorMod(threadId.hashCode(), 100000))
     }
 }

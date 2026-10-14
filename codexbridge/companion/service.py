@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from codexbridge.read_state import ReadStateStore
 from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
@@ -217,6 +218,7 @@ class CompanionService:
         client_factory: Callable[[list[str], Path], Any] | None = None,
         desktop_state_path: Path | None = None,
         sessions_root: Path | None = None,
+        read_state: ReadStateStore | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
@@ -247,6 +249,7 @@ class CompanionService:
         )
         self._log_cache: dict[str, tuple[float, tuple[float, str, float] | None]] = {}
         self._log_cache_lock = threading.Lock()
+        self._read_state = read_state or ReadStateStore(self.data_dir / "read-state.json")
 
     def start(self) -> None:
         self._stop.clear()
@@ -336,6 +339,9 @@ class CompanionService:
             except AppServerError as exc:
                 error = exc
                 message = str(exc)
+                if _is_active_writer_error(exc):
+                    self._thread_note(thread_id)
+                    return
                 if "not found" in message.lower():
                     raise
                 self._reset_client()
@@ -645,13 +651,20 @@ class CompanionService:
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             status = str(turn.get("status") or "completed")
+            thread_id = str(params.get("threadId") or "")
+            completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
             return {
                 "type": "turn_completed",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": thread_id,
                 "turn_id": str(turn.get("id") or ""),
                 "status": "completed" if status == "completed" else "failed",
                 "duration_ms": turn.get("durationMs"),
-                "completed_at": _epoch(turn.get("completedAt") or turn.get("completedAtMs")),
+                "completed_at": completed_at,
+                "read": bool(
+                    thread_id
+                    and completed_at > 0
+                    and self._read_state.is_thread_read(thread_id, completed_at)
+                ),
             }
         if method == "thread/status/changed":
             status = params.get("status") if isinstance(params.get("status"), dict) else {}
@@ -770,6 +783,13 @@ class CompanionService:
                 inferred = self._log_status(str(summary.get("thread_id") or ""))
                 if inferred:
                     summary["status"] = inferred
+            completed_at = int(summary.get("completed_at") or 0)
+            if (
+                summary.get("status") in {"completed", "failed"}
+                and completed_at > 0
+                and self._read_state.is_thread_read(str(summary.get("thread_id") or ""), completed_at)
+            ):
+                summary["status"] = "idle"
         threads.sort(
             key=lambda item: (
                 0 if str(item.get("status") or "") in ACTIVE_STATUSES else 1,
@@ -800,7 +820,11 @@ class CompanionService:
             "tokens": int(_as_number(total.get("totalTokens")) or 0),
             "ephemeral": bool(row.get("ephemeral")),
         }
-    def read_thread(self, thread_id: str, message_limit: int = MAX_MESSAGE_ITEMS) -> dict[str, Any]:
+    def read_thread(
+        self,
+        thread_id: str,
+        message_limit: int = MAX_MESSAGE_ITEMS,
+    ) -> dict[str, Any]:
         if not thread_id:
             raise ValueError("thread_id")
         result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
@@ -833,6 +857,14 @@ class CompanionService:
         if live_status:
             summary["status"] = live_status
             task["status"] = live_status
+        completed_at = int(summary.get("completed_at") or task.get("completed_at_epoch") or 0)
+        if (
+            summary.get("status") in {"completed", "failed"}
+            and completed_at > 0
+            and self._read_state.is_thread_read(thread_id, completed_at)
+        ):
+            summary["status"] = "idle"
+            task["status"] = "idle"
         return {
             "thread": summary,
             "task": task,
@@ -967,6 +999,34 @@ class CompanionService:
         if not isinstance(thread, dict):
             raise AppServerError("App Server 未返回新任务")
         return {"thread": self._summary(thread)}
+
+    def mark_thread_read(self, thread_id: str) -> dict[str, Any]:
+        if not thread_id:
+            raise ValueError("thread_id")
+        # Read without an acknowledging reader so the summary still carries the
+        # completion state we need to detect an unread result.
+        detail = self.read_thread(thread_id, message_limit=1)
+        summary = detail["thread"]
+        status = str(summary.get("status") or "idle")
+        completed_at = int(summary.get("completed_at") or 0)
+        if status in {"completed", "failed"} and completed_at > 0:
+            was_unread = not self._read_state.is_thread_read(thread_id, completed_at)
+            self._read_state.mark_thread(thread_id, completed_at)
+            if was_unread:
+                self.publish(
+                    {
+                        "type": "thread_status",
+                        "thread_id": thread_id,
+                        "status": "idle",
+                        "active_flags": [],
+                    }
+                )
+            status = "idle"
+        return {
+            "thread_id": thread_id,
+            "read_at": self._read_state.thread_read_at(thread_id),
+            "status": status,
+        }
 
     def start_turn(
         self,

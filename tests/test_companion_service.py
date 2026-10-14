@@ -12,6 +12,7 @@ from pathlib import Path
 
 from codexbridge.codex.app_server import AppServerError
 from codexbridge.companion.service import CompanionService
+from codexbridge.read_state import ReadStateStore
 
 
 class FakeClient:
@@ -246,6 +247,25 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "working")
         self.assertEqual(calls, {"start": 1, "steer": 1})
 
+    def test_start_turn_tolerates_active_writer_during_resume(self) -> None:
+        calls = {"resume": 0, "start": 0}
+
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread already has an active writer")
+
+        def start(_params):
+            calls["start"] += 1
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["turn/start"] = start
+
+        result = self.service.start_turn("t1", "继续这个旧任务")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(calls, {"resume": 1, "start": 1})
+
     def test_turn_completed_event_uses_desktop_completion_timestamp(self) -> None:
         event = self.service._event_payload(
             {
@@ -339,6 +359,34 @@ class CompanionServiceTests(unittest.TestCase):
             [method for method, _ in clients[1].requests if method == "thread/resume"],
             ["thread/resume"],
         )
+
+    def test_completed_thread_shows_idle_once_read(self) -> None:
+        read_state = ReadStateStore(None)
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            read_state=read_state,
+        )
+        try:
+            self.assertEqual(service.read_thread("t1")["thread"]["status"], "completed")
+            read_state.mark_thread("t1", 1791000100)
+            self.assertEqual(service.read_thread("t1")["thread"]["status"], "idle")
+        finally:
+            service.stop()
+
+    def test_mark_thread_read_publishes_idle_for_other_clients(self) -> None:
+        target = self.service.subscribe()
+
+        result = self.service.mark_thread_read("t1")
+
+        self.assertEqual(result["status"], "idle")
+        event = target.get(timeout=1.0)
+        self.assertEqual(event["type"], "thread_status")
+        self.assertEqual(event["thread_id"], "t1")
+        self.assertEqual(event["status"], "idle")
 
     def test_notification_pump_forwards_agent_delta(self) -> None:
         self.service.start()
