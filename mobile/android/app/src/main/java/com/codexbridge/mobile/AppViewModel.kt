@@ -486,15 +486,60 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             try {
-                val response = client.sendMessage(
-                    threadId = threadId,
-                    text = content,
-                    model = _state.value.selectedModel,
-                    effort = _state.value.selectedEffort,
-                    steer = false,
-                )
+                // An existing conversation that already has a turn in flight
+                // should be appended to with steer; only a fresh task, or a
+                // steer the bridge cannot honour, falls back to starting a turn.
+                val wantsSteer = _state.value.task.isWorking || _state.value.working
+                if (wantsSteer) {
+                    try {
+                        client.sendMessage(
+                            threadId = threadId,
+                            text = content,
+                            model = _state.value.selectedModel,
+                            effort = _state.value.selectedEffort,
+                            steer = true,
+                        )
+                    } catch (steerError: Exception) {
+                        client.sendMessage(
+                            threadId = threadId,
+                            text = content,
+                            model = _state.value.selectedModel,
+                            effort = _state.value.selectedEffort,
+                            steer = false,
+                        )
+                    }
+                } else {
+                    client.sendMessage(
+                        threadId = threadId,
+                        text = content,
+                        model = _state.value.selectedModel,
+                        effort = _state.value.selectedEffort,
+                        steer = false,
+                    )
+                }
+                // The bridge now owns the turn; let the detail poll report the
+                // real state instead of assuming it locally.
+                viewModelScope.launch {
+                    runCatching { client.thread(threadId) }.onSuccess { detail ->
+                        val status = coherentTaskStatus(
+                            _state.value.activeThread?.status.orEmpty(),
+                            detail.task.status,
+                        )
+                        _state.update { state ->
+                            state.copy(
+                                task = detail.task.copy(status = status),
+                                working = status in ACTIVE_TASK_STATUSES,
+                            )
+                        }
+                    }
+                }
             } catch (error: Exception) {
-                _state.update { it.copy(messages = it.messages.filterNot { item -> item.id == local.id }) }
+                _state.update {
+                    it.copy(
+                        messages = it.messages.filterNot { item -> item.id == local.id },
+                        working = false,
+                    )
+                }
                 handleError(error)
             }
         }

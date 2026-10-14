@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import tempfile
 import time
@@ -176,6 +177,46 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(result["threads"][0]["status"], "working")
         self.assertEqual(result["threads"][1]["status"], "idle")
 
+    def test_rollout_write_staleness_gates_working_inference(self) -> None:
+        # A rollout log can carry fresh-looking timestamps while the file itself
+        # stopped being written long ago (a stale tail left on disk, or a
+        # timestamp far in the future). Freshness of the log's own timestamps
+        # must never be enough on its own to call a desktop turn "working".
+        folder = (
+            Path(self.temp.name)
+            / "sessions"
+            / f"{datetime.now().year:04d}"
+            / f"{datetime.now().month:02d}"
+            / f"{datetime.now().day:02d}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "rollout-t2.jsonl"
+        stamp = datetime.now(timezone.utc)
+        path.write_text(
+            json.dumps(
+                {
+                    "timestamp": stamp.isoformat().replace("+00:00", "Z"),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stale = time.time() - 3600.0
+        os.utime(path, (stale, stale))
+
+        self.assertEqual(self.service._log_status("t2"), "")
+
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertNotEqual(statuses["t2"], "working")
+
+    def test_rollout_recently_written_still_reports_working(self) -> None:
+        # The same log, but actively appended: still a live desktop turn.
+        self._write_rollout("t2", "task_started")
+        self.assertEqual(self.service._log_status("t2"), "working")
+
     def test_list_threads_marks_finished_rollout_completed(self) -> None:
         self._write_rollout("t2", "task_complete", seconds_ago=30)
         result = self.service.list_threads(limit=10)
@@ -238,6 +279,78 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(detail["messages"][3]["detail"]["exit_code"], 0)
         self.assertEqual(detail["messages"][3]["detail"]["output"], "BUILD SUCCESSFUL")
         self.assertEqual(detail["thread"]["completed_at"], 1791000100)
+
+    def test_detail_reports_one_status_for_list_and_chat(self) -> None:
+        # The phone list renders thread.status while the chat header renders
+        # task.status. They must never disagree for the same thread.
+        self.client.responses["thread/read"] = self._interrupted_desktop_thread()
+
+        detail = self.service.read_thread("t1")
+
+        self.assertEqual(detail["thread"]["status"], detail["task"]["status"])
+
+    def test_interrupted_turn_without_live_activity_is_not_working(self) -> None:
+        # A desktop thread that stopped long ago must not be reported as a
+        # running turn, otherwise the chat header shows "正在处理任务" forever.
+        self.client.responses["thread/read"] = self._interrupted_desktop_thread()
+
+        detail = self.service.read_thread("t1")
+
+        self.assertNotEqual(detail["task"]["status"], "working")
+        self.assertNotEqual(detail["thread"]["status"], "working")
+
+    def _interrupted_desktop_thread(self, seconds_ago: float = 833.0) -> dict:
+        """A desktop-owned thread whose last turn was interrupted a while ago.
+
+        Mirrors a real thread (01a13af3): the last turn is ``interrupted`` with
+        ``completedAt: None`` and a single userMessage item, runtime status is
+        ``notLoaded``, source is ``vscode``, and ``recencyAt``/``updatedAt`` are
+        ``seconds_ago`` old (well past any plausible activity window).
+        CodexBridge must not call this a running turn.
+        """
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        epoch = int(stamp.timestamp())
+        started = (stamp - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+        older = (stamp - timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
+        return {
+            "thread": {
+                **thread_row("t1"),
+                "status": {"type": "notLoaded"},
+                "source": "vscode",
+                "recencyAt": epoch,
+                "updatedAt": epoch,
+                "createdAt": older,
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "startedAt": older,
+                        "completedAt": older,
+                        "items": [
+                            {
+                                "id": "item-1",
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "第一句"}],
+                            }
+                        ],
+                    },
+                    {
+                        "id": "turn-2",
+                        # Real payloads carry no updatedAt on an interrupted turn.
+                        "status": "interrupted",
+                        "startedAt": started,
+                        "completedAt": None,
+                        "items": [
+                            {
+                                "id": "item-2",
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "继续"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        }
 
     def test_start_turn_publishes_event(self) -> None:
         target = self.service.subscribe()

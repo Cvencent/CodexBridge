@@ -17,6 +17,8 @@ from typing import Any
 from codexbridge import VERSION
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
+# A turn that stopped updating this long ago is over, not still running.
+RESUMED_ACTIVE_WINDOW_SECONDS = 120
 TRANSIENT_REFRESH_FAILURE_LIMIT = 6
 
 
@@ -585,7 +587,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
     recency = _epoch(thread.get("recencyAt"))
     updated = recency or _epoch(thread.get("updatedAt") or latest_turn.get("updatedAt") or
                                 latest_turn.get("completedAt") or latest_turn.get("startedAt"))
-    recently_updating = updated > 0 and 0 <= now_epoch - updated < 15 * 60
+    recently_updating = updated > 0 and 0 <= now_epoch - updated < RESUMED_ACTIVE_WINDOW_SECONDS
     detached_recent = recency > 0 and 0 <= now_epoch - recency < DETACHED_ACTIVE_WINDOW_SECONDS
     completed_at = _epoch(latest_turn.get("completedAt"))
     resumed_visible_activity = (
@@ -608,7 +610,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
     elif turn_status == "completed":
         status = "completed"
     elif turn_status == "interrupted" and (
-            latest_turn.get("completedAt") is None and recently_updating or detached_active):
+            (latest_turn.get("completedAt") is None and recently_updating) or detached_active):
         # A second read-only app-server sees a desktop-owned in-flight turn as
         # interrupted. Newer versions may also expose an empty placeholder
         # turn with completedAt populated while recencyAt continues to move.
@@ -847,7 +849,7 @@ class CodexAppServerSource:
             return True
         recency = _epoch(item.get("recencyAt"))
         if (str(runtime.get("type", "")).lower() == "notloaded" and recency > 0 and
-                0 <= int(time.time()) - recency < 15 * 60):
+                0 <= int(time.time()) - recency < RESUMED_ACTIVE_WINDOW_SECONDS):
             return True
         turns = [turn for turn in item.get("turns", []) if isinstance(turn, dict)]
         if not turns:
@@ -858,7 +860,7 @@ class CodexAppServerSource:
             return True
         if status == "interrupted" and latest.get("completedAt") is None:
             updated = _epoch(item.get("updatedAt") or latest.get("updatedAt") or latest.get("startedAt"))
-            return updated > 0 and int(time.time()) - updated < 15 * 60
+            return updated > 0 and int(time.time()) - updated < RESUMED_ACTIVE_WINDOW_SECONDS
         return False
 
     @classmethod

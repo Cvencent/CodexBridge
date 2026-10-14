@@ -38,6 +38,8 @@ LOG_TAIL_BYTES = 131072
 LOG_ACTIVE_SECONDS = 150.0
 LOG_SETTLED_SECONDS = 1800.0
 LOG_CACHE_SECONDS = 8.0
+# How many days of rollout folders to search for a thread's log.
+ROLLOUT_SCAN_DAYS = 3
 LOG_SCAN_LIMIT = 24
 
 APPROVAL_KINDS: dict[str, str] = {
@@ -420,6 +422,11 @@ class CompanionService:
             status = str(turn.get("status") or "").replace("_", "").lower()
             if status in {"inprogress", "running", "active"}:
                 return str(turn.get("id") or "")
+            # A desktop-owned turn is reported as "interrupted" to any second
+            # reader even while it is still running, so treat an unfinished
+            # turn that is still being written as active too.
+            if status == "interrupted" and turn.get("completedAt") is None:
+                return str(turn.get("id") or "")
         return ""
 
     def _writable_thread(self, thread_id: str) -> str:
@@ -589,10 +596,11 @@ class CompanionService:
         with self._resumed_lock:
             return self._fork_origin.get(key, key)
 
-    def _thread_log(self, thread_id: str) -> tuple[float, str, float] | None:
+    def _thread_log(self, thread_id: str) -> tuple[float, str, float, float] | None:
         """Return (newest_timestamp, last_turn_event) for a rollout log.
 
-        Result is ``(newest_timestamp, last_turn_event, event_timestamp)``. The
+        Result is ``(newest_timestamp, last_turn_event, event_timestamp,
+        log_write_time)``. The
         event is the last ``task_started`` / ``task_complete`` /
         ``turn_aborted`` line seen in the tail, or ``""`` when the tail is too
         short to contain one.
@@ -617,7 +625,7 @@ class CompanionService:
         return found
 
     def _find_rollout_log(self, thread_id: str) -> Path | None:
-        for offset in (0, 1):
+        for offset in range(ROLLOUT_SCAN_DAYS):
             day = datetime.now() - timedelta(days=offset)
             folder = self._sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
             try:
@@ -631,13 +639,18 @@ class CompanionService:
     @staticmethod
     def _read_log_tail(path: Path) -> tuple[float, str, float] | None:
         try:
-            size = path.stat().st_size
+            stat = path.stat()
+            size = stat.st_size
             with path.open("rb") as handle:
                 if size > LOG_TAIL_BYTES:
                     handle.seek(size - LOG_TAIL_BYTES)
                 blob = handle.read()
         except OSError:
             return None
+        # The log records its own timestamps, but a stale tail can carry
+        # fresh-looking stamps long after the writer stopped. The file's mtime
+        # is the ground truth for "is someone still appending right now".
+        written_at = float(stat.st_mtime)
         newest = 0.0
         kind = ""
         kind_stamp = 0.0
@@ -660,13 +673,13 @@ class CompanionService:
                 newest = stamp
         if with_timestamps == 0:
             return None
-        return newest, kind, kind_stamp
+        return newest, kind, kind_stamp, written_at
 
     def _log_status(self, thread_id: str) -> str:
         activity = self._thread_log(thread_id)
         if activity is None:
             return ""
-        newest, kind, kind_stamp = activity
+        newest, kind, kind_stamp, written_at = activity
         if newest <= 0:
             return ""
         now = time.time()
@@ -675,9 +688,11 @@ class CompanionService:
                 return "completed"
             if kind == "turn_aborted":
                 return "idle"
-        if now - newest <= LOG_ACTIVE_SECONDS:
-            # The desktop is still appending to this rollout without having
-            # closed the turn, so a turn is in flight.
+        # Only claim a turn is running when the rollout file itself is still
+        # being appended to. Log timestamps alone are unreliable: a stale tail
+        # can look seconds old while the writer stopped hours ago, which made
+        # idle desktop tasks flicker into "working" on the phone list.
+        if now - written_at <= LOG_ACTIVE_SECONDS and now - newest <= LOG_ACTIVE_SECONDS:
             return "working"
         return ""
 
@@ -1056,7 +1071,7 @@ class CompanionService:
                 if inferred:
                     summary["status"] = inferred
                     if inferred in {"completed", "failed"} and activity is not None:
-                        _newest, _kind, kind_stamp = activity
+                        _newest, _kind, kind_stamp, _written = activity
                         if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
                             summary["completed_at"] = int(kind_stamp)
             completed_at = int(summary.get("completed_at") or 0)
@@ -1097,6 +1112,31 @@ class CompanionService:
             "ephemeral": bool(row.get("ephemeral")),
             "error_message": _turn_error(latest_turn),
         }
+    @staticmethod
+    def _resolve_status(
+        thread_id: str,
+        summary: dict[str, Any],
+        task: dict[str, Any],
+        live_status: str,
+    ) -> str:
+        """Pick the one status both the list row and the chat header will use.
+
+        The two views used to be derived by different code paths, so a thread
+        could be listed as idle but open as "working". A live rollout write is
+        the strongest signal, then the turn snapshot, then the row summary.
+        """
+        if live_status:
+            return live_status
+        task_status = str(task.get("status") or "")
+        summary_status = str(summary.get("status") or "")
+        if task_status in ACTIVE_STATUSES:
+            return task_status
+        if summary_status in ACTIVE_STATUSES:
+            return summary_status
+        if task_status:
+            return task_status
+        return summary_status or "idle"
+
     def read_thread(
         self,
         thread_id: str,
@@ -1139,17 +1179,24 @@ class CompanionService:
             summary["title"] = original
         task = thread_snapshot(thread)
         task["thread_id"] = thread_id
-        if live_status:
-            summary["status"] = live_status
-            task["status"] = live_status
-        completed_at = int(summary.get("completed_at") or task.get("completed_at_epoch") or 0)
-        if (
-            summary.get("status") in {"completed", "failed"}
-            and completed_at > 0
-            and self._read_state.is_thread_read(thread_id, completed_at)
-        ):
-            summary["status"] = "idle"
-            task["status"] = "idle"
+        # The phone list renders thread.status while the chat header renders
+        # task.status. Resolve them once so the two can never disagree, which
+        # used to show a task as idle in the list but "working" after opening it.
+        resolved = self._resolve_status(
+            thread_id=thread_id,
+            summary=summary,
+            task=task,
+            live_status=live_status,
+        )
+        summary["status"] = resolved
+        task["status"] = resolved
+        if resolved in {"completed", "failed"}:
+            completed_at = int(summary.get("completed_at") or task.get("completed_at_epoch") or 0)
+            if completed_at <= 0:
+                completed_at = int(summary.get("updated_at") or 0)
+            if completed_at > 0 and self._read_state.is_thread_read(thread_id, completed_at):
+                summary["status"] = "idle"
+                task["status"] = "idle"
         return {
             "thread": summary,
             "task": task,
