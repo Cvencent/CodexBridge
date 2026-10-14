@@ -16,8 +16,8 @@ data class DiscoveryPayload(
     val service: String = "",
     val name: String = "",
     val version: String = "",
-    val port: Int = 8791,
-    val discovery_port: Int = 8766,
+    val port: Int = ApiClient.DEFAULT_PORT,
+    val discovery_port: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
     val requires_pairing: Boolean = true,
 )
 

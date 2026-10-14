@@ -18,6 +18,11 @@ import com.codexbridge.mobile.data.SettingsStore
 import com.codexbridge.mobile.data.StreamEvent
 import com.codexbridge.mobile.data.TaskSnapshot
 import com.codexbridge.mobile.data.ThreadSummary
+import com.codexbridge.mobile.data.ACTIVE_TASK_STATUSES
+import com.codexbridge.mobile.data.coherentTaskStatus
+import com.codexbridge.mobile.data.resolveThreadStatus
+import com.codexbridge.mobile.data.applyThreadStatusEvent
+import com.codexbridge.mobile.data.sortThreadsByActivity
 import com.codexbridge.mobile.data.withCompletionSeen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -78,6 +83,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var api: ApiClient? = null
     private var streamJob: Job? = null
     private var pollJob: Job? = null
+    private var threadsJob: Job? = null
 
     init {
         val base = settings.baseUrl
@@ -99,7 +105,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (paired) {
             api = ApiClient(base, settings.token)
+            CompletionNotificationService.start(appContext)
             refresh()
+            startThreadsRefresh()
         }
     }
 
@@ -119,28 +127,43 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun useDiscoveredBridge(bridge: DiscoveredBridge) {
+        val base = ApiClient.withPort(bridge.baseUrl, bridge.port)
+        _state.update { it.copy(baseUrl = base, error = null) }
+    }
+
     fun pair(baseUrl: String, code: String) {
         if (_state.value.busy) return
         _state.update { it.copy(busy = true, error = null, notice = null) }
         viewModelScope.launch {
             try {
-                val client = ApiClient(baseUrl)
-                val ping = client.ping()
+                val entered = ApiClient(baseUrl)
+                val ping = entered.ping()
+                val client = if (ping.port in 1..65535) {
+                    ApiClient(ApiClient.withPort(entered.base, ping.port))
+                } else {
+                    entered
+                }
                 val response = withContext(Dispatchers.IO) { client.pair(code.trim(), phoneName()) }
                 if (!response.ok || response.token.isBlank()) {
                     throw ApiException("配对失败，请重新生成配对码")
                 }
-                settings.baseUrl = client.base
+                val resolved = if (response.bridge.port in 1..65535) {
+                    ApiClient(ApiClient.withPort(client.base, response.bridge.port))
+                } else {
+                    client
+                }
+                settings.baseUrl = resolved.base
                 settings.token = response.token
                 settings.phoneId = response.phone_id
                 settings.bridgeName = response.bridge.name.ifBlank { ping.name }
                 settings.bridgeVersion = response.bridge.version.ifBlank { ping.version }
-                api = ApiClient(client.base, response.token)
+                api = ApiClient(resolved.base, response.token)
                 _state.update {
                     it.copy(
                         busy = false,
                         paired = true,
-                        baseUrl = client.base,
+                        baseUrl = resolved.base,
                         phoneId = response.phone_id,
                         bridgeName = response.bridge.name.ifBlank { ping.name },
                         bridgeVersion = response.bridge.version.ifBlank { ping.version },
@@ -151,6 +174,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 CompletionNotificationService.start(appContext)
                 refresh()
+                startThreadsRefresh()
             } catch (error: Exception) {
                 _state.update { it.copy(busy = false, error = friendly(error)) }
             }
@@ -165,6 +189,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun unpair() {
         CompletionNotificationService.stop(appContext)
+        threadsJob?.cancel()
+        threadsJob = null
         settings.clearPairing()
         closeThread()
         api = null
@@ -184,6 +210,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // -------------------------------------------------------------- refresh
     fun refresh() {
         val client = api ?: return
+        refreshThreadsNow()
         viewModelScope.launch {
             try {
                 val status = client.status()
@@ -191,9 +218,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(
                         connected = true,
                         account = status.account,
-                        task = status.task,
                         approvals = mergeApprovals(it.approvals, status.pending_approvals),
-                        working = status.task.isWorking,
+                        task = if (it.activeThread == null) status.task else it.task,
+                        working = if (it.activeThread == null) status.task.isWorking else it.working,
                     )
                 }
             } catch (error: Exception) {
@@ -203,9 +230,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val threads = client.threads(_state.value.search)
                 _state.update { state ->
                     state.copy(
-                        threads = threads.threads.map { thread ->
-                            thread.withCompletionSeen(settings.completionSeenAt(thread.thread_id))
-                        },
+                        threads = sortThreadsByActivity(
+                            threads.threads.map { thread ->
+                                thread.withCompletionSeen(settings.completionSeenAt(thread.thread_id))
+                            },
+                        ),
                         connected = true,
                     )
                 }
@@ -215,6 +244,36 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             loadProjects()
             loadModels()
         }
+    }
+
+    fun refreshThreadsNow() {
+        viewModelScope.launch { refreshThreads() }
+    }
+
+    private fun startThreadsRefresh() {
+        threadsJob?.cancel()
+        threadsJob = viewModelScope.launch {
+            refreshThreads()
+            while (true) {
+                delay(THREADS_REFRESH_MS)
+                if (_state.value.screen == AppScreen.Threads && api != null) refreshThreads()
+            }
+        }
+    }
+
+    private suspend fun refreshThreads() {
+        val client = api ?: return
+        runCatching { client.threads(_state.value.search) }
+            .onSuccess { response ->
+                _state.update { state ->
+                    val visible = sortThreadsByActivity(
+                        response.threads.map { thread ->
+                            thread.withCompletionSeen(settings.completionSeenAt(thread.thread_id))
+                        },
+                    )
+                    state.copy(threads = visible, connected = true)
+                }
+            }
     }
 
     private fun loadModels() {
@@ -258,7 +317,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val client = api ?: return
         viewModelScope.launch {
             runCatching { client.threads(_state.value.search) }
-                .onSuccess { response -> _state.update { it.copy(threads = response.threads) } }
+                .onSuccess { response ->
+                    _state.update {
+                        it.copy(
+                            threads = sortThreadsByActivity(
+                                response.threads.map { thread ->
+                                    thread.withCompletionSeen(settings.completionSeenAt(thread.thread_id))
+                                },
+                            ),
+                        )
+                    }
+                }
                 .onFailure { handleError(it) }
         }
     }
@@ -271,6 +340,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         val seenAt = settings.completionSeenAt(threadId)
         val visibleSummary = summary?.withCompletionSeen(seenAt) ?: ThreadSummary(thread_id = threadId)
+        val seededTask = _state.value.task.takeIf { it.thread_id == threadId }
+            ?: TaskSnapshot(
+                status = visibleSummary.status,
+                thread_id = threadId,
+                title = visibleSummary.title,
+            )
         _state.update { state ->
             state.copy(
                 screen = AppScreen.Chat,
@@ -282,7 +357,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 streaming = emptyMap(),
                 approvals = emptyList(),
                 busy = true,
-                working = false,
+                task = seededTask,
+                working = seededTask.isWorking || visibleSummary.status in ACTIVE_TASK_STATUSES,
             )
         }
         viewModelScope.launch {
@@ -293,12 +369,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     settings.markCompletionSeen(threadId, detail.thread.completed_at)
                     seen = settings.completionSeenAt(threadId)
                 }
-                val visibleThread = detail.thread.withCompletionSeen(seen)
-                val visibleTask = if (detail.task.status == "completed") {
-                    detail.task.copy(status = visibleThread.status)
-                } else {
-                    detail.task
-                }
+                val status = resolveThreadStatus(
+                    coherentTaskStatus(
+                        _state.value.activeThread?.status.orEmpty(),
+                        detail.task.status,
+                    ),
+                    detail.thread.completed_at,
+                    seen,
+                )
+                val visibleTask = detail.task.copy(status = status)
+                val visibleThread = detail.thread.withCompletionSeen(seen).copy(status = status)
                 _state.update { state ->
                     state.copy(
                         activeThread = visibleThread,
@@ -308,7 +388,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         messages = detail.messages,
                         task = visibleTask,
                         approvals = detail.pending_approvals,
-                        working = visibleTask.isWorking,
+                        working = status in ACTIVE_TASK_STATUSES,
                         messageCount = detail.message_count,
                         truncated = detail.truncated,
                         busy = false,
@@ -330,6 +410,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update {
             it.copy(screen = AppScreen.Threads, activeThread = null, messages = emptyList(), streaming = emptyMap())
         }
+        refreshThreadsNow()
     }
 
     private fun observeThread(threadId: String) {
@@ -348,14 +429,35 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         pollJob = viewModelScope.launch {
             while (true) {
                 delay(4000)
-                if (!_state.value.working) continue
                 runCatching { client.thread(threadId) }.onSuccess { detail ->
-                    _state.update {
-                        it.copy(
+                    _state.update { state ->
+                        if (
+                            state.screen == AppScreen.Chat &&
+                            state.activeThread?.thread_id == threadId &&
+                            detail.thread.status == "completed" &&
+                            detail.thread.completed_at > 0
+                        ) {
+                            settings.markCompletionSeen(threadId, detail.thread.completed_at)
+                        }
+                        val seen = settings.completionSeenAt(threadId)
+                        val status = resolveThreadStatus(
+                            coherentTaskStatus(
+                                state.activeThread?.status.orEmpty(),
+                                detail.task.status,
+                            ),
+                            detail.thread.completed_at,
+                            seen,
+                        )
+                        val visibleThread = detail.thread.withCompletionSeen(seen).copy(status = status)
+                        state.copy(
+                            activeThread = if (state.activeThread?.thread_id == threadId) visibleThread else state.activeThread,
+                            threads = state.threads.map { thread ->
+                                if (thread.thread_id == threadId) visibleThread else thread
+                            },
                             messages = detail.messages,
-                            task = detail.task,
+                            task = detail.task.copy(status = status),
                             approvals = detail.pending_approvals,
-                            working = detail.task.isWorking,
+                            working = status in ACTIVE_TASK_STATUSES,
                             messageCount = detail.message_count,
                         )
                     }
@@ -531,22 +633,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             "turn_completed" -> {
                 val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
                 val completionStatus = if (event.status == "failed") "failed" else "completed"
-                val completedAt = System.currentTimeMillis() / 1000
+                val completedAt = event.completed_at.takeIf { it > 0 } ?: System.currentTimeMillis() / 1000
                 val viewing = _state.value.screen == AppScreen.Chat && _state.value.activeThread?.thread_id == threadId
                 if (completionStatus == "completed" && viewing && threadId.isNotBlank()) {
                     settings.markCompletionSeen(threadId, completedAt)
                 }
-                val visibleStatus = if (completionStatus == "completed" && viewing) "idle" else completionStatus
+                val seenAt = settings.completionSeenAt(threadId)
+                val visibleStatus = resolveThreadStatus(completionStatus, completedAt, seenAt)
                 _state.update { state ->
                     state.copy(
-                        working = false,
-                        threads = state.threads.map { thread ->
-                            if (thread.thread_id == threadId) {
-                                thread.copy(status = visibleStatus, completed_at = completedAt)
-                            } else {
-                                thread
-                            }
+                        working = if (state.activeThread?.thread_id == threadId) {
+                            visibleStatus in ACTIVE_TASK_STATUSES
+                        } else {
+                            state.working
                         },
+                        threads = sortThreadsByActivity(
+                            state.threads.map { thread ->
+                                if (thread.thread_id == threadId) {
+                                    thread.copy(status = visibleStatus, completed_at = completedAt)
+                                } else {
+                                    thread
+                                }
+                            },
+                        ),
                         activeThread = state.activeThread?.let { thread ->
                             if (thread.thread_id == threadId) {
                                 thread.copy(status = visibleStatus, completed_at = completedAt)
@@ -570,12 +679,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                     settings.markCompletionSeen(threadId, detail.thread.completed_at)
                                     seen = settings.completionSeenAt(threadId)
                                 }
-                                val visibleThread = detail.thread.withCompletionSeen(seen)
-                                val visibleTask = if (detail.task.status == "completed") {
-                                    detail.task.copy(status = visibleThread.status)
-                                } else {
-                                    detail.task
-                                }
+                                val status = resolveThreadStatus(
+                                    coherentTaskStatus(
+                                        _state.value.activeThread?.status.orEmpty(),
+                                        detail.task.status,
+                                    ),
+                                    detail.thread.completed_at,
+                                    seen,
+                                )
+                                val visibleThread = detail.thread.withCompletionSeen(seen).copy(status = status)
+                                val visibleTask = detail.task.copy(status = status)
                                 _state.update { state ->
                                     state.copy(
                                         activeThread = if (state.activeThread?.thread_id == threadId) visibleThread else state.activeThread,
@@ -585,7 +698,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                         messages = detail.messages,
                                         task = visibleTask,
                                         approvals = detail.pending_approvals,
-                                        working = visibleTask.isWorking,
+                                        working = status in ACTIVE_TASK_STATUSES,
                                         messageCount = detail.message_count,
                                     )
                                 }
@@ -598,15 +711,27 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             "turn_interrupted" -> _state.update { it.copy(working = false) }
             "turn_steered" -> Unit
             "thread_status" -> {
-                val flags = event.active_flags
-                val status = event.status.lowercase()
+                val threadId = event.thread_id
                 _state.update { state ->
-                    val working = when {
-                        status == "active" || flags.isNotEmpty() -> true
-                        status in setOf("idle", "notloaded", "completed", "failed") -> false
-                        else -> state.working
+                    val activeMatches = threadId.isBlank() || state.activeThread?.thread_id == threadId
+                    val current = when {
+                        state.activeThread?.thread_id == threadId -> state.activeThread.status
+                        state.task.thread_id == threadId -> state.task.status
+                        else -> state.threads.firstOrNull { it.thread_id == threadId }?.status.orEmpty()
                     }
-                    state.copy(working = working)
+                    val status = applyThreadStatusEvent(current, event.status, event.active_flags)
+                    state.copy(
+                        activeThread = state.activeThread?.let { thread ->
+                            if (thread.thread_id == threadId || threadId.isBlank()) thread.copy(status = status) else thread
+                        },
+                        threads = sortThreadsByActivity(
+                            state.threads.map { thread ->
+                                if (thread.thread_id == threadId || threadId.isBlank()) thread.copy(status = status) else thread
+                            },
+                        ),
+                        task = if (activeMatches) state.task.copy(status = status) else state.task,
+                        working = if (activeMatches) status in ACTIVE_TASK_STATUSES else state.working,
+                    )
                 }
             }
             "token_usage" -> _state.update {
@@ -675,5 +800,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private fun friendly(error: Throwable): String = when (error) {
         is ApiException -> error.message ?: "请求失败"
         else -> error.message ?: "网络不可用，请检查手机与电脑是否在同一 Wi-Fi"
+    }
+
+    companion object {
+        private const val THREADS_REFRESH_MS = 4000L
     }
 }

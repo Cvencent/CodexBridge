@@ -48,6 +48,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.codexbridge.mobile.UiState
 import com.codexbridge.mobile.data.ThreadSummary
+import com.codexbridge.mobile.data.sortThreadsByActivity
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -128,7 +129,7 @@ fun ThreadsScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(state.threads, key = { it.thread_id }) { thread ->
+                items(sortThreadsByActivity(state.threads), key = { it.thread_id }) { thread ->
                     ThreadCard(thread = thread, onClick = { onOpenThread(thread.thread_id) })
                 }
                 if (state.threads.isEmpty()) {

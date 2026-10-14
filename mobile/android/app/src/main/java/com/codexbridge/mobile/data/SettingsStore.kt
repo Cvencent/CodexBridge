@@ -57,8 +57,9 @@ class SettingsStore(context: Context) {
         prefs.edit().putLong(key, completedAt).apply()
     }
 
-    fun markNotificationSent(threadId: String, turnId: String): Boolean {
-        val key = "notified_" + completionNotificationKey(threadId, turnId)
+    fun markNotificationSent(threadId: String, notificationKey: String): Boolean {
+        if (threadId.isBlank() || notificationKey.isBlank()) return false
+        val key = "notified_$notificationKey"
         if (prefs.getBoolean(key, false)) return false
         prefs.edit().putBoolean(key, true).apply()
         return true

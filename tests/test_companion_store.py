@@ -107,7 +107,7 @@ class CompanionStoreTests(unittest.TestCase):
 
     def test_default_port_is_not_the_reserved_legacy_port(self) -> None:
         self.assertEqual(LEGACY_PORT, 8790)
-        self.assertEqual(DEFAULT_PORT, 8791)
+        self.assertEqual(DEFAULT_PORT, 8568)
 
     def test_legacy_port_is_migrated_and_persisted(self) -> None:
         payload = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {"version": 1}

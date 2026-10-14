@@ -651,6 +651,7 @@ class CompanionService:
                 "turn_id": str(turn.get("id") or ""),
                 "status": "completed" if status == "completed" else "failed",
                 "duration_ms": turn.get("durationMs"),
+                "completed_at": _epoch(turn.get("completedAt") or turn.get("completedAtMs")),
             }
         if method == "thread/status/changed":
             status = params.get("status") if isinstance(params.get("status"), dict) else {}
@@ -806,6 +807,9 @@ class CompanionService:
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             raise ValueError("thread")
+        live_status = self._log_status(thread_id)
+        if live_status:
+            thread = {**thread, "__codexbridge_live_status": live_status}
         turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
         turns.sort(key=lambda turn: _epoch(
             turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
@@ -824,9 +828,14 @@ class CompanionService:
                 messages.append(mapped)
         total = len(messages)
         trimmed = messages[-max(1, int(message_limit)):]
+        summary = self._summary(thread)
+        task = thread_snapshot(thread)
+        if live_status:
+            summary["status"] = live_status
+            task["status"] = live_status
         return {
-            "thread": self._summary(thread),
-            "task": thread_snapshot(thread),
+            "thread": summary,
+            "task": task,
             "messages": trimmed,
             "message_count": total,
             "truncated": total > len(trimmed),

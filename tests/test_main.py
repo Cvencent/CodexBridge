@@ -151,7 +151,7 @@ class CompanionActionTest(unittest.TestCase):
         companion = Companion()
         discovery = Discovery()
         store = Store()
-        status = {"port": 8791, "discovery_port": 18791, "ports": []}
+        status = {"port": 8568, "discovery_port": 18791, "ports": []}
 
         result = _apply_companion_action(
             {"action": "set_port", "kind": "discovery", "port": 18791},

@@ -180,6 +180,18 @@ class CompanionServiceTests(unittest.TestCase):
         statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
         self.assertEqual(statuses["t2"], "completed")
 
+    def test_read_thread_uses_live_rollout_status_for_desktop_turn(self) -> None:
+        detail = thread_detail("t2")
+        detail["thread"]["status"] = {"type": "notLoaded"}
+        detail["thread"]["turns"][-1]["status"] = "interrupted"
+        self.client.responses["thread/read"] = detail
+        self._write_rollout("t2", "task_started", seconds_ago=1)
+
+        result = self.service.read_thread("t2")
+
+        self.assertEqual(result["thread"]["status"], "working")
+        self.assertEqual(result["task"]["status"], "working")
+
     def test_list_threads_ignores_stale_rollout(self) -> None:
         self._write_rollout("t2", "task_started", seconds_ago=600)
         result = self.service.list_threads(limit=10)
@@ -233,6 +245,26 @@ class CompanionServiceTests(unittest.TestCase):
         result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
         self.assertEqual(result["status"], "working")
         self.assertEqual(calls, {"start": 1, "steer": 1})
+
+    def test_turn_completed_event_uses_desktop_completion_timestamp(self) -> None:
+        event = self.service._event_payload(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "t1",
+                    "turn": {
+                        "id": "turn-2",
+                        "status": "completed",
+                        "completedAt": 1791000100,
+                        "durationMs": 1200,
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["completed_at"], 1791000100)
 
     def test_steer_turn_falls_back_to_start_when_no_active_writer(self) -> None:
         calls = {"start": 0, "steer": 0}

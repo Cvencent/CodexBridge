@@ -14,6 +14,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from codexbridge import VERSION
+
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
 TRANSIENT_REFRESH_FAILURE_LIMIT = 6
 
@@ -201,7 +203,7 @@ class AppServerClient:
             "clientInfo": {
                 "name": "codex_bridge",
                 "title": "CodexBridge",
-                "version": "1.3.4",
+                "version": VERSION,
             }
         })
         self.notify("initialized", {})

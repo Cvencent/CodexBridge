@@ -255,6 +255,7 @@ data class StreamEvent(
     val item_id: String = "",
     val delta: String = "",
     val status: String = "",
+    val completed_at: Long = 0,
     val title: String = "",
     val message: String = "",
     val decision: String = "",

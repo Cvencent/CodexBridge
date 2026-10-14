@@ -207,9 +207,11 @@ class ApiClient(
     }
 
     companion object {
-        const val DEFAULT_PORT = 8791
-        const val DEFAULT_DISCOVERY_PORT = 8766
+        const val DEFAULT_PORT = 8568
+        const val DEFAULT_DISCOVERY_PORT = 8569
         private const val LEGACY_DEFAULT_PORT = 8790
+        private const val LEGACY_COMPANION_PORT = 8791
+        private const val LEGACY_DISCOVERY_PORT = 8766
 
         fun migrateStoredBase(value: String): String {
             val text = value.trim()
@@ -230,13 +232,32 @@ class ApiClient(
             val tail = rest.substring(hostPart.length)
             if (hostPart.isNotBlank() && !hostPart.contains(':')) {
                 text = text.substring(0, schemeEnd) + hostPart + ":$DEFAULT_PORT" + tail
-            } else if (hostPart.endsWith(":$LEGACY_DEFAULT_PORT")) {
+            } else if (
+                hostPart.endsWith(":$LEGACY_DEFAULT_PORT") ||
+                hostPart.endsWith(":$LEGACY_COMPANION_PORT") ||
+                hostPart.endsWith(":$LEGACY_DISCOVERY_PORT")
+            ) {
                 text = text.substring(0, schemeEnd) +
-                    hostPart.removeSuffix(":$LEGACY_DEFAULT_PORT") +
+                    hostPart.substringBeforeLast(':') +
                     ":$DEFAULT_PORT" +
                     tail
             }
             return text.trimEnd('/')
+        }
+
+        fun withPort(value: String, port: Int): String {
+            if (port !in 1..65535) throw ApiException("端口无效")
+            var text = value.trim()
+            if (text.isEmpty()) throw ApiException("请填写电脑地址")
+            if (!text.startsWith("http://") && !text.startsWith("https://")) {
+                text = "http://$text"
+            }
+            val schemeEnd = text.indexOf("://") + 3
+            val rest = text.substring(schemeEnd)
+            val hostPart = rest.substringBefore('/')
+            val tail = rest.substring(hostPart.length)
+            val host = hostPart.substringBeforeLast(':', hostPart)
+            return (text.substring(0, schemeEnd) + host + ":$port" + tail).trimEnd('/')
         }
     }
 }

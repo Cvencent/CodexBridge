@@ -48,6 +48,11 @@ class MainActivity : ComponentActivity() {
         openThreadFromIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (viewModel.state.value.paired) viewModel.refreshThreadsNow()
+    }
+
     private fun openThreadFromIntent(intent: android.content.Intent?) {
         val threadId = intent?.getStringExtra(CompletionNotificationService.EXTRA_THREAD_ID).orEmpty()
         if (threadId.isNotBlank()) viewModel.openThread(threadId)
