@@ -32,7 +32,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 UsePreviousAppDir=yes
 UsePreviousGroup=yes
 UsePreviousTasks=yes
-CloseApplications=yes
+CloseApplications=no
 CloseApplicationsFilter=*.exe
 RestartApplications=no
 UninstallDisplayName=CodexBridge
@@ -54,3 +54,14 @@ Name: "{autodesktop}\CodexBridge"; Filename: "{app}\CodexBridge.exe"; Tasks: des
 
 [Run]
 Filename: "{app}\CodexBridge.exe"; Description: "启动 CodexBridge"; Flags: nowait postinstall skipifsilent
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  { The tray app does not always answer Restart Manager close requests. }
+  { Force-stop the previous build before Setup replaces its executable. }
+  Exec('taskkill.exe', '/F /T /IM CodexBridge.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(700);
+  Result := '';
+end;
