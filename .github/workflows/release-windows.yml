@@ -48,5 +48,9 @@ jobs:
             gh release create "v$version" --title "CodexBridge v$version" --notes-file $notes
           }
           gh release upload "v$version" release/* --clobber
-          Write-Host "Uploaded CodexBridge-Setup-$version-win64.exe and portable package"
+          $mobileApk = Join-Path $PWD "mobile/release/CodexBridgeMobile-0.1.0-release.apk"
+          if (Test-Path -LiteralPath $mobileApk) {
+            gh release upload "v$version" $mobileApk --clobber
+          }
+          Write-Host "Uploaded CodexBridge-Setup-$version-win64.exe, portable package and the mobile APK"
           gh release edit "v$version" --title "CodexBridge v$version" --notes-file $notes
