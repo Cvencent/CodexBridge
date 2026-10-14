@@ -74,6 +74,7 @@ data class ThreadSummary(
     val status: String = "idle",
     val model: String = "",
     val cwd: String = "",
+    val workspace: String = "",
     val source: String = "",
     val created_at: Long = 0,
     val updated_at: Long = 0,

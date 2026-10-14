@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
+import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,6 +27,13 @@ MAX_MESSAGE_ITEMS = 400
 MAX_TURNS_IN_DETAIL = 60
 MAX_EVENT_QUEUE = 300
 ACCOUNT_CACHE_SECONDS = 45.0
+# Desktop turns are not visible to this app-server process, so the phone list
+# infers "working" from the rollout log the desktop itself is appending to.
+LOG_TAIL_BYTES = 131072
+LOG_ACTIVE_SECONDS = 150.0
+LOG_SETTLED_SECONDS = 1800.0
+LOG_CACHE_SECONDS = 8.0
+LOG_SCAN_LIMIT = 24
 
 APPROVAL_KINDS: dict[str, str] = {
     "item/commandExecution/requestApproval": "command",
@@ -110,6 +119,49 @@ def _status_from_thread(thread: dict[str, Any]) -> str:
     return "idle" if not turns else "completed"
 
 
+_TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def _parse_stamp(text: str) -> float | None:
+    try:
+        return datetime.fromisoformat(str(text or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _line_stamp(line: str) -> float | None:
+    """Read the record ``timestamp`` without parsing the whole payload."""
+    match = _TIMESTAMP_RE.search(line)
+    if match is None:
+        return None
+    return _parse_stamp(match.group(1))
+
+
+def _log_activity(line: str) -> tuple[float, str] | None:
+    if '"event_msg"' not in line:
+        return None
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    kind = str(payload.get("type") or "")
+    if kind not in {"task_started", "task_complete", "turn_aborted"}:
+        return None
+    stamp = _parse_stamp(str(record.get("timestamp") or ""))
+    if stamp is None:
+        return None
+    return stamp, kind
+
+
+def _workspace_name(cwd: str) -> str:
+    text = str(cwd or "").rstrip("\\/")
+    if not text:
+        return ""
+    name = os.path.basename(text)
+    return name or text
+
+
 def _thread_title(thread: dict[str, Any]) -> str:
     for key in ("name", "preview"):
         value = thread.get(key)
@@ -149,6 +201,7 @@ class CompanionService:
         codex_command: str | None = None,
         client_factory: Callable[[list[str], Path], Any] | None = None,
         desktop_state_path: Path | None = None,
+        sessions_root: Path | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
@@ -172,6 +225,13 @@ class CompanionService:
         self._log: list[str] = []
         self._resumed_threads: set[str] = set()
         self._resumed_lock = threading.Lock()
+        self._sessions_root = (
+            Path(sessions_root)
+            if sessions_root is not None
+            else Path.home() / ".codex" / "sessions"
+        )
+        self._log_cache: dict[str, tuple[float, tuple[float, str, float] | None]] = {}
+        self._log_cache_lock = threading.Lock()
 
     def start(self) -> None:
         self._stop.clear()
@@ -269,6 +329,95 @@ class CompanionService:
                     raise
         if error is not None:
             raise error
+
+    def _thread_log(self, thread_id: str) -> tuple[float, str, float] | None:
+        """Return (newest_timestamp, last_turn_event) for a rollout log.
+
+        Result is ``(newest_timestamp, last_turn_event, event_timestamp)``. The
+        event is the last ``task_started`` / ``task_complete`` /
+        ``turn_aborted`` line seen in the tail, or ``""`` when the tail is too
+        short to contain one.
+        """
+        key = str(thread_id or "")
+        if not key:
+            return None
+        now = time.monotonic()
+        with self._log_cache_lock:
+            cached = self._log_cache.get(key)
+        if cached is not None and now - cached[0] <= LOG_CACHE_SECONDS:
+            return cached[1]
+        path = self._find_rollout_log(key)
+        found = self._read_log_tail(path) if path is not None else None
+        with self._log_cache_lock:
+            if len(self._log_cache) > 512:
+                self._log_cache.clear()
+            self._log_cache[key] = (now, found)
+        return found
+
+    def _find_rollout_log(self, thread_id: str) -> Path | None:
+        for offset in (0, 1):
+            day = datetime.now() - timedelta(days=offset)
+            folder = self._sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
+            try:
+                entries = list(folder.glob(f"*{thread_id}.jsonl"))
+            except OSError:
+                continue
+            if entries:
+                return max(entries, key=lambda item: item.stat().st_mtime)
+        return None
+
+    @staticmethod
+    def _read_log_tail(path: Path) -> tuple[float, str, float] | None:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > LOG_TAIL_BYTES:
+                    handle.seek(size - LOG_TAIL_BYTES)
+                blob = handle.read()
+        except OSError:
+            return None
+        newest = 0.0
+        kind = ""
+        kind_stamp = 0.0
+        with_timestamps = 0
+        for raw in blob.splitlines():
+            line = raw.decode("utf-8", "replace")
+            if '"timestamp"' not in line:
+                continue
+            activity = _log_activity(line)
+            if activity is not None:
+                stamp, activity_kind = activity
+                kind = activity_kind
+                kind_stamp = stamp
+            else:
+                stamp = _line_stamp(line)
+            if stamp is None:
+                continue
+            with_timestamps += 1
+            if stamp > newest:
+                newest = stamp
+        if with_timestamps == 0:
+            return None
+        return newest, kind, kind_stamp
+
+    def _log_status(self, thread_id: str) -> str:
+        activity = self._thread_log(thread_id)
+        if activity is None:
+            return ""
+        newest, kind, kind_stamp = activity
+        if newest <= 0:
+            return ""
+        now = time.time()
+        if now - kind_stamp <= LOG_SETTLED_SECONDS:
+            if kind == "task_complete":
+                return "completed"
+            if kind == "turn_aborted":
+                return "idle"
+        if now - newest <= LOG_ACTIVE_SECONDS:
+            # The desktop is still appending to this rollout without having
+            # closed the turn, so a turn is in flight.
+            return "working"
+        return ""
 
     def _read(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None
@@ -598,6 +747,19 @@ class CompanionService:
             if not _is_display_thread(row):
                 continue
             threads.append(self._summary(row))
+        for index, summary in enumerate(threads):
+            if index >= LOG_SCAN_LIMIT:
+                break
+            if str(summary.get("status") or "") not in ACTIVE_STATUSES:
+                inferred = self._log_status(str(summary.get("thread_id") or ""))
+                if inferred:
+                    summary["status"] = inferred
+        threads.sort(
+            key=lambda item: (
+                0 if str(item.get("status") or "") in ACTIVE_STATUSES else 1,
+                -float(item.get("recency_at") or item.get("updated_at") or 0),
+            )
+        )
         return {"threads": threads, "next_cursor": next_cursor}
 
     @staticmethod
@@ -612,6 +774,7 @@ class CompanionService:
             "status": _status_from_thread({**row, "turns": turns}),
             "model": str(row.get("model") or ""),
             "cwd": str(row.get("cwd") or ""),
+            "workspace": _workspace_name(str(row.get("cwd") or "")),
             "source": str(row.get("source") or ""),
             "created_at": _epoch(row.get("createdAt")),
             "updated_at": _epoch(row.get("updatedAt") or row.get("recencyAt")),

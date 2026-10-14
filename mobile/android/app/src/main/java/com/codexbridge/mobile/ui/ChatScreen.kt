@@ -2,6 +2,8 @@ package com.codexbridge.mobile.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,11 +41,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,14 +78,48 @@ fun ChatScreen(
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
-
-    LaunchedEffect(state.messages.size, state.streaming.size, state.working, state.approvals.size) {
-        val target = state.messages.size + state.approvals.size
-        if (target > 0) {
-            listState.animateScrollToItem(target - 1)
+    val scope = rememberCoroutineScope()
+    val threadKey = state.activeThread?.thread_id.orEmpty()
+    val itemCount = state.messages.size + state.approvals.size
+    var lastBottomId by remember(threadKey) { mutableStateOf("") }
+    var userScrolledUp by remember(threadKey) { mutableStateOf(false) }
+    val pinnedToBottom by remember {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val last = layout.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= layout.totalItemsCount - 1 ||
+                listState.canScrollForward.not()
+        }
+    }
+    val showJumpToBottom by remember {
+        derivedStateOf {
+            listState.canScrollBackward && (!pinnedToBottom || userScrolledUp)
         }
     }
 
+    // Opening a thread jumps straight to the newest message.
+    LaunchedEffect(threadKey) {
+        if (threadKey.isNotBlank()) {
+            listState.scrollToItem(0)
+            if (itemCount > 0) listState.scrollToItem(itemCount - 1)
+        }
+    }
+    // A newly loaded message scrolls to the bottom instantly; deltas only
+    // follow while the user is already reading the bottom of the list.
+    LaunchedEffect(threadKey, itemCount) {
+        val lastId = state.messages.lastOrNull()?.id
+            ?: state.approvals.lastOrNull()?.let { "approval-" + it.request_id }
+            ?: ""
+        if (lastId.isNotBlank() && lastId != lastBottomId) {
+            lastBottomId = lastId
+            listState.scrollToItem(itemCount - 1)
+        }
+    }
+    LaunchedEffect(threadKey, state.streaming.size, state.working, state.task.current_action) {
+        if (itemCount > 0 && pinnedToBottom) {
+            listState.scrollToItem(itemCount - 1)
+        }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -135,17 +175,40 @@ fun ChatScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.messages, key = { it.id.ifBlank { it.hashCode().toString() } }) { item ->
-                    MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(state.messages, key = { it.id.ifBlank { it.hashCode().toString() } }) { item ->
+                        MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
+                    }
+                    items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
+                        ApprovalCard(approval = approval, onDecision = onResolveApproval)
+                    }
                 }
-                items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
-                    ApprovalCard(approval = approval, onDecision = onResolveApproval)
+                if (showJumpToBottom) {
+                    Surface(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 10.dp)
+                            .clickable {
+                                val target = state.messages.size + state.approvals.size
+                                if (target > 0) scope.launch { listState.scrollToItem(target - 1) }
+                            },
+                        shape = RoundedCornerShape(999.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        tonalElevation = 4.dp,
+                    ) {
+                        Text(
+                            text = "回到底部",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
                 }
             }
             if (state.working) {

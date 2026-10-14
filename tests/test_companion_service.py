@@ -7,6 +7,7 @@ import queue
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codexbridge.codex.app_server import AppServerError
@@ -134,11 +135,56 @@ class CompanionServiceTests(unittest.TestCase):
             cwd=Path(self.temp.name),
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
         )
 
     def tearDown(self) -> None:
         self.service.stop()
         self.temp.cleanup()
+
+    def _write_rollout(self, thread_id: str, kind: str, seconds_ago: float = 0.0) -> None:
+        day = datetime.now()
+        folder = (
+            Path(self.temp.name)
+            / "sessions"
+            / f"{day.year:04d}"
+            / f"{day.month:02d}"
+            / f"{day.day:02d}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        record = {
+            "timestamp": stamp.isoformat().replace("+00:00", "Z"),
+            "type": "event_msg",
+            "payload": {"type": kind},
+        }
+        path = folder / f"rollout-{thread_id}.jsonl"
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    def test_list_threads_reports_workspace_name(self) -> None:
+        result = self.service.list_threads(limit=10)
+        self.assertEqual(result["threads"][0]["workspace"], "work")
+        self.assertEqual(result["threads"][0]["cwd"], r"D:\work")
+
+    def test_list_threads_marks_active_rollout_first(self) -> None:
+        # t2 is older by recency, but the desktop is still writing its rollout.
+        self._write_rollout("t2", "task_started")
+        result = self.service.list_threads(limit=10)
+        self.assertEqual(result["threads"][0]["thread_id"], "t2")
+        self.assertEqual(result["threads"][0]["status"], "working")
+        self.assertEqual(result["threads"][1]["status"], "idle")
+
+    def test_list_threads_marks_finished_rollout_completed(self) -> None:
+        self._write_rollout("t2", "task_complete", seconds_ago=30)
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "completed")
+
+    def test_list_threads_ignores_stale_rollout(self) -> None:
+        self._write_rollout("t2", "task_started", seconds_ago=600)
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "idle")
 
     def test_list_threads_maps_rows(self) -> None:
         result = self.service.list_threads(limit=10)
@@ -210,6 +256,7 @@ class CompanionServiceTests(unittest.TestCase):
             cwd=Path(self.temp.name),
             client_factory=factory,
             desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
         )
         try:
             service.start_turn("t1", "第一次")

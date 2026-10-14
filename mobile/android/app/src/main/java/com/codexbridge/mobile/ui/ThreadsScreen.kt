@@ -157,6 +157,21 @@ fun ThreadsScreen(
     }
 }
 
+private fun isActiveStatus(status: String): Boolean =
+    status == "working" || status == "waiting_user"
+
+private fun threadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
+    threads.sortedWith(
+        compareBy<ThreadSummary> { if (isActiveStatus(it.status)) 0 else 1 }
+            .thenByDescending { maxOf(it.recency_at, it.updated_at) },
+    )
+
+private fun workspaceLabel(thread: ThreadSummary): String {
+    if (thread.workspace.isNotBlank()) return thread.workspace
+    val parts = thread.cwd.trimEnd('\\', '/').split('\\', '/').filter { it.isNotBlank() }
+    return parts.lastOrNull() ?: "默认目录"
+}
+
 @Composable
 private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
     Card(
@@ -183,6 +198,18 @@ private fun ThreadCard(thread: ThreadSummary, onClick: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("工作空间", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = workspaceLabel(thread),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
