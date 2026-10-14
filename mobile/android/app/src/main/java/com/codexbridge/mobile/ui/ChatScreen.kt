@@ -175,12 +175,6 @@ fun ChatScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
-            if (state.continuedAs.isNotBlank()) {
-                ChatBanner(
-                    text = "该任务正在电脑端使用，手机回复会写入同历史的副本会话（电脑端显示为「手机继续」）。",
-                    accent = MaterialTheme.colorScheme.tertiary,
-                )
-            }
             if (state.task.status == "failed" && state.task.errorMessage.isNotBlank()) {
                 ChatBanner(
                     text = "上一轮失败：" + state.task.errorMessage,

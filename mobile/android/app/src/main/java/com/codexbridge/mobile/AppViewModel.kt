@@ -62,7 +62,6 @@ data class UiState(
     val activeThread: ThreadSummary? = null,
     // Non-empty when replies to this task continue in a hidden copy because the
     // desktop currently holds the original thread.
-    val continuedAs: String = "",
     val messages: List<MessageItem> = emptyList(),
     val streaming: Map<String, String> = emptyMap(),
     val approvals: List<ApprovalRequest> = emptyList(),
@@ -396,7 +395,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         messages = detail.messages,
                         task = visibleTask,
-                        continuedAs = detail.continued_as,
                         approvals = detail.pending_approvals,
                         working = status in ACTIVE_TASK_STATUSES,
                         messageCount = detail.message_count,
@@ -421,7 +419,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 screen = AppScreen.Threads,
                 activeThread = null,
-                continuedAs = "",
                 messages = emptyList(),
                 streaming = emptyMap(),
             )
@@ -459,7 +456,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             },
                             messages = detail.messages,
                             task = detail.task.copy(status = status),
-                            continuedAs = detail.continued_as,
                             approvals = detail.pending_approvals,
                             working = status in ACTIVE_TASK_STATUSES,
                             messageCount = detail.message_count,
@@ -497,11 +493,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     effort = _state.value.selectedEffort,
                     steer = false,
                 )
-                if (response.continued_as.isNotBlank() && response.continued_as != threadId) {
-                    // The desktop was using the original thread, so this reply
-                    // continued in a forked copy that shares its history.
-                    _state.update { it.copy(continuedAs = response.continued_as) }
-                }
             } catch (error: Exception) {
                 _state.update { it.copy(messages = it.messages.filterNot { item -> item.id == local.id }) }
                 handleError(error)
@@ -639,18 +630,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             "turn_started" -> _state.update { it.copy(working = true) }
-            "thread_forked" -> {
-                val threadId = event.thread_id
-                _state.update { state ->
-                    state.copy(
-                        continuedAs = if (threadId.isBlank() || state.activeThread?.thread_id == threadId) {
-                            event.continued_as
-                        } else {
-                            state.continuedAs
-                        },
-                    )
-                }
-            }
             "turn_completed" -> {
                 val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
                 val completionStatus = if (event.status == "failed") "failed" else "completed"
@@ -708,7 +687,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                         },
                                         messages = detail.messages,
                                         task = visibleTask,
-                                        continuedAs = detail.continued_as,
                                         approvals = detail.pending_approvals,
                                         working = status in ACTIVE_TASK_STATUSES,
                                         messageCount = detail.message_count,

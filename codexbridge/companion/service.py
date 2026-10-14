@@ -61,6 +61,32 @@ def _is_active_writer_error(error: BaseException) -> bool:
     )
 
 
+def writer_lock_path(thread_id: str) -> Path:
+    return Path.home() / ".codex" / "thread-writer-locks" / f"{thread_id}.lock"
+
+
+def _clear_writer_lock(thread_id: str) -> bool:
+    """Remove a stale Codex thread writer lock when Windows allows it.
+
+    The desktop app-server can keep its lock file after a turn finishes. The
+    lock is advisory and owned by an independent process, but Windows POSIX
+    semantics let us delete it by rename; once removed a new app-server can
+    resume and write the same stored thread. Failure is safe: callers fall back
+    to the previous locked-thread behavior.
+    """
+    if not thread_id or Path(thread_id).name != thread_id:
+        return False
+    path = writer_lock_path(thread_id)
+    try:
+        if not path.is_file():
+            return False
+        path.replace(path.with_name(path.name + ".removed"))
+        path.with_name(path.name + ".removed").unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def _as_number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -347,15 +373,24 @@ class CompanionService:
             return
         client = self._ensure_client()
         error: AppServerError | None = None
+        lock_cleared = False
         for attempt in range(2):
             try:
                 client.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+                with self._resumed_lock:
+                    self._locked_threads.discard(thread_id)
                 self._thread_note(thread_id)
                 return
             except AppServerError as exc:
                 error = exc
                 message = str(exc)
                 if _is_active_writer_error(exc):
+                    # The desktop keeps a stale writer lock after it finishes a
+                    # turn. Remove it so the phone continues the original
+                    # conversation instead of silently forking it.
+                    if not lock_cleared and _clear_writer_lock(thread_id):
+                        lock_cleared = True
+                        continue
                     with self._resumed_lock:
                         self._locked_threads.add(thread_id)
                     self._thread_note(thread_id)
@@ -867,6 +902,11 @@ class CompanionService:
                 "duration_ms": turn.get("durationMs"),
                 "completed_at": completed_at,
                 "error_message": _turn_error(turn),
+                # App-server notifications only reach the bridge that owns a
+                # turn. This marker tells every connected client to append the
+                # completed turn from disk so desktop-created work is visible
+                # even when this process never called turn/start.
+                "append_only": True,
                 "read": bool(
                     thread_id
                     and completed_at > 0

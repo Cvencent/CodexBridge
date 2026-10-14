@@ -7,6 +7,7 @@ import queue
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -249,6 +250,101 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(method, "turn/start")
         self.assertEqual(params["input"][0]["text"], "继续修复")
         self.assertEqual(params["model"], "gpt-5.1-codex")
+
+    def test_start_turn_falls_back_to_fork_when_lock_cannot_be_cleared(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
+
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(params):
+            calls["fork"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
+            calls["start"] += 1
+            self.assertEqual(params["threadId"], "t1-fork")
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["turn/start"] = start
+
+        with mock.patch(
+            "codexbridge.companion.service._clear_writer_lock", return_value=False
+        ):
+            result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(result["continued_as"], "t1-fork")
+        self.assertEqual(calls, {"resume": 1, "fork": 1, "start": 1})
+
+    def test_active_writer_lock_is_cleared_before_forking(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
+        original_resume = {"thread": thread_row()}
+
+        def resume(_params):
+            calls["resume"] += 1
+            if calls["resume"] == 1:
+                raise AppServerError("thread t1 already has an active writer")
+            return original_resume
+
+        def fork(_params):
+            calls["fork"] += 1
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
+            calls["start"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["turn/start"] = start
+
+        with mock.patch(
+            "codexbridge.companion.service._clear_writer_lock", return_value=True
+        ) as clear:
+            result = self.service.start_turn("t1", "继续同一个任务")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(result["continued_as"], "")
+        self.assertEqual(calls, {"resume": 2, "fork": 0, "start": 1})
+        clear.assert_called_once_with("t1")
+
+    def test_stale_writer_lock_file_is_removed_from_disk(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {"USERPROFILE": self.temp.name, "HOME": self.temp.name},
+        ):
+            lock_dir = Path(self.temp.name) / ".codex" / "thread-writer-locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = lock_dir / "t1.lock"
+            lock.write_bytes(b"locked")
+            self.client.responses["thread/resume"] = lambda _params: (_ for _ in ()).throw(
+                AppServerError("thread t1 already has an active writer")
+            )
+
+            with mock.patch(
+                "codexbridge.companion.service.writer_lock_path",
+                return_value=lock,
+            ):
+                self.service._ensure_thread("t1")
+
+            self.assertFalse(lock.exists())
+            self.assertFalse((lock_dir / "t1.lock.removed").exists())
+
+    def test_turn_completed_event_marks_history_append(self) -> None:
+        payload = {
+            "threadId": "t1",
+            "turn": {"id": "turn-9", "status": "completed", "completedAt": 1791000300},
+        }
+
+        event = self.service._event_payload({"method": "turn/completed", "params": payload})
+
+        self.assertTrue(event["append_only"])
 
     def test_start_turn_forks_when_thread_is_locked_by_another_writer(self) -> None:
         calls = {"resume": 0, "fork": 0, "start": 0}
