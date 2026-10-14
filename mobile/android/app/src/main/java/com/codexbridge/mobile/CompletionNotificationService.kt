@@ -173,11 +173,29 @@ class CompletionNotificationService : Service() {
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))
             .setVibrate(longArrayOf(0, 250, 150, 250))
-            .setDefaults(NotificationCompat.DEFAULT_SOUND or NotificationCompat.DEFAULT_VIBRATE)
             .build()
         NotificationManagerCompat.from(this).notify(completionId(threadId), notification)
+        playNotificationSound()
+    }
+
+    /**
+     * Some OEM ROMs cache or override notification channel sound settings.
+     * Play the system notification sound directly so the user always hears it,
+     * regardless of what the channel does.
+     */
+    private fun playNotificationSound() {
+        try {
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val ringtone = RingtoneManager.getRingtone(this, uri)
+            ringtone.audioAttributes = android.media.AudioAttributes.Builder()
+                .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            ringtone.play()
+        } catch (_: Exception) {
+            // Channel sound is the fallback.
+        }
     }
 
     private fun cancelCompletion(threadId: String) {
@@ -211,7 +229,7 @@ class CompletionNotificationService : Service() {
 
     companion object {
         private const val LISTEN_CHANNEL = "codexbridge_listen"
-        private const val COMPLETION_CHANNEL = "codexbridge_completion_v2"
+        private const val COMPLETION_CHANNEL = "codexbridge_completion_v4"
         private const val LISTEN_NOTIFICATION_ID = 4101
         private const val RETRY_MS = 3000L
         private const val POLL_MS = 5000L
