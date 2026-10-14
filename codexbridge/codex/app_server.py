@@ -173,7 +173,7 @@ class AppServerClient:
             "clientInfo": {
                 "name": "codex_bridge",
                 "title": "CodexBridge",
-                "version": "1.3.3",
+                "version": "1.3.4",
             }
         })
         self.notify("initialized", {})

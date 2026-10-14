@@ -1,5 +1,8 @@
 # Codex 手机端（CodexBridge Mobile）
 
+> 本目录是 [CodexBridge](../README.md) 主仓库的一部分（`mobile/` 子目录），
+> 桌面端伴侣接口与手机端应用随同一个仓库发布。
+
 通过局域网连接电脑上的 **CodexBridge**，在手机上查看 Codex 的全部任务与消息、继续对话、切换模型、新建任务、处理审批请求。
 
 - 连接方式：CodexBridge 的“手机伴侣接口”（默认端口 `8790`），同一 Wi-Fi 下自动发现（UDP `8766`）
