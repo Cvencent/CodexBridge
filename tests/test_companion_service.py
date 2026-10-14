@@ -193,6 +193,26 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(result["thread"]["status"], "working")
         self.assertEqual(result["task"]["status"], "working")
 
+    def test_list_threads_marks_read_completion_idle(self) -> None:
+        self._write_rollout("t2", "task_complete", seconds_ago=30)
+        read_state = ReadStateStore(None)
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            read_state=read_state,
+        )
+        try:
+            service.list_threads(limit=10)  # populate the log cache
+            read_state.mark_thread("t2", int(self.service._thread_log("t2")[2]))
+            result = service.list_threads(limit=10)
+        finally:
+            service.stop()
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "idle")
+
     def test_list_threads_ignores_stale_rollout(self) -> None:
         self._write_rollout("t2", "task_started", seconds_ago=600)
         result = self.service.list_threads(limit=10)
@@ -230,41 +250,199 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(params["input"][0]["text"], "继续修复")
         self.assertEqual(params["model"], "gpt-5.1-codex")
 
-    def test_start_turn_uses_steer_when_active_writer_rejects_new_turn(self) -> None:
-        calls = {"start": 0, "steer": 0}
+    def test_start_turn_forks_when_thread_is_locked_by_another_writer(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
 
-        def start(_params):
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(params):
+            calls["fork"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
             calls["start"] += 1
-            raise AppServerError("thread already has an active writer")
-
-        def steer(_params):
-            calls["steer"] += 1
+            # turn runs on the fork we own, not the locked original
+            self.assertEqual(params["threadId"], "t1-fork")
             return {"turn": {"id": "turn-2", "status": "inProgress"}}
 
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
         self.client.responses["turn/start"] = start
-        self.client.responses["turn/steer"] = steer
+
         result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+
         self.assertEqual(result["status"], "working")
-        self.assertEqual(calls, {"start": 1, "steer": 1})
+        self.assertEqual(result["continued_as"], "t1-fork")
+        self.assertEqual(calls, {"resume": 1, "fork": 1, "start": 1})
+
+    def test_start_turn_reuses_fork_on_next_reply(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        forks = {"n": 0}
+
+        def fork(_params):
+            forks["n"] += 1
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "第一次")
+        result = self.service.start_turn("t1", "第二次")
+
+        self.assertEqual(forks["n"], 1)
+        self.assertEqual(result["continued_as"], "t1-fork")
+
+    def test_start_turn_reports_locked_thread_when_fork_fails(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            raise AppServerError("fork unsupported")
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        with self.assertRaises(AppServerError) as ctx:
+            self.service.start_turn("t1", "继续")
+
+        self.assertIn("电脑端", str(ctx.exception))
+
+    def test_forked_reply_is_transparent_in_list_and_read(self) -> None:
+        # Lock t1, continue it, then make sure the phone still sees one task
+        # named t1 whose history comes from the fork.
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        detail = thread_detail("t1-fork")
+        detail["thread"]["turns"][0]["status"] = "completed"
+        self.client.responses["thread/read"] = detail
+        self.client.responses["thread/list"] = {
+            "data": [thread_row("t1-fork"), thread_row("t2", name="第二个任务")],
+            "nextCursor": None,
+        }
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        listing = self.service.list_threads(limit=10)
+        visible = [item["thread_id"] for item in listing["threads"]]
+        self.assertIn("t1", visible)
+        self.assertNotIn("t1-fork", visible)
+
+        read = self.service.read_thread("t1")
+        self.assertEqual(read["thread"]["thread_id"], "t1")
+        self.assertEqual(read["task"]["thread_id"], "t1")
+
+    def test_fork_completion_flips_to_idle_after_read(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        detail = thread_detail("t1-fork")
+        self.client.responses["thread/read"] = detail
+        self.client.responses["thread/list"] = {"data": [thread_row("t1-fork")], "nextCursor": None}
+
+        self.service.start_turn("t1", "继续")
+        self._write_rollout("t1-fork", "task_complete", seconds_ago=20)
+
+        before = self.service.list_threads(limit=10)["threads"][0]
+        self.assertEqual(before["status"], "completed")
+
+        self.service.mark_thread_read("t1")
+
+        after = self.service.list_threads(limit=10)["threads"][0]
+        self.assertEqual(after["thread_id"], "t1")
+        self.assertEqual(after["status"], "idle")
+
+    def test_fork_events_report_origin_thread_id(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.service.start_turn("t1", "继续")
+
+        payload = self.service._event_payload(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "t1-fork", "turnId": "turn-2", "itemId": "i1", "delta": "好"},
+            }
+        )
+        self.assertEqual(payload["thread_id"], "t1")
+
+    def test_fork_mapping_survives_restart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.service.start_turn("t1", "继续")
+        self.service.stop()
+
+        restored = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            forks = {"n": 0}
+
+            def fork_again(_params):
+                forks["n"] += 1
+                return {"thread": thread_row("t1-fork2")}
+
+            self.client.responses["thread/fork"] = fork_again
+            result = restored.start_turn("t1", "第二次")
+        finally:
+            restored.stop()
+        # The persisted mapping is reused, so no second fork is created.
+        self.assertEqual(forks["n"], 0)
+        self.assertEqual(result["continued_as"], "t1-fork")
 
     def test_start_turn_tolerates_active_writer_during_resume(self) -> None:
-        calls = {"resume": 0, "start": 0}
+        calls = {"resume": 0, "fork": 0, "start": 0}
 
         def resume(_params):
             calls["resume"] += 1
             raise AppServerError("thread already has an active writer")
+
+        def fork(_params):
+            calls["fork"] += 1
+            return {"thread": thread_row("t1-fork")}
 
         def start(_params):
             calls["start"] += 1
             return {"turn": {"id": "turn-2", "status": "inProgress"}}
 
         self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
         self.client.responses["turn/start"] = start
 
         result = self.service.start_turn("t1", "继续这个旧任务")
 
         self.assertEqual(result["status"], "working")
-        self.assertEqual(calls, {"resume": 1, "start": 1})
+        self.assertEqual(calls, {"resume": 1, "fork": 1, "start": 1})
 
     def test_turn_completed_event_uses_desktop_completion_timestamp(self) -> None:
         event = self.service._event_payload(
@@ -286,22 +464,45 @@ class CompanionServiceTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["completed_at"], 1791000100)
 
-    def test_steer_turn_falls_back_to_start_when_no_active_writer(self) -> None:
-        calls = {"start": 0, "steer": 0}
+    def test_steer_turn_requires_an_active_turn(self) -> None:
+        # A resident thread with no in-progress turn cannot be steered; the
+        # app-server requires expectedTurnId, so surface a clear error instead
+        # of sending an invalid steer.
+        calls = {"steer": 0}
 
         def steer(_params):
             calls["steer"] += 1
-            raise AppServerError("no active turn to steer")
-
-        def start(_params):
-            calls["start"] += 1
             return {"turn": {"id": "turn-3", "status": "inProgress"}}
 
         self.client.responses["turn/steer"] = steer
-        self.client.responses["turn/start"] = start
-        result = self.service.steer_turn("t1", "换个方向")
-        self.assertEqual(result["status"], "working")
-        self.assertEqual(calls, {"start": 1, "steer": 1})
+
+        with self.assertRaises(AppServerError):
+            self.service.steer_turn("t1", "换个方向")
+
+        self.assertEqual(calls["steer"], 0)
+
+    def test_steer_turn_sends_expected_turn_id(self) -> None:
+        detail = thread_detail()
+        detail["thread"]["turns"].append(
+            {
+                "id": "turn-9",
+                "status": "inProgress",
+                "startedAt": 1791000200,
+                "items": [],
+            }
+        )
+        self.client.responses["thread/read"] = detail
+        seen = {}
+
+        def steer(params):
+            seen.update(params)
+            return {"turn": {"id": "turn-9", "status": "inProgress"}}
+
+        self.client.responses["turn/steer"] = steer
+        self.service.steer_turn("t1", "换个方向")
+
+        self.assertEqual(seen["expectedTurnId"], "turn-9")
+        self.assertEqual(seen["threadId"], "t1")
     def test_start_turn_resumes_disk_thread_first(self) -> None:
         self.service.start_turn("t1", "继续修复", model="gpt-5.1-codex")
         methods = [method for method, _ in self.client.requests]
@@ -322,7 +523,12 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(len(turns), 2)
 
     def test_steer_turn_resumes_thread(self) -> None:
-        self.client.responses["turn/steer"] = {"turn": {"id": "turn-2", "status": "inProgress"}}
+        detail = thread_detail()
+        detail["thread"]["turns"].append(
+            {"id": "turn-9", "status": "inProgress", "startedAt": 1791000200, "items": []}
+        )
+        self.client.responses["thread/read"] = detail
+        self.client.responses["turn/steer"] = {"turn": {"id": "turn-9", "status": "inProgress"}}
         self.service.steer_turn("t1", "改一下方向")
         methods = [method for method, _ in self.client.requests]
         self.assertLess(methods.index("thread/resume"), methods.index("turn/steer"))

@@ -746,7 +746,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.13","port":8568,"discovery_port":8569,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.14","port":8568,"discovery_port":8569,"requires_pairing":true}
 ```
 
 默认连接端口为 `8568`，默认发现端口为 `8569`，并在管理页面显示每个端口的健康状态。
@@ -773,7 +773,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 | POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model` |
 | GET | `/api/companion/threads/<id>` | 线程详情与归一化消息 |
 | POST | `/api/companion/threads/<id>/read` | 标记该线程当前完成状态为已读，返回最新 `status` |
-| POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务 |
+| POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务；响应中的 `continued_as`（非空时）指向实际承接历史的线程 id |
 | POST | `/api/companion/threads/<id>/interrupt` | 中断任务，`turn_id` 可省略 |
 | POST | `/api/companion/approvals/<request_id>` | 审批决定，`decision` 取 `accept`、`acceptForSession`、`decline`、`cancel` |
 | GET | `/api/companion/models` | 可用模型与推理档位 |
@@ -806,7 +806,25 @@ SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_star
 标记为全局已读，线程列表状态回落为 `idle`，并向所有在线客户端广播 `thread_status`
 的 `idle` 事件，其他设备据此撤回尚未展示的完成提醒。
 
-### 17.4 本机管理
+### 17.4 电脑端占用线程时的续写
+
+app-server 对同一线程只允许一个 writer。电脑端 Codex（或另一个 app-server 进程）正打开某
+线程时，手机对该线程的 `thread/resume` 会返回“已有活跃 writer”，随后 `turn/start` 只会得到
+模糊的 `thread not found`。CodexBridge 对此做透明续写：
+
+- 电脑端占用该线程时，CodexBridge 调用 `thread/fork` 复制完整历史，在新的线程 id 上执行
+  `turn/start`，不抢占电脑端会话。
+- 同一源线程只 fork 一次，映射保存在 `%LOCALAPPDATA%\CodexBridge\fork-map.json`，后续回复
+  继续复用同一个 fork，不会重复分叉；进程重启后仍然复用。
+- 手机始终看到原来的线程 id 与历史：`GET /api/companion/threads/<id>`、线程列表和 SSE 事件
+  都会把 fork 的事件与详情映射回源线程 id，列表不会把隐藏 fork 另列一条。
+- `POST /api/companion/threads/<id>/messages` 的响应含 `continued_as`：为空表示在原线程直接
+  继续；不为空时是实际承接的 fork id，手机可据此提示“已在同历史的副本中继续”。
+- 若 fork 也失败，返回明确的中文错误，提示先在电脑端关闭该会话后重试。
+- `mode=steer` 需带进行中的 `expectedTurnId`；当前没有进行中的对话时返回“该任务当前没有
+  进行中的对话，无法追加消息”。
+
+### 17.5 本机管理
 
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
 - `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。

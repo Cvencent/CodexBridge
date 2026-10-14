@@ -44,6 +44,9 @@ data class UiState(
     val paired: Boolean = false,
     val connected: Boolean = false,
     val busy: Boolean = false,
+    // Drives the "sync in progress" indicator on the task list.
+    val refreshing: Boolean = false,
+    val lastRefreshedAt: Long = 0,
     val error: String? = null,
     val notice: String? = null,
     val threads: List<ThreadSummary> = emptyList(),
@@ -259,14 +262,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun refreshThreads() {
         val client = api ?: return
+        _state.update { it.copy(refreshing = true) }
         runCatching { client.threads(_state.value.search) }
             .onSuccess { response ->
                 _state.update { state ->
                     val visible = sortThreadsByActivity(
                         response.threads,
                     )
-                    state.copy(threads = visible, connected = true)
+                    state.copy(
+                        threads = visible,
+                        connected = true,
+                        refreshing = false,
+                        lastRefreshedAt = System.currentTimeMillis(),
+                    )
                 }
+            }
+            .onFailure {
+                _state.update { it.copy(refreshing = false) }
             }
     }
 
@@ -459,13 +471,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             try {
-                client.sendMessage(
+                val response = client.sendMessage(
                     threadId = threadId,
                     text = content,
                     model = _state.value.selectedModel,
                     effort = _state.value.selectedEffort,
                     steer = false,
                 )
+                if (response.continued_as.isNotBlank() && response.continued_as != threadId) {
+                    // The desktop was using the original thread, so this reply
+                    // continued in a forked copy that shares its history.
+                    _state.update {
+                        it.copy(notice = "该任务正在电脑端使用，已在同历史的副本中继续")
+                    }
+                }
             } catch (error: Exception) {
                 _state.update { it.copy(messages = it.messages.filterNot { item -> item.id == local.id }) }
                 handleError(error)
@@ -766,6 +785,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     companion object {
-        private const val THREADS_REFRESH_MS = 4000L
+        private const val THREADS_REFRESH_MS = 2000L
     }
 }

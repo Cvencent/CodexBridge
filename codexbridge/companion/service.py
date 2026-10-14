@@ -57,13 +57,6 @@ def _is_active_writer_error(error: BaseException) -> bool:
     )
 
 
-def _is_no_active_turn_error(error: BaseException) -> bool:
-    text = str(error or "").strip().lower()
-    if "no active turn" in text or "no active writer" in text:
-        return True
-    return "not active" in text and ("turn" in text or "writer" in text or "steer" in text)
-
-
 def _as_number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -241,7 +234,20 @@ class CompanionService:
         self._account_cache_epoch = 0.0
         self._log: list[str] = []
         self._resumed_threads: set[str] = set()
+        # Threads whose writer lock is held by another Codex client (desktop
+        # app-server). The app-server refuses to resume these, so a turn/start
+        # on them fails with a bare "thread not found"; remember the real cause
+        # so the phone gets an actionable message instead.
+        self._locked_threads: set[str] = set()
+        # When a thread is locked by another writer we continue it in a fork
+        # that shares its full history, and remember the mapping so a repeat
+        # reply reuses the same fork instead of branching again.
+        self._forked_threads: dict[str, str] = {}
+        # Reverse map (hidden fork id -> phone-visible thread id) so reads and
+        # events stay attached to the thread the phone actually opened.
+        self._fork_origin: dict[str, str] = {}
         self._resumed_lock = threading.Lock()
+        self._load_fork_map()
         self._sessions_root = (
             Path(sessions_root)
             if sessions_root is not None
@@ -263,6 +269,7 @@ class CompanionService:
             self._generation += 1
         with self._resumed_lock:
             self._resumed_threads.clear()
+            self._locked_threads.clear()
         if client is not None:
             try:
                 client.close()
@@ -305,6 +312,7 @@ class CompanionService:
             self._generation += 1
         with self._resumed_lock:
             self._resumed_threads.clear()
+            self._locked_threads.clear()
         if client is not None:
             try:
                 client.close()
@@ -340,6 +348,8 @@ class CompanionService:
                 error = exc
                 message = str(exc)
                 if _is_active_writer_error(exc):
+                    with self._resumed_lock:
+                        self._locked_threads.add(thread_id)
                     self._thread_note(thread_id)
                     return
                 if "not found" in message.lower():
@@ -350,6 +360,116 @@ class CompanionService:
                     raise
         if error is not None:
             raise error
+
+    def _active_turn_id(self, thread_id: str) -> str:
+        """Return the id of the turn currently running on a thread, if any."""
+        try:
+            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except AppServerError:
+            return ""
+        thread = result.get("thread") if isinstance(result, dict) else None
+        turns = (thread or {}).get("turns") if isinstance(thread, dict) else None
+        if not isinstance(turns, list):
+            return ""
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            status = str(turn.get("status") or "").replace("_", "").lower()
+            if status in {"inprogress", "running", "active"}:
+                return str(turn.get("id") or "")
+        return ""
+
+    def _writable_thread(self, thread_id: str) -> str:
+        """Return a thread id this client may write to.
+
+        app-server allows only one writer per stored thread. When the desktop
+        or another Codex process holds that thread, ``thread/resume`` and
+        ``turn/start`` fail. Forking reuses the full history under a new id we
+        own, so the phone can keep replying without stealing the desktop's
+        session. Free threads are resumed in place and used directly.
+        """
+        if not thread_id:
+            return thread_id
+        with self._resumed_lock:
+            existing = self._forked_threads.get(thread_id)
+        if existing:
+            # A reset app-server forgets loaded threads, so re-hydrate the fork
+            # (or the next turn/start fails with "thread not found" again).
+            try:
+                self._ensure_thread(existing)
+            except AppServerError:
+                # The fork is gone; drop the stale mapping and branch again.
+                with self._resumed_lock:
+                    self._forked_threads.pop(thread_id, None)
+                    self._fork_origin.pop(existing, None)
+                self._save_fork_map()
+            else:
+                return existing
+        self._ensure_thread(thread_id)
+        with self._resumed_lock:
+            locked = thread_id in self._locked_threads
+        if not locked:
+            return thread_id
+        client = self._ensure_client()
+        try:
+            result = client.request("thread/fork", {"threadId": thread_id})
+        except AppServerError as error:
+            raise AppServerError(
+                "该任务正在电脑端 Codex 中使用，无法同时从手机继续；"
+                "请先在电脑端关闭该会话后重试。"
+            ) from error
+        thread = result.get("thread") if isinstance(result, dict) else None
+        forked_id = str((thread or {}).get("id") or "")
+        if not forked_id:
+            raise AppServerError("电脑端无法为该任务创建可继续的会话")
+        self._thread_note(forked_id)
+        with self._resumed_lock:
+            self._forked_threads[thread_id] = forked_id
+            self._fork_origin[forked_id] = thread_id
+        self._save_fork_map()
+        return forked_id
+
+    def _fork_map_path(self) -> Path:
+        return self.data_dir / "fork-map.json"
+
+    def _load_fork_map(self) -> None:
+        try:
+            payload = json.loads(self._fork_map_path().read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        forks = payload.get("forks")
+        if not isinstance(forks, dict):
+            return
+        for origin, fork in forks.items():
+            if not isinstance(origin, str) or not isinstance(fork, str) or not origin or not fork:
+                continue
+            self._forked_threads[origin] = fork
+            self._fork_origin[fork] = origin
+
+    def _save_fork_map(self) -> None:
+        with self._resumed_lock:
+            payload = {"version": 1, "forks": dict(self._forked_threads)}
+        try:
+            self._fork_map_path().parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._fork_map_path().with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self._fork_map_path())
+        except OSError:
+            return
+
+    def _fork_for(self, thread_id: str) -> str:
+        with self._resumed_lock:
+            return self._forked_threads.get(str(thread_id or ""), "")
+
+    def visible_thread_id(self, thread_id: str) -> str:
+        """Map a hidden fork id back to the thread the phone opened."""
+        key = str(thread_id or "")
+        if not key:
+            return ""
+        with self._resumed_lock:
+            return self._fork_origin.get(key, key)
 
     def _thread_log(self, thread_id: str) -> tuple[float, str, float] | None:
         """Return (newest_timestamp, last_turn_event) for a rollout log.
@@ -362,6 +482,9 @@ class CompanionService:
         key = str(thread_id or "")
         if not key:
             return None
+        # A continuation fork is authoritative for the thread it branched from,
+        # so read the fork's rollout when the phone asks about the origin.
+        key = self._fork_for(key) or key
         now = time.monotonic()
         with self._log_cache_lock:
             cached = self._log_cache.get(key)
@@ -529,7 +652,7 @@ class CompanionService:
                 "request_id": request_id,
                 "kind": kind,
                 "method": method,
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or params.get("callId") or ""),
                 "command": str(params.get("command") or ""),
@@ -614,7 +737,7 @@ class CompanionService:
         if method == "item/agentMessage/delta":
             return {
                 "type": "agent_delta",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or ""),
                 "delta": str(params.get("delta") or params.get("text") or ""),
@@ -622,7 +745,7 @@ class CompanionService:
         if method == "item/commandExecution/outputDelta":
             return {
                 "type": "command_output",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or ""),
                 "delta": str(params.get("delta") or params.get("chunk") or ""),
@@ -636,7 +759,7 @@ class CompanionService:
                 return None
             return {
                 "type": "item_started" if method == "item/started" else "item_completed",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item": mapped,
             }
@@ -644,14 +767,14 @@ class CompanionService:
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             return {
                 "type": "turn_started",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(turn.get("id") or ""),
                 "status": "working",
             }
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             status = str(turn.get("status") or "completed")
-            thread_id = str(params.get("threadId") or "")
+            thread_id = self.visible_thread_id(str(params.get("threadId") or ""))
             completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
             return {
                 "type": "turn_completed",
@@ -670,14 +793,14 @@ class CompanionService:
             status = params.get("status") if isinstance(params.get("status"), dict) else {}
             return {
                 "type": "thread_status",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "status": str(status.get("type") or "unknown"),
                 "active_flags": [str(flag) for flag in status.get("activeFlags") or []],
             }
         if method == "thread/name/updated":
             return {
                 "type": "thread_name",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "title": str(params.get("name") or ""),
             }
         if method == "thread/tokenUsage/updated":
@@ -685,7 +808,7 @@ class CompanionService:
             total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             return {
                 "type": "token_usage",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "total_tokens": int(_as_number(total.get("totalTokens")) or 0),
                 "context_window": int(_as_number(usage.get("modelContextWindow")) or 0),
@@ -695,7 +818,7 @@ class CompanionService:
         if method == "error":
             return {
                 "type": "error",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "message": _clip(str(params.get("message") or params.get("error") or ""), 500),
             }
         return None
@@ -770,24 +893,43 @@ class CompanionService:
         rows = result.get("data") if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         threads = []
+        seen: set[str] = set()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or not row.get("id"):
                 continue
             if not _is_display_thread(row):
                 continue
-            threads.append(self._summary(row))
+            # A thread we forked to keep replying is still shown as the thread
+            # the phone opened; never list the hidden fork as a second task.
+            visible_id = self.visible_thread_id(str(row.get("id") or ""))
+            if visible_id in seen:
+                continue
+            seen.add(visible_id)
+            summary = self._summary(row)
+            summary["thread_id"] = visible_id
+            threads.append(summary)
         for index, summary in enumerate(threads):
             if index >= LOG_SCAN_LIMIT:
                 break
+            thread_id = str(summary.get("thread_id") or "")
             if str(summary.get("status") or "") not in ACTIVE_STATUSES:
-                inferred = self._log_status(str(summary.get("thread_id") or ""))
+                # List rows carry no turns, so a finished task only shows up via
+                # its rollout log. Use that log's completion timestamp as the
+                # read watermark; otherwise completed_at stays 0 and the
+                # "already read" check below can never match.
+                activity = self._thread_log(thread_id)
+                inferred = self._log_status(thread_id)
                 if inferred:
                     summary["status"] = inferred
+                    if inferred in {"completed", "failed"} and activity is not None:
+                        _newest, _kind, kind_stamp = activity
+                        if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
+                            summary["completed_at"] = int(kind_stamp)
             completed_at = int(summary.get("completed_at") or 0)
             if (
                 summary.get("status") in {"completed", "failed"}
                 and completed_at > 0
-                and self._read_state.is_thread_read(str(summary.get("thread_id") or ""), completed_at)
+                and self._read_state.is_thread_read(thread_id, completed_at)
             ):
                 summary["status"] = "idle"
         threads.sort(
@@ -827,7 +969,10 @@ class CompanionService:
     ) -> dict[str, Any]:
         if not thread_id:
             raise ValueError("thread_id")
-        result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+        # When the origin thread is locked by the desktop we read the fork that
+        # carries its history, but keep reporting the origin id to the phone.
+        source_id = self._fork_for(thread_id) or thread_id
+        result = self._read("thread/read", {"threadId": source_id, "includeTurns": True})
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             raise ValueError("thread")
@@ -853,7 +998,9 @@ class CompanionService:
         total = len(messages)
         trimmed = messages[-max(1, int(message_limit)):]
         summary = self._summary(thread)
+        summary["thread_id"] = thread_id
         task = thread_snapshot(thread)
+        task["thread_id"] = thread_id
         if live_status:
             summary["status"] = live_status
             task["status"] = live_status
@@ -1009,6 +1156,12 @@ class CompanionService:
         summary = detail["thread"]
         status = str(summary.get("status") or "idle")
         completed_at = int(summary.get("completed_at") or 0)
+        # The list derives its completion time from the rollout log, which can
+        # be a beat later than the turn's completedAt. Mark the later value so
+        # the list's read check matches and the row flips to idle too.
+        log_activity = self._thread_log(thread_id)
+        if log_activity is not None:
+            completed_at = max(completed_at, int(log_activity[2] or 0))
         if status in {"completed", "failed"} and completed_at > 0:
             was_unread = not self._read_state.is_thread_read(thread_id, completed_at)
             self._read_state.mark_thread(thread_id, completed_at)
@@ -1041,8 +1194,9 @@ class CompanionService:
         content = (text or "").strip()
         if not content:
             raise ValueError("text")
+        target_id = self._writable_thread(thread_id)
         params: dict[str, Any] = {
-            "threadId": thread_id,
+            "threadId": target_id,
             "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
         }
         if model:
@@ -1051,20 +1205,8 @@ class CompanionService:
             params["effort"] = str(effort)
         if client_message_id:
             params["clientUserMessageId"] = str(client_message_id)[:64]
-        self._ensure_thread(thread_id)
         client = self._ensure_client()
-        try:
-            result = client.request("turn/start", params)
-        except AppServerError as error:
-            if not _is_active_writer_error(error):
-                raise
-            result = client.request(
-                "turn/steer",
-                {
-                    "threadId": thread_id,
-                    "input": params["input"],
-                },
-            )
+        result = client.request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str((turn or {}).get("id") or "")
         self.publish(
@@ -1076,7 +1218,12 @@ class CompanionService:
                 "user_message": _clip(content, MAX_MESSAGE_CHARS),
             }
         )
-        return {"thread_id": thread_id, "turn_id": turn_id, "status": "working"}
+        return {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "status": "working",
+            "continued_as": target_id if target_id != thread_id else "",
+        }
 
     def steer_turn(self, thread_id: str, text: str) -> dict[str, Any]:
         if not thread_id:
@@ -1084,42 +1231,37 @@ class CompanionService:
         content = (text or "").strip()
         if not content:
             raise ValueError("text")
-        self._ensure_thread(thread_id)
+        target_id = self._writable_thread(thread_id)
         client = self._ensure_client()
         steer_params = {
-            "threadId": thread_id,
+            "threadId": target_id,
             "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
         }
-        try:
-            result = client.request("turn/steer", steer_params)
-        except AppServerError as error:
-            if not _is_no_active_turn_error(error):
-                raise
-            result = client.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": steer_params["input"],
-                },
-            )
+        expected_turn_id = self._active_turn_id(target_id)
+        if not expected_turn_id:
+            raise AppServerError("该任务当前没有进行中的对话，无法追加消息")
+        steer_params["expectedTurnId"] = expected_turn_id
+        result = client.request("turn/steer", steer_params)
         turn = result.get("turn") if isinstance(result, dict) else None
         return {
             "thread_id": thread_id,
-            "turn_id": str((turn or {}).get("id") or ""),
+            "turn_id": str((turn or {}).get("id") or expected_turn_id),
             "status": "working",
         }
 
     def interrupt(self, thread_id: str, turn_id: str = "") -> dict[str, Any]:
         if not thread_id:
             raise ValueError("thread_id")
-        params: dict[str, Any] = {"threadId": thread_id}
-        self._ensure_thread(thread_id)
+        target_id = self._writable_thread(thread_id)
+        params: dict[str, Any] = {"threadId": target_id}
         if turn_id:
             params["turnId"] = turn_id
         else:
-            detail = self.read_thread(thread_id, message_limit=1)
-            task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
-            turn_id = str(task.get("turn_id") or "")
+            turn_id = self._active_turn_id(target_id)
+            if not turn_id:
+                detail = self.read_thread(thread_id, message_limit=1)
+                task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
+                turn_id = str(task.get("turn_id") or "")
             if not turn_id:
                 raise ValueError("turn_id")
             params["turnId"] = turn_id

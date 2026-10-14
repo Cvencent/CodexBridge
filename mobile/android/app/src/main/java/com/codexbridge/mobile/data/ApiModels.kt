@@ -36,6 +36,9 @@ data class SendResponse(
     val turn_id: String = "",
     val status: String = "",
     val read_at: Long = 0,
+    // Set when the desktop held the original thread, so the reply continued in
+    // a forked copy that shares its history.
+    val continued_as: String = "",
 )
 
 @Serializable
