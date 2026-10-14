@@ -427,6 +427,71 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(forked[0]["thread_id"], "t1")
         self.assertEqual(forked[0]["continued_as"], "t1-fork")
 
+    def test_existing_untitled_fork_is_labelled_when_reused(self) -> None:
+        # Forks created before labelling existed only have a mapping entry.
+        fork_map = Path(self.temp.name) / "fork-map.json"
+        fork_map.write_text(
+            json.dumps({"version": 1, "forks": {"t1": "t1-fork"}}),
+            encoding="utf-8",
+        )
+        self.client.responses["thread/resume"] = {
+            "thread": thread_row("t1-fork", name="桌面任务")
+        }
+        self.client.responses["thread/read"] = {
+            "thread": thread_row("t1-fork", name="桌面任务")
+        }
+        names: list[dict] = []
+
+        def name_set(params):
+            names.append(params)
+            return {}
+
+        self.client.responses["thread/name/set"] = name_set
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            result = service.start_turn("t1", "继续")
+        finally:
+            service.stop()
+
+        self.assertEqual(result["continued_as"], "t1-fork")
+        self.assertEqual(len(names), 1)
+        self.assertEqual(names[0]["name"], "手机继续 · 桌面任务")
+
+    def test_relabelling_an_already_labelled_fork_does_not_stack_prefixes(self) -> None:
+        fork_map = Path(self.temp.name) / "fork-map.json"
+        fork_map.write_text(
+            json.dumps({"version": 1, "forks": {"t1": "t1-fork"}}),
+            encoding="utf-8",
+        )
+        self.client.responses["thread/resume"] = {"thread": thread_row("t1-fork")}
+        self.client.responses["thread/read"] = {
+            "thread": thread_row("t1-fork", name="手机继续 · 桌面任务")
+        }
+        names: list[dict] = []
+        self.client.responses["thread/name/set"] = lambda params: names.append(params) or {}
+
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            service.start_turn("t1", "继续")
+            detail = service.read_thread("t1")
+        finally:
+            service.stop()
+
+        self.assertEqual(names[0]["name"], "手机继续 · 桌面任务")
+        self.assertEqual(detail["thread"]["title"], "桌面任务")
+
     def test_read_thread_reports_continuation_fork(self) -> None:
         def resume(_params):
             raise AppServerError("thread t1 already has an active writer")

@@ -23,6 +23,9 @@ from codexbridge.codex.app_server import (
 )
 
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
+# Name given to a continuation fork so the desktop can tell it apart from the
+# original task the phone opened.
+FORK_TITLE_PREFIX = "手机继续 · "
 INTERNAL_THREAD_PREFIXES = ("The following is the Codex agent history",)
 MAX_MESSAGE_CHARS = 20000
 MAX_MESSAGE_ITEMS = 400
@@ -407,8 +410,12 @@ class CompanionService:
                 with self._resumed_lock:
                     self._forked_threads.pop(thread_id, None)
                     self._fork_origin.pop(existing, None)
+                    self._fork_titles.pop(thread_id, None)
                 self._save_fork_map()
             else:
+                # Forks created before this version were left unnamed, so give
+                # them their label the first time they are reused.
+                self._ensure_fork_label(thread_id, existing)
                 return existing
         self._ensure_thread(thread_id)
         with self._resumed_lock:
@@ -447,6 +454,22 @@ class CompanionService:
         )
         return forked_id
 
+    def _ensure_fork_label(self, thread_id: str, forked_id: str) -> None:
+        """Label a fork that predates fork labelling. Failure is cosmetic."""
+        if self._original_title(thread_id):
+            return
+        try:
+            result = self._read("thread/read", {"threadId": forked_id, "includeTurns": False})
+        except AppServerError:
+            return
+        thread = result.get("thread") if isinstance(result, dict) else None
+        _label, origin_title = self._label_fork(forked_id, thread)
+        if not origin_title:
+            return
+        with self._resumed_lock:
+            self._fork_titles[thread_id] = origin_title
+        self._save_fork_map()
+
     def _label_fork(self, forked_id: str, forked: Any) -> tuple[str, str]:
         """Name a continuation fork so it is identifiable in the desktop app.
 
@@ -462,7 +485,10 @@ class CompanionService:
         base = ""
         if isinstance(forked, dict):
             base = str(forked.get("name") or forked.get("preview") or "").strip()
-        label = _clip(f"手机继续 · {base}".strip() if base else "手机继续 · CodexBridge", 120)
+        # Re-labelling an already labelled fork must stay idempotent.
+        if base.startswith(FORK_TITLE_PREFIX):
+            base = base[len(FORK_TITLE_PREFIX):].strip()
+        label = _clip(f"{FORK_TITLE_PREFIX}{base}".strip() if base else f"{FORK_TITLE_PREFIX}CodexBridge", 120)
         try:
             self._ensure_client().request("thread/name/set", {"threadId": forked_id, "name": label})
         except AppServerError:
