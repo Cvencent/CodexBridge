@@ -13,6 +13,7 @@ from codexbridge.companion.store import CompanionStore
 DISCOVERY_PORT = 8766
 DISCOVERY_REQUEST = b"CODEXBRIDGE_COMPANION_DISCOVER"
 MAX_REPLY_BYTES = 512
+BIND_RETRY_SECONDS = 1.0
 
 
 class CompanionDiscovery:
@@ -66,24 +67,29 @@ class CompanionDiscovery:
             "requires_pairing": True,
         }
 
-    def _loop(self) -> None:
+    def _bind(self) -> socket.socket | None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((self.host, self.port))
         except OSError as error:
-            self._log(f"companion discovery bind failed: {error}")
             sock.close()
-            return
+            self._log(f"companion discovery bind failed: {error}")
+            return None
         sock.settimeout(1.0)
-        self._socket = sock
+        return sock
+
+    def _serve(self, sock: socket.socket) -> None:
         while not self._stop.is_set():
             try:
                 data, address = sock.recvfrom(256)
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except OSError as error:
+                if self._stop.is_set():
+                    break
+                self._log(f"companion discovery receive failed: {error}")
+                continue
             if data.strip() != DISCOVERY_REQUEST:
                 continue
             if not self.store.enabled:
@@ -93,7 +99,23 @@ class CompanionDiscovery:
                 sock.sendto(payload, address)
             except OSError:
                 continue
-        try:
-            sock.close()
-        except OSError:
-            pass
+
+    def _loop(self) -> None:
+        # During an upgrade the previous process can still hold this port for a
+        # moment. Keep retrying instead of silently disabling phone discovery.
+        while not self._stop.is_set():
+            sock = self._bind()
+            if sock is None:
+                self._stop.wait(BIND_RETRY_SECONDS)
+                continue
+            self._socket = sock
+            try:
+                self._serve(sock)
+            finally:
+                self._socket = None
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            if not self._stop.is_set():
+                self._stop.wait(BIND_RETRY_SECONDS)

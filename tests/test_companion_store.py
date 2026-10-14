@@ -75,6 +75,24 @@ class CompanionStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.authorize(claimed["token"]))
         self.assertFalse(self.store.remove_phone(claimed["phone_id"]))
 
+    def test_stale_instance_does_not_erase_newer_disk_phone(self) -> None:
+        stale = CompanionStore(self.path)
+        stale.load()
+        code = stale.pairing_code()["code"]
+        claimed = stale.claim(code, "新手机")
+        assert claimed is not None
+        stale.save()
+
+        # Simulate a second instance that loaded the file before that claim.
+        disk_empty = json.loads(self.path.read_text(encoding="utf-8"))
+        disk_empty["phones"] = []
+        self.path.write_text(json.dumps(disk_empty, ensure_ascii=False), encoding="utf-8")
+        stale.touch(claimed["phone_id"])
+
+        reloaded = CompanionStore(self.path)
+        reloaded.load()
+        self.assertIsNotNone(reloaded.authorize(claimed["token"]))
+
     def test_saved_payload_never_contains_plain_token(self) -> None:
         code = self.store.pairing_code()["code"]
         claimed = self.store.claim(code, "备机")

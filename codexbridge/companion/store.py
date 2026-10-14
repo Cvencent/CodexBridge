@@ -78,26 +78,64 @@ class CompanionStore:
         if not isinstance(payload, dict):
             return
         with self._lock:
-            enabled = payload.get("enabled")
-            if isinstance(enabled, bool):
-                self.enabled = enabled
-            port = payload.get("port")
-            if isinstance(port, int) and 1 <= port <= 65535:
-                self.port = port
-            phones = payload.get("phones")
-            if isinstance(phones, list):
-                for item in phones:
-                    record = self._record_from(item)
-                    if record is not None:
-                        self.phones[record.phone_id] = record
-            pairing = payload.get("pairing")
-            if isinstance(pairing, dict):
-                code = pairing.get("code")
-                expires = pairing.get("expires_at")
-                if isinstance(code, str) and len(code) == 6 and code.isdigit():
-                    if isinstance(expires, (int, float)) and float(expires) > time.time():
-                        self._code = code
-                        self._code_expires_at = float(expires)
+            self._apply_payload(payload)
+
+    def _apply_payload(self, payload: dict) -> None:
+        enabled = payload.get("enabled")
+        if isinstance(enabled, bool):
+            self.enabled = enabled
+        port = payload.get("port")
+        if isinstance(port, int) and 1 <= port <= 65535:
+            self.port = port
+
+        phones = payload.get("phones")
+        refreshed: dict[str, PhoneRecord] = {}
+        if isinstance(phones, list):
+            for item in phones:
+                record = self._record_from(item)
+                if record is not None:
+                    refreshed[record.phone_id] = record
+        # Merge, never replace: an older tray instance can otherwise save its
+        # empty in-memory list over a phone that was paired by a newer one.
+        for phone_id, record in refreshed.items():
+            current = self.phones.get(phone_id)
+            if current is None or record.last_seen >= current.last_seen:
+                self.phones[phone_id] = record
+
+        self._code = ""
+        self._code_expires_at = 0.0
+        pairing = payload.get("pairing")
+        if isinstance(pairing, dict):
+            code = pairing.get("code")
+            expires = pairing.get("expires_at")
+            if (
+                isinstance(code, str)
+                and len(code) == 6
+                and code.isdigit()
+                and isinstance(expires, (int, float))
+                and float(expires) > time.time()
+            ):
+                self._code = code
+                self._code_expires_at = float(expires)
+
+    def _reload_locked(self) -> None:
+        """Refresh disk state before a mutation.
+
+        A stale tray instance must not overwrite a newer phone record with the
+        empty phone list it loaded at startup.
+        """
+        if self.path is None:
+            return
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            self._apply_payload(payload)
 
     @staticmethod
     def _record_from(value: object) -> PhoneRecord | None:
@@ -157,15 +195,17 @@ class CompanionStore:
     # -------------------------------------------------------------- settings
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
+            self._reload_locked()
             self.enabled = bool(enabled)
-        self.save()
+            self.save()
 
     def set_port(self, port: int) -> None:
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("port")
         with self._lock:
+            self._reload_locked()
             self.port = port
-        self.save()
+            self.save()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -179,24 +219,22 @@ class CompanionStore:
     # --------------------------------------------------------------- pairing
     def pairing_code(self, regenerate: bool = False) -> dict:
         with self._lock:
+            self._reload_locked()
             now = time.time()
-            if (
-                regenerate
-                or not self._code
-                or self._code_expires_at <= now
-            ):
+            if regenerate or not self._code or self._code_expires_at <= now:
                 self._code = _new_code()
                 self._code_expires_at = now + PAIRING_CODE_TTL_SECONDS
                 self._code_attempts = 0
             code = self._code
             expires_at = self._code_expires_at
-        self.save()
+            self.save()
         return {"code": code, "expires_at": expires_at}
 
     def claim(self, code: str, name: str) -> dict | None:
         if not isinstance(code, str) or not code:
             return None
         with self._lock:
+            self._reload_locked()
             now = time.time()
             if not self._code or self._code_expires_at <= now:
                 return None
@@ -214,17 +252,18 @@ class CompanionStore:
                 self.phones.pop(oldest.phone_id, None)
             phone_id = "phone-" + secrets.token_hex(6)
             token = _new_token()
-            self.phones[phone_id] = PhoneRecord(
+            record = PhoneRecord(
                 phone_id=phone_id,
                 name=(name or "").strip()[:48],
                 token_hash=_hash_token(token),
                 created_at=now,
             )
+            self.phones[phone_id] = record
             self._code = ""
             self._code_expires_at = 0.0
             self._code_attempts = 0
-        self.save()
-        return {"phone_id": phone_id, "token": token, "name": self.phones[phone_id].name}
+            self.save()
+        return {"phone_id": phone_id, "token": token, "name": record.name}
 
     def authorize(self, token: str) -> PhoneRecord | None:
         if not isinstance(token, str) or not token:
@@ -238,17 +277,19 @@ class CompanionStore:
 
     def touch(self, phone_id: str) -> None:
         with self._lock:
+            self._reload_locked()
             record = self.phones.get(phone_id)
             if record is None:
                 return
             if time.time() - record.last_seen < 60:
                 return
             record.last_seen = time.time()
-        self.save()
+            self.save()
 
     def remove_phone(self, phone_id: str) -> bool:
         with self._lock:
+            self._reload_locked()
             removed = self.phones.pop(phone_id, None) is not None
-        if removed:
-            self.save()
-        return removed
+            if removed:
+                self.save()
+            return removed
