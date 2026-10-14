@@ -43,6 +43,10 @@ class SettingsStore(context: Context) {
         get() = prefs.getBoolean("dark_theme", true)
         set(value) = prefs.edit().putBoolean("dark_theme", value).apply()
 
+    var discoveryPort: Int
+        get() = prefs.getInt("discovery_port", ApiClient.DEFAULT_DISCOVERY_PORT)
+        set(value) = prefs.edit().putInt("discovery_port", value).apply()
+
     fun completionSeenAt(threadId: String): Long =
         prefs.getLong(completionSeenKey(threadId), 0L)
 

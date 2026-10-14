@@ -20,13 +20,20 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,8 +45,10 @@ fun SettingsScreen(
     state: UiState,
     onBack: () -> Unit,
     onToggleTheme: (Boolean) -> Unit,
+    onDiscoveryPort: (Int) -> Unit,
     onUnpair: () -> Unit,
 ) {
+    var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -69,6 +78,19 @@ fun SettingsScreen(
                     SettingRow("电脑名称", state.bridgeName.ifBlank { "--" })
                     SettingRow("CodexBridge 版本", state.bridgeVersion.ifBlank { "--" })
                     SettingRow("手机 ID", state.phoneId.ifBlank { "--" })
+                    OutlinedTextField(
+                        value = discoveryPort,
+                        onValueChange = { value ->
+                            val digits = value.filter { it.isDigit() }.take(5)
+                            discoveryPort = digits
+                            digits.toIntOrNull()?.let(onDiscoveryPort)
+                        },
+                        label = { Text("扫描端口") },
+                        supportingText = { Text("电脑端改过手机发现端口时，这里要填相同值。") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
 

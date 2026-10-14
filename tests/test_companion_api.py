@@ -165,6 +165,37 @@ class CompanionApiTests(unittest.TestCase):
         finally:
             recovered.stop()
 
+    def test_set_port_starts_listener_when_api_is_not_running(self) -> None:
+        self.api.stop()
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        target_port = holder.getsockname()[1]
+        holder.close()
+
+        recovered = CompanionApi(self.service, self.store, host="127.0.0.1", port=0)
+        self.assertFalse(recovered.running)
+        recovered.set_port(target_port)
+        try:
+            self.assertTrue(recovered.running)
+            self.assertEqual(recovered.port, target_port)
+            self.assertEqual(self.store.snapshot()["port"], target_port)
+        finally:
+            recovered.stop()
+
+    def test_set_port_failure_keeps_the_existing_listener_and_config(self) -> None:
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        busy_port = holder.getsockname()[1]
+        try:
+            with self.assertRaises(OSError):
+                self.api.set_port(busy_port)
+            self.assertTrue(self.api.running)
+            self.assertEqual(self.api.port, self.port)
+            self.assertEqual(self.store.snapshot()["port"], self.port)
+        finally:
+            holder.close()
+
     def test_fallback_starts_after_the_default_port(self) -> None:
         self.api.stop()
         holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

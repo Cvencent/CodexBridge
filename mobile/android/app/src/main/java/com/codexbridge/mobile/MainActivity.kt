@@ -96,6 +96,7 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
             AppScreen.Pair -> PairScreen(
                 state = state,
                 onDiscover = viewModel::discoverBridges,
+                onDiscoveryPort = viewModel::setDiscoveryPort,
                 onPair = viewModel::pair,
             )
             AppScreen.Threads -> ThreadsScreen(
@@ -119,6 +120,7 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 state = state,
                 onBack = viewModel::closeSettings,
                 onToggleTheme = viewModel::setDarkTheme,
+                onDiscoveryPort = viewModel::setDiscoveryPort,
                 onUnpair = viewModel::unpair,
             )
         }

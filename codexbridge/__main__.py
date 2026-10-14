@@ -22,7 +22,12 @@ from codexbridge.companion import (
     CompanionService,
     CompanionStore,
 )
-from codexbridge.ports import ADMIN_PORT, build_port_statuses
+from codexbridge.ports import (
+    ADMIN_PORT,
+    build_port_statuses,
+    validate_companion_port,
+    validate_discovery_port,
+)
 from codexbridge.speech import SpeechService
 
 
@@ -169,6 +174,46 @@ def _launch_restarted_process(
     )
 
 
+def _apply_companion_action(
+    payload: dict,
+    *,
+    companion,
+    discovery,
+    store,
+    status,
+    set_enabled=None,
+) -> dict:
+    action = str(payload.get("action") or "")
+    if action == "new_code":
+        return {
+            "pairing": store.pairing_code(regenerate=True),
+            "companion": status(),
+        }
+    if action == "remove_phone":
+        removed = store.remove_phone(str(payload.get("phone_id") or ""))
+        return {"removed": removed, "companion": status()}
+    if action == "set_port":
+        kind = str(payload.get("kind") or "companion")
+        if kind == "discovery":
+            port = validate_discovery_port(payload.get("port"))
+            discovery.set_port(port)
+        elif kind == "companion":
+            port = validate_companion_port(payload.get("port"))
+            companion.set_port(port)
+        else:
+            raise ValueError("port_kind")
+        return {"companion": status()}
+    if "enabled" in payload:
+        value = payload.get("enabled")
+        if not isinstance(value, bool):
+            raise ValueError("enabled")
+        if set_enabled is None:
+            raise ValueError("enabled")
+        set_enabled(value)
+        return {"companion": status()}
+    raise ValueError("action")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="codexbridge")
     parser.add_argument(
@@ -217,13 +262,20 @@ def main(argv: list[str] | None = None) -> int:
     companion_store.load()
     companion_service = CompanionService(data_dir, codex_cwd, codex_command)
     companion = CompanionApi(companion_service, companion_store, logger=print)
-    companion_discovery = CompanionDiscovery(companion_store, logger=print)
+    companion_discovery = CompanionDiscovery(
+        companion_store,
+        port=companion_store.discovery_port,
+        logger=print,
+    )
 
     def companion_status() -> dict:
         payload = companion.status_payload()
         payload["ports"] = build_port_statuses(
             admin_port=ADMIN_PORT,
             companion_port=int(payload.get("port") or companion.store.port),
+            discovery_port=int(
+                payload.get("discovery_port") or companion_store.discovery_port
+            ),
             companion_enabled=bool(payload.get("enabled")),
             companion_running=companion.running,
             discovery_running=companion_discovery.running,
@@ -243,25 +295,14 @@ def main(argv: list[str] | None = None) -> int:
             companion_service.stop()
 
     def companion_action(payload: dict) -> dict:
-        action = str(payload.get("action") or "")
-        if action == "new_code":
-            return {
-                "pairing": companion_store.pairing_code(regenerate=True),
-                "companion": companion.status_payload(),
-            }
-        if action == "remove_phone":
-            removed = companion_store.remove_phone(str(payload.get("phone_id") or ""))
-            return {"removed": removed, "companion": companion.status_payload()}
-        if action == "set_port":
-            companion.set_port(payload.get("port"))
-            return {"companion": companion_status()}
-        if "enabled" in payload:
-            value = payload.get("enabled")
-            if not isinstance(value, bool):
-                raise ValueError("enabled")
-            companion_set_enabled(value)
-            return {"companion": companion.status_payload()}
-        raise ValueError("action")
+        return _apply_companion_action(
+            payload,
+            companion=companion,
+            discovery=companion_discovery,
+            store=companion_store,
+            status=companion_status,
+            set_enabled=companion_set_enabled,
+        )
 
     def publish_codex(records: list) -> None:
         codex_state.record_snapshot()

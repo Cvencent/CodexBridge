@@ -45,7 +45,7 @@ HTTP API。
 | 设备会话 | TCP | `8765` | CodexBridge 主动连接设备 |
 | CodexBridge 本机管理 | HTTP | `127.0.0.1:8788` | 本机浏览器或本机程序 |
 | Dotii 管理中心 | HTTP | `127.0.0.1:8787` | 本机浏览器；设备端仅访问其快照接口 |
-| 手机发现 | UDP | `8766` | 手机广播，CodexBridge 应答 |
+| 手机发现 | UDP | `8766`（可在管理页修改） | 手机广播，CodexBridge 应答 |
 | 手机伴侣 API | HTTP + SSE | `TCP 8791`（可在管理页修改） | 已配对手机 |
 
 设备 TCP 会话使用 UTF-8 JSON，每条消息一行，以 `\n` 分隔。设备是 TCP 服务端，
@@ -743,13 +743,15 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.9","port":8791,"discovery_port":8766,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.10","port":8791,"discovery_port":8766,"requires_pairing":true}
 ```
 
-默认端口为 `8791`，并在管理页面显示每个端口的健康状态。`8790` 由本机其他
-程序保留，CodexBridge 不接受配置或回退到该端口；旧版本保存的 `8790` 会在升级后
-自动迁移为 `8791`，配对令牌保持不变。修改端口时，新端口先完成监听才会释放旧
-端口；目标端口无效或被占用时继续使用原端口。
+默认连接端口为 `8791`，默认发现端口为 `8766`，并在管理页面显示每个端口的健康状态。
+手机连接端口和手机发现端口都可以在电脑端修改；修改发现端口后，手机端“扫描端口”
+必须填写同一个值。`8764` 和 `8765` 是设备固件定义的固定端口。`8790` 由本机其他程序
+保留，CodexBridge 不接受配置或回退到该端口；旧版本保存的 `8790` 会在升级后自动迁移为
+`8791`，配对令牌保持不变。修改端口时，新端口先完成监听才会释放旧端口；目标端口无效
+或被占用时继续使用原端口。
 
 ### 17.1 配对与鉴权
 
@@ -798,6 +800,6 @@ SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_star
 ### 17.4 本机管理
 
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
-- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","port":8791}`。
+- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8791}` 和 `{"action":"set_port","kind":"discovery","port":8766}`。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 ```

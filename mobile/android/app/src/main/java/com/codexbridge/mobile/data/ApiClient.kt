@@ -208,6 +208,7 @@ class ApiClient(
 
     companion object {
         const val DEFAULT_PORT = 8791
+        const val DEFAULT_DISCOVERY_PORT = 8766
         private const val LEGACY_DEFAULT_PORT = 8790
 
         fun migrateStoredBase(value: String): String {

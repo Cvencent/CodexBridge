@@ -20,6 +20,11 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn('action: "set_port"', SETTINGS_HTML)
         self.assertIn("8790 已保留", SETTINGS_HTML)
 
+    def test_port_rows_have_stable_edit_actions_and_fixed_state_text(self):
+        self.assertIn("port-actions-cell", SETTINGS_HTML)
+        self.assertIn('fixed: "设备定义"', SETTINGS_HTML)
+        self.assertIn("save.addEventListener", SETTINGS_HTML)
+
     def test_page_has_device_and_speech_sections(self):
         self.assertIn("设备", SETTINGS_HTML)
         self.assertIn("语音识别", SETTINGS_HTML)

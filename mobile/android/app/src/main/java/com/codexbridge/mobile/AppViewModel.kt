@@ -62,6 +62,7 @@ data class UiState(
     val truncated: Boolean = false,
     val discovered: List<DiscoveredBridge> = emptyList(),
     val discovering: Boolean = false,
+    val discoveryPort: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
 ) {
     val modelLabel: String
         get() = models.firstOrNull { it.slug == selectedModel || it.id == selectedModel }?.label
@@ -93,6 +94,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 selectedEffort = settings.selectedEffort,
                 selectedCwd = settings.selectedCwd,
                 darkTheme = settings.darkTheme,
+                discoveryPort = settings.discoveryPort,
             )
         }
         if (paired) {
@@ -106,7 +108,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (_state.value.discovering) return
         _state.update { it.copy(discovering = true, error = null) }
         viewModelScope.launch {
-            val found = Discovery.discover()
+            val found = Discovery.discover(_state.value.discoveryPort)
             _state.update {
                 it.copy(
                     discovered = found,
@@ -479,6 +481,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setDarkTheme(enabled: Boolean) {
         settings.darkTheme = enabled
         _state.update { it.copy(darkTheme = enabled) }
+    }
+
+    fun setDiscoveryPort(port: Int) {
+        if (port !in 1..65535) return
+        settings.discoveryPort = port
+        _state.update { it.copy(discoveryPort = port) }
     }
 
     fun dismissError() {

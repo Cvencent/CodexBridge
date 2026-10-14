@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_PORT = 8791
+DEFAULT_DISCOVERY_PORT = 8766
 LEGACY_PORT = 8790
 PAIRING_CODE_TTL_SECONDS = 10 * 60
 PAIRING_MAX_ATTEMPTS = 5
@@ -54,9 +55,15 @@ class PhoneRecord:
 class CompanionStore:
     """Thread-safe pairing store persisted next to the device registry."""
 
-    def __init__(self, path: Path | None, port: int = DEFAULT_PORT) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        port: int = DEFAULT_PORT,
+        discovery_port: int = DEFAULT_DISCOVERY_PORT,
+    ) -> None:
         self.path = Path(path) if path is not None else None
         self.port = DEFAULT_PORT if port == LEGACY_PORT else port
+        self.discovery_port = discovery_port
         self.enabled = True
         self.phones: dict[str, PhoneRecord] = {}
         self._code = ""
@@ -95,6 +102,10 @@ class CompanionStore:
                 migrated = True
             else:
                 self.port = port
+
+        discovery_port = payload.get("discovery_port")
+        if isinstance(discovery_port, int) and 1 <= discovery_port <= 65535:
+            self.discovery_port = discovery_port
 
         phones = payload.get("phones")
         refreshed: dict[str, PhoneRecord] = {}
@@ -175,6 +186,7 @@ class CompanionStore:
                 "version": 1,
                 "enabled": self.enabled,
                 "port": self.port,
+                "discovery_port": self.discovery_port,
                 "phones": [
                     {
                         "phone_id": record.phone_id,
@@ -218,6 +230,16 @@ class CompanionStore:
             self.port = port
             self.save()
 
+    def set_discovery_port(self, port: int) -> None:
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("port")
+        if port == LEGACY_PORT:
+            raise ValueError("port_reserved")
+        with self._lock:
+            self._reload_locked()
+            self.discovery_port = port
+            self.save()
+
     def snapshot(self) -> dict:
         with self._lock:
             # The management page can be opened by a process that started
@@ -228,6 +250,7 @@ class CompanionStore:
             return {
                 "enabled": self.enabled,
                 "port": self.port,
+                "discovery_port": self.discovery_port,
                 "phones": [record.public() for record in self.phones.values()],
                 "pairing_expires_at": self._code_expires_at if self.enabled else 0,
             }

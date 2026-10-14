@@ -7,6 +7,7 @@ from unittest.mock import patch
 from codexbridge.codex.app_server import AppServerError
 from codexbridge.__main__ import (
     _CodexSourceHolder,
+    _apply_companion_action,
     _launch_restarted_process,
     _restart_command,
 )
@@ -82,3 +83,44 @@ class CodexSourceHolderTest(unittest.TestCase):
             {"source": "fallback"},
         )
         self.assertEqual(client.calls, [("project/list", {"limit": 100})])
+
+
+class CompanionActionTest(unittest.TestCase):
+    def test_discovery_port_action_rebinds_udp_and_returns_fresh_status(self):
+        class Companion:
+            def __init__(self):
+                self.calls = []
+
+            def set_port(self, port):
+                self.calls.append(port)
+
+        class Discovery:
+            def __init__(self):
+                self.calls = []
+
+            def set_port(self, port):
+                self.calls.append(port)
+
+        class Store:
+            def __init__(self):
+                self.calls = []
+
+            def set_discovery_port(self, port):
+                self.calls.append(port)
+
+        companion = Companion()
+        discovery = Discovery()
+        store = Store()
+        status = {"port": 8791, "discovery_port": 18791, "ports": []}
+
+        result = _apply_companion_action(
+            {"action": "set_port", "kind": "discovery", "port": 18791},
+            companion=companion,
+            discovery=discovery,
+            store=store,
+            status=lambda: status,
+        )
+
+        self.assertEqual(discovery.calls, [18791])
+        self.assertEqual(companion.calls, [])
+        self.assertEqual(result, {"companion": status})

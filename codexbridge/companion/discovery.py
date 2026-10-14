@@ -26,11 +26,48 @@ class CompanionDiscovery:
     ) -> None:
         self.store = store
         self.host = host
-        self.port = port
+        self.port = int(port if port is not None else store.discovery_port)
         self._logger = logger
         self._stop = threading.Event()
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+
+    def set_port(self, port: int) -> None:
+        """Switch the UDP listener to an exact port, preserving the old one on failure."""
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError("port_invalid")
+        with self._lock:
+            if port == self.port and self._socket is not None:
+                self.store.set_discovery_port(port)
+                return
+            previous = (self.port, self._socket, self._thread)
+            was_running = self._thread is not None
+            if was_running:
+                self.stop()
+            self.port = port
+            self._stop = threading.Event()
+            probe = self._bind()
+            if probe is None:
+                self.port, self._socket, self._thread = previous
+                if was_running:
+                    self._stop = threading.Event()
+                    self._thread = threading.Thread(
+                        target=self._loop,
+                        name="companion-discovery",
+                        daemon=True,
+                    )
+                    self._thread.start()
+                raise OSError("port_in_use")
+            self._socket = probe
+            self.store.set_discovery_port(port)
+            self._thread = threading.Thread(
+                target=self._serve,
+                args=(probe,),
+                name="companion-discovery",
+                daemon=True,
+            )
+            self._thread.start()
 
     def start(self) -> None:
         if self._thread is not None:

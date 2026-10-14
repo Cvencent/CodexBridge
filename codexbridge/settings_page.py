@@ -356,7 +356,7 @@ SETTINGS_HTML = r'''<!doctype html>
     .port-list { display: grid; gap: 8px; margin-top: 8px; }
     .port-row {
       display: grid;
-      grid-template-columns: minmax(120px, 1fr) auto auto;
+      grid-template-columns: minmax(140px, 1fr) minmax(96px, 120px) minmax(96px, auto);
       align-items: center;
       gap: 12px;
       padding: 10px 12px;
@@ -367,6 +367,9 @@ SETTINGS_HTML = r'''<!doctype html>
     .port-row strong { display: block; font-size: 14px; }
     .port-row p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
     .port-number { font-family: Consolas, "Courier New", monospace; font-weight: 700; }
+    .port-edit { width: 100%; min-height: 36px; padding: 6px 8px; border: 1px solid var(--border-strong); border-radius: 6px; font-family: Consolas, "Courier New", monospace; font-weight: 700; }
+    .port-row .button { min-height: 36px; padding: 6px 10px; }
+    .port-actions-cell { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
     .port-state {
       padding: 3px 8px;
       border-radius: 999px;
@@ -1078,7 +1081,8 @@ SETTINGS_HTML = r'''<!doctype html>
         active: "正常",
         error: "异常",
         disabled: "已关闭",
-        reserved: "已保留"
+        reserved: "已保留",
+        fixed: "设备定义"
       })[state] || state || "未知";
     }
 
@@ -1102,16 +1106,39 @@ SETTINGS_HTML = r'''<!doctype html>
         detail.textContent = `${item.protocol} · ${item.purpose || ""}`;
         info.appendChild(title);
         info.appendChild(detail);
-        const number = document.createElement("span");
-        number.className = "port-number";
-        number.textContent = String(item.port || "--");
+        let number;
+        if (item.editable) {
+          number = document.createElement("input");
+          number.className = "port-edit";
+          number.type = "number";
+          number.min = "1";
+          number.max = "65535";
+          number.inputMode = "numeric";
+          number.value = String(item.port || "");
+          number.setAttribute("aria-label", `${item.label || item.key}端口`);
+        } else {
+          number = document.createElement("span");
+          number.className = "port-number";
+          number.textContent = String(item.port || "--");
+        }
         const state = document.createElement("span");
         state.className = "port-state";
         state.dataset.state = item.state || "";
-        state.textContent = item.key === "reserved" ? "8790 已保留" : portStateText(item.state);
+        state.textContent = portStateText(item.state);
+        const actions = document.createElement("div");
+        actions.className = "port-actions-cell";
         row.appendChild(info);
         row.appendChild(number);
-        row.appendChild(state);
+        if (item.editable) {
+          const save = document.createElement("button");
+          save.className = "button";
+          save.type = "button";
+          save.textContent = "保存";
+          save.addEventListener("click", () => saveCompanionPort(item.key, number, save));
+          actions.appendChild(save);
+        }
+        actions.appendChild(state);
+        row.appendChild(actions);
         list.appendChild(row);
       });
     }
@@ -1188,9 +1215,9 @@ SETTINGS_HTML = r'''<!doctype html>
       }
     }
 
-    async function saveCompanionPort() {
-      const button = $("#companion-save-port");
-      const input = $("#companion-port");
+    async function saveCompanionPort(kind = "companion", input = null, button = null) {
+      input = input || $("#companion-port");
+      button = button || $("#companion-save-port");
       const port = Number(input.value);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
         setMessage($("#companion-message"), "端口必须是 1 到 65535 之间的整数。", "error");
@@ -1206,13 +1233,14 @@ SETTINGS_HTML = r'''<!doctype html>
         const payload = await requestJson("/api/admin/companion", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({action: "set_port", port})
+          body: JSON.stringify({action: "set_port", kind, port})
         });
         const companion = payload.companion || {};
         $("#companion-port").value = companion.port || port;
         $("#companion-addresses").textContent = (companion.urls || []).join(" · ") || "未检测到局域网地址";
         renderCompanionPorts(companion.ports || []);
-        setMessage($("#companion-message"), `手机连接端口已切换为 ${companion.port || port}。`, "success");
+        const label = kind === "discovery" ? "手机发现端口" : "手机连接端口";
+        setMessage($("#companion-message"), `${label}已切换为 ${port}。`, "success");
       } catch (error) {
         setMessage($("#companion-message"), `切换失败：${error.message}。原端口仍保持可用。`, "error");
       } finally {
@@ -1222,7 +1250,7 @@ SETTINGS_HTML = r'''<!doctype html>
 
     $("#companion-enabled").addEventListener("change", saveCompanionEnabled);
     $("#companion-new-code").addEventListener("click", newCompanionCode);
-    $("#companion-save-port").addEventListener("click", saveCompanionPort);
+    $("#companion-save-port").addEventListener("click", () => saveCompanionPort("companion"));
     $("#companion-refresh-ports").addEventListener("click", loadCompanion);
 
     loadStatus();

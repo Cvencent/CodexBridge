@@ -106,8 +106,18 @@ class CompanionApi:
         requested = validate_companion_port(port)
         with self._lifecycle_lock:
             if self._server is None:
+                server = _CompanionServer((self.host, requested), _CompanionHandler)
+                server.app = self
+                thread = threading.Thread(
+                    target=server.serve_forever,
+                    name="companion-api",
+                    daemon=True,
+                )
+                self._server = server
+                self._thread = thread
                 self.port = requested
                 self.store.set_port(requested)
+                thread.start()
                 return requested
             if requested == self.port:
                 self.store.set_port(requested)
@@ -155,6 +165,7 @@ class CompanionApi:
         return {
             "enabled": bool(snapshot.get("enabled")),
             "port": snapshot.get("port"),
+            "discovery_port": snapshot.get("discovery_port"),
             "host": self.host,
             "urls": [f"http://{address}:{snapshot.get('port')}" for address in addresses],
             "phones": snapshot.get("phones") or [],
@@ -262,7 +273,7 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     "version": VERSION,
                     "requires_pairing": True,
                     "port": self.app.store.port,
-                    "discovery_port": 8766,
+                    "discovery_port": self.app.store.discovery_port,
                 },
             )
             return

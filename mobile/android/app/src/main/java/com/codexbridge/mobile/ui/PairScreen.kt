@@ -42,10 +42,12 @@ import com.codexbridge.mobile.UiState
 fun PairScreen(
     state: UiState,
     onDiscover: () -> Unit,
+    onDiscoveryPort: (Int) -> Unit,
     onPair: (String, String) -> Unit,
 ) {
     var host by remember { mutableStateOf(state.baseUrl.ifBlank { "" }) }
     var code by remember { mutableStateOf("") }
+    var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -88,6 +90,19 @@ fun PairScreen(
                         Text("扫描")
                     }
                 }
+                OutlinedTextField(
+                    value = discoveryPort,
+                    onValueChange = { value ->
+                        val digits = value.filter { it.isDigit() }.take(5)
+                        discoveryPort = digits
+                        digits.toIntOrNull()?.let(onDiscoveryPort)
+                    },
+                    label = { Text("扫描端口") },
+                    supportingText = { Text("电脑端改过手机发现端口时，这里要填相同值。") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 if (state.discovered.isEmpty()) {
                     Text(
                         text = "电脑端打开 CodexBridge 后即可被扫描到。",

@@ -16,6 +16,73 @@ from codexbridge.companion.store import CompanionStore
 
 
 class CompanionDiscoveryTests(unittest.TestCase):
+    def _find_free_udp_port(self) -> int:
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        holder.close()
+        return port
+
+    def _query(self, port: int):
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(0.4)
+        try:
+            client.sendto(DISCOVERY_REQUEST, ("127.0.0.1", port))
+            try:
+                return client.recvfrom(1024)[0]
+            except (socket.timeout, ConnectionResetError, OSError):
+                return None
+        finally:
+            client.close()
+
+    def test_set_port_rebinds_the_udp_listener_and_persists_it(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "companion.json"
+        store = CompanionStore(path)
+        store.load()
+        discovery = CompanionDiscovery(store, host="127.0.0.1", port=self._find_free_udp_port())
+        discovery.start()
+        time.sleep(0.1)
+        target = self._find_free_udp_port()
+        try:
+            discovery.set_port(target)
+            deadline = time.monotonic() + 2.0
+            reply = None
+            while time.monotonic() < deadline:
+                reply = self._query(target)
+                if reply is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(reply)
+            self.assertEqual(store.snapshot()["discovery_port"], target)
+        finally:
+            discovery.stop()
+
+    def test_set_port_failure_keeps_the_old_listener_and_config(self) -> None:
+        path = Path(tempfile.mkdtemp()) / "companion.json"
+        store = CompanionStore(path)
+        store.load()
+        original = self._find_free_udp_port()
+        store.set_discovery_port(original)
+        discovery = CompanionDiscovery(store, host="127.0.0.1", port=original)
+        discovery.start()
+        time.sleep(0.1)
+
+        try:
+            with patch.object(discovery, "_bind", return_value=None):
+                with self.assertRaises(OSError):
+                    discovery.set_port(self._find_free_udp_port())
+            self.assertEqual(store.snapshot()["discovery_port"], original)
+            deadline = time.monotonic() + 2.0
+            reply = None
+            while time.monotonic() < deadline:
+                reply = self._query(original)
+                if reply is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(reply)
+        finally:
+            discovery.stop()
+
     def test_bind_retries_after_address_is_in_use(self) -> None:
         holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

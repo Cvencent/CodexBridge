@@ -31,12 +31,14 @@ data class DiscoveredBridge(
 }
 
 object Discovery {
-    private const val DISCOVERY_PORT = 8766
     private const val TIMEOUT_MS = 3500L
     private val requestBytes = "CODEXBRIDGE_COMPANION_DISCOVER".toByteArray(Charsets.UTF_8)
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
-    suspend fun discover(timeoutMs: Long = TIMEOUT_MS): List<DiscoveredBridge> =
+    suspend fun discover(
+        discoveryPort: Int = ApiClient.DEFAULT_DISCOVERY_PORT,
+        timeoutMs: Long = TIMEOUT_MS,
+    ): List<DiscoveredBridge> =
         withContext(Dispatchers.IO) {
             val socket = DatagramSocket()
             try {
@@ -57,7 +59,7 @@ object Discovery {
                                         requestBytes,
                                         requestBytes.size,
                                         InetAddress.getByName(target),
-                                        DISCOVERY_PORT,
+                                        discoveryPort,
                                     ),
                                 )
                             }

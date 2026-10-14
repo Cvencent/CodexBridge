@@ -41,8 +41,9 @@ CodexBridge 内置手机伴侣接口：同一局域网内的手机在管理页�
 `127.0.0.1:8788/settings` 生成配对码后，即可查看线程、读取消息、远程发送任务、
 切换模型并处理审批。
 
-- 手机端通过 UDP `8766` 自动发现电脑，也可以手动填写 `http://<电脑 IP>:8791`。
-- 设置页会显示各端口的健康状态，并可修改手机连接端口；`8790` 已保留，不会使用。
+- 手机端默认通过 UDP `8766` 自动发现电脑，也可以手动填写 `http://<电脑 IP>:8791`。
+- 设置页会显示各端口的健康状态，并可修改手机连接端口和手机发现端口；如果在电脑端改了发现端口，手机端的“扫描端口”也要改成同一个值。
+- `8764` 和 `8765` 是设备固件定义的固定端口；`8790` 已保留，不会使用。
 - 伴侣接口默认开启，可在管理页面关闭；配对令牌只保存在手机与电脑本机。
 - 接口细节见 [PROTOCOL.md](PROTOCOL.md) 第 17 节。
 
@@ -50,7 +51,7 @@ Android 手机端应用源码与成品 APK 位于本仓库 [mobile/](mobile/READ
 
 ``text
 mobile/android/    Kotlin + Jetpack Compose 工程
-mobile/release/    CodexBridgeMobile-0.2.3-release.apk 及校验文件
+mobile/release/    CodexBridgeMobile-0.2.4-release.apk 及校验文件
 ``
 
 ## Development
@@ -73,14 +74,14 @@ or set `CODEXBRIDGE_VOSK_MODEL` to the model directory.
 Download the Windows installer from the GitHub Releases page:
 
 ```text
-CodexBridge-Setup-1.3.9-win64.exe
+CodexBridge-Setup-1.3.10-win64.exe
 ```
 
 A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 1.3.9
+./packaging/build_windows.ps1 -Version 1.3.10
 ```
 
 `CodexBridge.exe` stays in the system tray and only handles the Codex side:
