@@ -17,6 +17,7 @@ from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
     _resolve_codex_command,
+    _turn_error,
     account_snapshot,
     thread_snapshot,
 )
@@ -246,6 +247,10 @@ class CompanionService:
         # Reverse map (hidden fork id -> phone-visible thread id) so reads and
         # events stay attached to the thread the phone actually opened.
         self._fork_origin: dict[str, str] = {}
+        # The fork inherits the original title, which we then overwrite with a
+        # "手机继续 · …" label. Remember the original so the phone keeps showing
+        # the task name the user opened.
+        self._fork_titles: dict[str, str] = {}
         self._resumed_lock = threading.Lock()
         self._load_fork_map()
         self._sessions_root = (
@@ -427,7 +432,42 @@ class CompanionService:
             self._forked_threads[thread_id] = forked_id
             self._fork_origin[forked_id] = thread_id
         self._save_fork_map()
+        label, origin_title = self._label_fork(forked_id, thread)
+        if origin_title:
+            with self._resumed_lock:
+                self._fork_titles[thread_id] = origin_title
+            self._save_fork_map()
+        self.publish(
+            {
+                "type": "thread_forked",
+                "thread_id": thread_id,
+                "continued_as": forked_id,
+                "title": label,
+            }
+        )
         return forked_id
+
+    def _label_fork(self, forked_id: str, forked: Any) -> tuple[str, str]:
+        """Name a continuation fork so it is identifiable in the desktop app.
+
+        The desktop owns the original thread's writer lock, so the phone reply
+        lands in a fork that would otherwise look like an unnamed duplicate of
+        the same task. Give it a distinct name; failure here is cosmetic.
+
+        ``forked`` is the thread object ``thread/fork`` returned. It still
+        carries the name inherited from the original thread, which we return as
+        ``origin_title`` so the phone list keeps showing the task the user
+        opened.
+        """
+        base = ""
+        if isinstance(forked, dict):
+            base = str(forked.get("name") or forked.get("preview") or "").strip()
+        label = _clip(f"手机继续 · {base}".strip() if base else "手机继续 · CodexBridge", 120)
+        try:
+            self._ensure_client().request("thread/name/set", {"threadId": forked_id, "name": label})
+        except AppServerError:
+            return "", base
+        return label, base
 
     def _fork_map_path(self) -> Path:
         return self.data_dir / "fork-map.json"
@@ -447,10 +487,19 @@ class CompanionService:
                 continue
             self._forked_threads[origin] = fork
             self._fork_origin[fork] = origin
+        titles = payload.get("titles")
+        if isinstance(titles, dict):
+            for origin, title in titles.items():
+                if isinstance(origin, str) and isinstance(title, str) and origin and title:
+                    self._fork_titles[origin] = title
 
     def _save_fork_map(self) -> None:
         with self._resumed_lock:
-            payload = {"version": 1, "forks": dict(self._forked_threads)}
+            payload = {
+                "version": 1,
+                "forks": dict(self._forked_threads),
+                "titles": dict(self._fork_titles),
+            }
         try:
             self._fork_map_path().parent.mkdir(parents=True, exist_ok=True)
             temporary = self._fork_map_path().with_suffix(".json.tmp")
@@ -462,6 +511,14 @@ class CompanionService:
     def _fork_for(self, thread_id: str) -> str:
         with self._resumed_lock:
             return self._forked_threads.get(str(thread_id or ""), "")
+
+    def _original_title(self, thread_id: str) -> str:
+        with self._resumed_lock:
+            return self._fork_titles.get(str(thread_id or ""), "")
+
+    def _is_fork_id(self, thread_id: str) -> bool:
+        with self._resumed_lock:
+            return str(thread_id or "") in self._fork_origin
 
     def visible_thread_id(self, thread_id: str) -> str:
         """Map a hidden fork id back to the thread the phone opened."""
@@ -783,6 +840,7 @@ class CompanionService:
                 "status": "completed" if status == "completed" else "failed",
                 "duration_ms": turn.get("durationMs"),
                 "completed_at": completed_at,
+                "error_message": _turn_error(turn),
                 "read": bool(
                     thread_id
                     and completed_at > 0
@@ -798,9 +856,14 @@ class CompanionService:
                 "active_flags": [str(flag) for flag in status.get("activeFlags") or []],
             }
         if method == "thread/name/updated":
+            raw_id = str(params.get("threadId") or "")
+            # Relabelling a hidden continuation fork must not rename the task
+            # the phone is showing.
+            if self._is_fork_id(raw_id):
+                return None
             return {
                 "type": "thread_name",
-                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
+                "thread_id": self.visible_thread_id(raw_id),
                 "title": str(params.get("name") or ""),
             }
         if method == "thread/tokenUsage/updated":
@@ -907,6 +970,11 @@ class CompanionService:
             seen.add(visible_id)
             summary = self._summary(row)
             summary["thread_id"] = visible_id
+            # The hidden fork was renamed for the desktop's benefit; keep the
+            # phone row showing the task the user actually opened.
+            original = self._original_title(visible_id)
+            if original:
+                summary["title"] = original
             threads.append(summary)
         for index, summary in enumerate(threads):
             if index >= LOG_SCAN_LIMIT:
@@ -961,6 +1029,7 @@ class CompanionService:
             "completed_at": _epoch(latest_turn.get("completedAt")),
             "tokens": int(_as_number(total.get("totalTokens")) or 0),
             "ephemeral": bool(row.get("ephemeral")),
+            "error_message": _turn_error(latest_turn),
         }
     def read_thread(
         self,
@@ -999,6 +1068,9 @@ class CompanionService:
         trimmed = messages[-max(1, int(message_limit)):]
         summary = self._summary(thread)
         summary["thread_id"] = thread_id
+        original = self._original_title(thread_id)
+        if original:
+            summary["title"] = original
         task = thread_snapshot(thread)
         task["thread_id"] = thread_id
         if live_status:
@@ -1016,6 +1088,7 @@ class CompanionService:
             "thread": summary,
             "task": task,
             "messages": trimmed,
+            "continued_as": self._fork_for(thread_id),
             "message_count": total,
             "truncated": total > len(trimmed),
             "pending_approvals": [

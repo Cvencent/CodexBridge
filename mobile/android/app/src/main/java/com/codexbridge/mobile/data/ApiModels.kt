@@ -86,6 +86,7 @@ data class ThreadSummary(
     val completed_at: Long = 0,
     val tokens: Long = 0,
     val ephemeral: Boolean = false,
+    val error_message: String = "",
 )
 
 @Serializable
@@ -155,6 +156,7 @@ data class TaskSnapshot(
     val started_at_epoch: Long = 0,
     val last_updated_epoch: Long = 0,
     val completed_at_epoch: Long = 0,
+    @SerialName("error_message") val errorMessage: String = "",
 ) {
     val isWorking: Boolean get() = status == "working" || status == "waiting_user"
 }
@@ -204,6 +206,7 @@ data class ThreadDetailResponse(
     val messages: List<MessageItem> = emptyList(),
     val message_count: Int = 0,
     val truncated: Boolean = false,
+    val continued_as: String = "",
     val pending_approvals: List<ApprovalRequest> = emptyList(),
 )
 
@@ -269,6 +272,8 @@ data class StreamEvent(
     val context_window: Long = 0,
     val duration_ms: Long? = null,
     val active_flags: List<String> = emptyList(),
+    val continued_as: String = "",
+    val error_message: String = "",
     val item: MessageItem? = null,
     // Approval payload fields.
     val kind: String = "",

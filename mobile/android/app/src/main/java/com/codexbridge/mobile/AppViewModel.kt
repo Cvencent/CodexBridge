@@ -44,8 +44,12 @@ data class UiState(
     val paired: Boolean = false,
     val connected: Boolean = false,
     val busy: Boolean = false,
-    // Drives the "sync in progress" indicator on the task list.
+    // True while any task-list request is in flight. The list keeps this
+    // mounted so the layout never jumps.
     val refreshing: Boolean = false,
+    // True only for a refresh the user asked for, which is the only case that
+    // shows a spinner. The 2s background poll would otherwise blink.
+    val manualRefreshing: Boolean = false,
     val lastRefreshedAt: Long = 0,
     val error: String? = null,
     val notice: String? = null,
@@ -56,6 +60,9 @@ data class UiState(
     val selectedEffort: String = "",
     val selectedCwd: String = "",
     val activeThread: ThreadSummary? = null,
+    // Non-empty when replies to this task continue in a hidden copy because the
+    // desktop currently holds the original thread.
+    val continuedAs: String = "",
     val messages: List<MessageItem> = emptyList(),
     val streaming: Map<String, String> = emptyMap(),
     val approvals: List<ApprovalRequest> = emptyList(),
@@ -211,6 +218,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // -------------------------------------------------------------- refresh
     fun refresh() {
         val client = api ?: return
+        _state.update { it.copy(manualRefreshing = true) }
         refreshThreadsNow()
         viewModelScope.launch {
             try {
@@ -246,6 +254,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshThreadsNow() {
+        // Called on resume and when leaving a chat: refresh quietly so the
+        // spinner only appears when the user actually taps 刷新.
         viewModelScope.launch { refreshThreads() }
     }
 
@@ -273,12 +283,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         threads = visible,
                         connected = true,
                         refreshing = false,
+                        manualRefreshing = false,
                         lastRefreshedAt = System.currentTimeMillis(),
                     )
                 }
             }
             .onFailure {
-                _state.update { it.copy(refreshing = false) }
+                _state.update { it.copy(refreshing = false, manualRefreshing = false) }
             }
     }
 
@@ -385,6 +396,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         },
                         messages = detail.messages,
                         task = visibleTask,
+                        continuedAs = detail.continued_as,
                         approvals = detail.pending_approvals,
                         working = status in ACTIVE_TASK_STATUSES,
                         messageCount = detail.message_count,
@@ -406,7 +418,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         pollJob?.cancel()
         pollJob = null
         _state.update {
-            it.copy(screen = AppScreen.Threads, activeThread = null, messages = emptyList(), streaming = emptyMap())
+            it.copy(
+                screen = AppScreen.Threads,
+                activeThread = null,
+                continuedAs = "",
+                messages = emptyList(),
+                streaming = emptyMap(),
+            )
         }
         refreshThreadsNow()
     }
@@ -441,6 +459,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             },
                             messages = detail.messages,
                             task = detail.task.copy(status = status),
+                            continuedAs = detail.continued_as,
                             approvals = detail.pending_approvals,
                             working = status in ACTIVE_TASK_STATUSES,
                             messageCount = detail.message_count,
@@ -481,9 +500,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 if (response.continued_as.isNotBlank() && response.continued_as != threadId) {
                     // The desktop was using the original thread, so this reply
                     // continued in a forked copy that shares its history.
-                    _state.update {
-                        it.copy(notice = "该任务正在电脑端使用，已在同历史的副本中继续")
-                    }
+                    _state.update { it.copy(continuedAs = response.continued_as) }
                 }
             } catch (error: Exception) {
                 _state.update { it.copy(messages = it.messages.filterNot { item -> item.id == local.id }) }
@@ -622,6 +639,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             "turn_started" -> _state.update { it.copy(working = true) }
+            "thread_forked" -> {
+                val threadId = event.thread_id
+                _state.update { state ->
+                    state.copy(
+                        continuedAs = if (threadId.isBlank() || state.activeThread?.thread_id == threadId) {
+                            event.continued_as
+                        } else {
+                            state.continuedAs
+                        },
+                    )
+                }
+            }
             "turn_completed" -> {
                 val threadId = event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
                 val completionStatus = if (event.status == "failed") "failed" else "completed"
@@ -655,7 +684,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         },
                         task = if (state.activeThread?.thread_id == threadId) {
-                            state.task.copy(status = visibleStatus)
+                            state.task.copy(status = visibleStatus, errorMessage = event.error_message)
                         } else {
                             state.task
                         },
@@ -679,6 +708,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                         },
                                         messages = detail.messages,
                                         task = visibleTask,
+                                        continuedAs = detail.continued_as,
                                         approvals = detail.pending_approvals,
                                         working = status in ACTIVE_TASK_STATUSES,
                                         messageCount = detail.message_count,

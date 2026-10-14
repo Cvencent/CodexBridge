@@ -746,7 +746,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.14","port":8568,"discovery_port":8569,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.15","port":8568,"discovery_port":8569,"requires_pairing":true}
 ```
 
 默认连接端口为 `8568`，默认发现端口为 `8569`，并在管理页面显示每个端口的健康状态。
@@ -798,8 +798,8 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 
 SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
 `turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
-`token_usage`、`thread_status`、`thread_name`、`rate_limits`、`approval_request`、
-`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳与 `read` 布尔值；手机端应使用它们判断完成先后、给状态栏提醒去重，并在 `read=true` 时不再提醒。审批请求超过 `600` 秒未处理会在电脑端失效。
+`token_usage`、`thread_status`、`thread_name`、`thread_forked`、`rate_limits`、
+`approval_request`、`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳、`read` 布尔值与 `error_message`（失败原因，成功时为空字符串）；手机端应使用前两者判断完成先后、给状态栏提醒去重，并在 `read=true` 时不再提醒，失败时直接展示 `error_message`。审批请求超过 `600` 秒未处理会在电脑端失效。
 
 完成与失败的提醒在多台客户端之间保持一致：`completed`/`failed` 的线程在任一台设备
 打开（`GET /api/companion/threads/<id>` 或 `POST /api/companion/threads/<id>/read`）后即被
@@ -818,8 +818,14 @@ app-server 对同一线程只允许一个 writer。电脑端 Codex（或另一�
   继续复用同一个 fork，不会重复分叉；进程重启后仍然复用。
 - 手机始终看到原来的线程 id 与历史：`GET /api/companion/threads/<id>`、线程列表和 SSE 事件
   都会把 fork 的事件与详情映射回源线程 id，列表不会把隐藏 fork 另列一条。
+- fork 创建后会被重命名为 `手机继续 · <原任务名>`（`thread/name/set`）。电脑端刷新任务列表后
+  能看到这条副本会话，从而知道手机在哪个会话里继续了对话。重命名失败只影响可读性，不影响
+  手机回复；`thread/name/updated` 也不会把手机端显示的原任务名改掉。
+- 新建 fork 时向所有在线客户端广播一次 `thread_forked` 事件，字段为 `thread_id`（原线程）、
+  `continued_as`（fork id）与 `title`（重命名后的名字），手机可据此立即提示。
 - `POST /api/companion/threads/<id>/messages` 的响应含 `continued_as`：为空表示在原线程直接
-  继续；不为空时是实际承接的 fork id，手机可据此提示“已在同历史的副本中继续”。
+  继续；不为空时是实际承接的 fork id。`GET /api/companion/threads/<id>` 同样返回 `continued_as`，
+  手机据此在会话页常驻提示“手机回复写入副本会话”。
 - 若 fork 也失败，返回明确的中文错误，提示先在电脑端关闭该会话后重试。
 - `mode=steer` 需带进行中的 `expectedTurnId`；当前没有进行中的对话时返回“该任务当前没有
   进行中的对话，无法追加消息”。

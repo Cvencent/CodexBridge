@@ -428,6 +428,67 @@ def _turn_usage(turn: dict[str, Any]) -> int:
     return total
 
 
+def _try_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _turn_error(turn: dict[str, Any]) -> str:
+    """Return a readable message for a failed turn, if the server reported one."""
+    error = turn.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("error") or ""
+    elif isinstance(error, str):
+        message = error
+    else:
+        message = ""
+    return _safe_line(_flatten_provider_error(str(message)), 400)
+
+
+def _flatten_provider_error(text: str) -> str:
+    """Collapse nested provider error JSON into one readable sentence.
+
+    A custom model provider can wrap its failure several layers deep, for
+    example ``{"error": {"message": "<json string>"}}``. Unwrap those layers so
+    the phone shows the upstream reason instead of raw escaped JSON.
+    """
+    raw = text.strip()
+    if not raw:
+        return ""
+    payload = _try_json(raw)
+    for _ in range(3):
+        if not isinstance(payload, dict):
+            break
+        inner = payload.get("error") if "error" in payload else payload.get("message")
+        if isinstance(inner, str):
+            parsed = _try_json(inner)
+            if parsed is None:
+                raw = inner.strip() or raw
+                payload = None
+                break
+            payload = parsed
+            continue
+        if isinstance(inner, dict):
+            payload = inner
+            continue
+        break
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("msg")
+        if isinstance(message, str) and message.strip():
+            raw = message.strip()
+    # The provider may still append its own JSON body after a plain sentence.
+    head, _, tail = raw.partition("{")
+    if tail:
+        embedded = _try_json("{" + tail)
+        if isinstance(embedded, dict):
+            detail = embedded.get("msg") or embedded.get("message")
+            if isinstance(detail, str) and detail.strip():
+                return (head + detail.strip()).strip()
+    return raw
+
+
 def _plan_counts(turn: dict[str, Any], items: list[dict[str, Any]]) -> tuple[int, int]:
     candidates: list[Any] = [turn.get("plan")]
     candidates.extend(item.get("plan") for item in items if item.get("type") == "plan")
@@ -453,6 +514,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
             "token_count": 0, "token_count_available": False,
             "plan_completed": 0, "plan_total": 0,
             "started_at_epoch": 0, "last_updated_epoch": 0,
+            "error_message": "",
         }
 
     turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
@@ -636,6 +698,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
         "started_at_epoch": started,
         "last_updated_epoch": updated,
         "completed_at_epoch": completed,
+        "error_message": _turn_error(latest_turn),
     }
 
 

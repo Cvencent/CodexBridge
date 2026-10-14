@@ -1,7 +1,9 @@
 package com.codexbridge.mobile.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -80,14 +83,18 @@ fun ThreadsScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onRefresh, enabled = !state.refreshing) {
-                        if (state.refreshing) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.width(20.dp).height(20.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                    IconButton(onClick = onRefresh, enabled = !state.manualRefreshing) {
+                        // The icon and the spinner share one fixed-size slot, so
+                        // the app bar never resizes while a sync runs.
+                        Box(modifier = Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                            if (state.manualRefreshing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(Icons.Filled.Refresh, contentDescription = "刷新")
+                            }
                         }
                     }
                     IconButton(onClick = onOpenSettings) {
@@ -114,34 +121,49 @@ fun ThreadsScreen(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // One fixed-height row carries the sync state. The background
+                // poll updates the text in place instead of mounting and
+                // unmounting a spinner, which used to make the list blink.
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().height(28.dp),
+                ) {
                     Text(
                         text = "共 ${state.threads.size} 个任务",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    if (state.refreshing) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        CircularProgressIndicator(
-                            modifier = Modifier.width(12.dp).height(12.dp),
-                            strokeWidth = 1.5.dp,
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "正在刷新…",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(modifier = Modifier.size(14.dp), contentAlignment = Alignment.Center) {
+                        if (state.manualRefreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(12.dp),
+                                strokeWidth = 1.5.dp,
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .background(
+                                        MaterialTheme.colorScheme.secondary,
+                                        RoundedCornerShape(999.dp),
+                                    ),
+                            )
+                        }
                     }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (state.manualRefreshing) "正在刷新…" else syncLabel(state.lastRefreshedAt),
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        color = if (state.manualRefreshing) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
                     Spacer(modifier = Modifier.weight(1f))
                     TextButton(onClick = onSearchSubmit) { Text("搜索") }
-                }
-                if (!state.refreshing && state.lastRefreshedAt > 0) {
-                    Text(
-                        text = "已同步 · ${syncLabel(state.lastRefreshedAt)}",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 11.sp,
-                    )
                 }
                 state.error?.let { message ->
                     Text(text = message, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
@@ -187,12 +209,13 @@ fun ThreadsScreen(
 }
 
 private fun syncLabel(millis: Long): String {
+    if (millis <= 0) return "等待同步"
     val seconds = ((System.currentTimeMillis() - millis) / 1000).coerceAtLeast(0)
     return when {
-        seconds < 3 -> "刚刚"
-        seconds < 60 -> "${seconds} 秒前"
-        seconds < 3600 -> "${seconds / 60} 分钟前"
-        else -> "${seconds / 3600} 小时前"
+        seconds < 3 -> "已同步 · 刚刚"
+        seconds < 60 -> "已同步 · ${seconds} 秒前"
+        seconds < 3600 -> "已同步 · ${seconds / 60} 分钟前"
+        else -> "已同步 · ${seconds / 3600} 小时前"
     }
 }
 

@@ -297,6 +297,209 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(forks["n"], 1)
         self.assertEqual(result["continued_as"], "t1-fork")
 
+    def test_fork_is_named_so_the_desktop_can_tell_it_apart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            self.assertEqual(params["threadId"], "t1-fork")
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        names: list[dict] = []
+
+        def name_set(params):
+            names.append(params)
+            return {}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = name_set
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        self.assertEqual(len(names), 1)
+        self.assertEqual(names[0]["threadId"], "t1-fork")
+        self.assertIn("手机继续", names[0]["name"])
+        self.assertIn("桌面任务", names[0]["name"])
+
+    def test_renaming_the_fork_keeps_the_phone_task_title(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            if params["threadId"] == "t1-fork":
+                # Once renamed, the stored fork no longer carries the old name.
+                return {"thread": thread_row("t1-fork", name="手机继续 · 桌面任务")}
+            return thread_detail()
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = {}
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        listing = self.service.list_threads()
+        row = next(item for item in listing["threads"] if item["thread_id"] == "t1")
+        self.assertEqual(row["title"], "桌面任务")
+
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["thread"]["title"], "桌面任务")
+
+    def test_fork_titles_survive_restart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            if params["threadId"] == "t1-fork":
+                return {"thread": thread_row("t1-fork", name="手机继续 · 桌面任务")}
+            return thread_detail()
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = {}
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        restarted = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            detail = restarted.read_thread("t1")
+            self.assertEqual(detail["thread"]["title"], "桌面任务")
+        finally:
+            restarted.stop()
+
+    def test_fork_naming_failure_does_not_break_the_reply(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        def name_set(_params):
+            raise AppServerError("thread metadata update failed")
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/name/set"] = name_set
+
+        result = self.service.start_turn("t1", "继续这个任务")
+
+        self.assertEqual(result["continued_as"], "t1-fork")
+
+    def test_fork_publishes_thread_forked_event(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        subscriber = self.service.subscribe()
+        try:
+            self.service.start_turn("t1", "继续")
+            events = []
+            while not subscriber.empty():
+                events.append(subscriber.get_nowait())
+        finally:
+            self.service.unsubscribe(subscriber)
+
+        forked = [event for event in events if event.get("type") == "thread_forked"]
+        self.assertEqual(len(forked), 1)
+        self.assertEqual(forked[0]["thread_id"], "t1")
+        self.assertEqual(forked[0]["continued_as"], "t1-fork")
+
+    def test_read_thread_reports_continuation_fork(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "继续")
+
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["continued_as"], "t1-fork")
+
+    def test_read_thread_reports_no_continuation_for_free_thread(self) -> None:
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["continued_as"], "")
+
+    def test_thread_summary_surfaces_provider_failure_reason(self) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "[workbuddy] upstream client (http 400): "
+                    + json.dumps({"code": 11129, "msg": "invalid function call parameters"})
+                }
+            }
+        )
+        detail = thread_detail("t1")
+        detail["thread"]["turns"][0]["status"] = "failed"
+        detail["thread"]["turns"][0]["error"] = {"message": payload}
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(
+            result["thread"]["error_message"],
+            "[workbuddy] upstream client (http 400): invalid function call parameters",
+        )
+
+    def test_turn_completed_event_carries_provider_error(self) -> None:
+        payload = {
+            "threadId": "t1",
+            "turn": {
+                "id": "turn-9",
+                "status": "failed",
+                "completedAt": 1791000300,
+                "error": {"message": json.dumps({"error": {"message": "provider exploded"}})},
+            },
+        }
+
+        event = self.service._event_payload({"method": "turn/completed", "params": payload})
+
+        self.assertEqual(event["status"], "failed")
+        self.assertEqual(event["error_message"], "provider exploded")
+
+    def test_fork_rename_does_not_retitle_the_phone_thread(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "继续")
+
+        event = self.service._event_payload(
+            {"method": "thread/name/updated", "params": {"threadId": "t1-fork", "name": "手机继续 · 桌面任务"}}
+        )
+        self.assertIsNone(event)
+
     def test_start_turn_reports_locked_thread_when_fork_fails(self) -> None:
         def resume(_params):
             raise AppServerError("thread t1 already has an active writer")
