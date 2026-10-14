@@ -30,6 +30,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestNotificationPermission()
+        openThreadFromIntent(intent)
+        if (viewModel.state.value.paired) CompletionNotificationService.start(this)
         enableEdgeToEdge()
         setContent {
             val state by viewModel.state.collectAsState()
@@ -37,6 +40,33 @@ class MainActivity : ComponentActivity() {
                 AppRoot(state = state, viewModel = viewModel)
             }
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        openThreadFromIntent(intent)
+    }
+
+    private fun openThreadFromIntent(intent: android.content.Intent?) {
+        val threadId = intent?.getStringExtra(CompletionNotificationService.EXTRA_THREAD_ID).orEmpty()
+        if (threadId.isNotBlank()) viewModel.openThread(threadId)
+    }
+
+    private fun requestNotificationPermission() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                NOTIFICATION_PERMISSION_REQUEST,
+            )
+        }
+    }
+
+    companion object {
+        private const val NOTIFICATION_PERMISSION_REQUEST = 4102
     }
 }
 

@@ -43,14 +43,37 @@ class SettingsStore(context: Context) {
         get() = prefs.getBoolean("dark_theme", true)
         set(value) = prefs.edit().putBoolean("dark_theme", value).apply()
 
+    fun completionSeenAt(threadId: String): Long =
+        prefs.getLong(completionSeenKey(threadId), 0L)
+
+    fun markCompletionSeen(threadId: String, completedAt: Long) {
+        if (threadId.isBlank() || completedAt <= 0) return
+        val key = completionSeenKey(threadId)
+        if (completedAt <= prefs.getLong(key, 0L)) return
+        prefs.edit().putLong(key, completedAt).apply()
+    }
+
+    fun markNotificationSent(threadId: String, turnId: String): Boolean {
+        val key = "notified_" + completionNotificationKey(threadId, turnId)
+        if (prefs.getBoolean(key, false)) return false
+        prefs.edit().putBoolean(key, true).apply()
+        return true
+    }
+
     val isPaired: Boolean
         get() = baseUrl.isNotBlank() && token.isNotBlank()
 
     fun clearPairing() {
-        prefs.edit().remove("token").remove("phone_id").apply()
+        val editor = prefs.edit().remove("token").remove("phone_id")
+        prefs.all.keys
+            .filter { it.startsWith("completion_seen_") || it.startsWith("notified_") }
+            .forEach(editor::remove)
+        editor.apply()
     }
 
     fun clearAll() {
         prefs.edit().clear().apply()
     }
+
+    private fun completionSeenKey(threadId: String): String = "completion_seen_$threadId"
 }

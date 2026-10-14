@@ -203,6 +203,7 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(detail["messages"][0]["text"], "帮我看一下构建结果")
         self.assertEqual(detail["messages"][3]["detail"]["exit_code"], 0)
         self.assertEqual(detail["messages"][3]["detail"]["output"], "BUILD SUCCESSFUL")
+        self.assertEqual(detail["thread"]["completed_at"], 1791000100)
 
     def test_start_turn_publishes_event(self) -> None:
         target = self.service.subscribe()
@@ -216,6 +217,39 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(params["input"][0]["text"], "继续修复")
         self.assertEqual(params["model"], "gpt-5.1-codex")
 
+    def test_start_turn_uses_steer_when_active_writer_rejects_new_turn(self) -> None:
+        calls = {"start": 0, "steer": 0}
+
+        def start(_params):
+            calls["start"] += 1
+            raise AppServerError("thread already has an active writer")
+
+        def steer(_params):
+            calls["steer"] += 1
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["turn/start"] = start
+        self.client.responses["turn/steer"] = steer
+        result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(calls, {"start": 1, "steer": 1})
+
+    def test_steer_turn_falls_back_to_start_when_no_active_writer(self) -> None:
+        calls = {"start": 0, "steer": 0}
+
+        def steer(_params):
+            calls["steer"] += 1
+            raise AppServerError("no active turn to steer")
+
+        def start(_params):
+            calls["start"] += 1
+            return {"turn": {"id": "turn-3", "status": "inProgress"}}
+
+        self.client.responses["turn/steer"] = steer
+        self.client.responses["turn/start"] = start
+        result = self.service.steer_turn("t1", "换个方向")
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(calls, {"start": 1, "steer": 1})
     def test_start_turn_resumes_disk_thread_first(self) -> None:
         self.service.start_turn("t1", "继续修复", model="gpt-5.1-codex")
         methods = [method for method, _ in self.client.requests]

@@ -45,7 +45,22 @@ APPROVAL_KINDS: dict[str, str] = {
     "mcpServer/elicitation/request": "mcp",
 }
 
+# Statuses that mean a turn still owns the thread.
 ACTIVE_STATUSES = {"working", "waiting_user"}
+
+
+def _is_active_writer_error(error: BaseException) -> bool:
+    text = str(error or "").strip().lower()
+    return "active writer" in text and (
+        "already" in text or "existing" in text or "has an active writer" in text
+    )
+
+
+def _is_no_active_turn_error(error: BaseException) -> bool:
+    text = str(error or "").strip().lower()
+    if "no active turn" in text or "no active writer" in text:
+        return True
+    return "not active" in text and ("turn" in text or "writer" in text or "steer" in text)
 
 
 def _as_number(value: Any) -> float | None:
@@ -765,6 +780,7 @@ class CompanionService:
     @staticmethod
     def _summary(row: dict[str, Any]) -> dict[str, Any]:
         turns = [turn for turn in row.get("turns", []) if isinstance(turn, dict)]
+        latest_turn = turns[-1] if turns else {}
         usage = row.get("tokenUsage") if isinstance(row.get("tokenUsage"), dict) else {}
         total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
         return {
@@ -779,6 +795,7 @@ class CompanionService:
             "created_at": _epoch(row.get("createdAt")),
             "updated_at": _epoch(row.get("updatedAt") or row.get("recencyAt")),
             "recency_at": _epoch(row.get("recencyAt")),
+            "completed_at": _epoch(latest_turn.get("completedAt")),
             "tokens": int(_as_number(total.get("totalTokens")) or 0),
             "ephemeral": bool(row.get("ephemeral")),
         }
@@ -966,7 +983,19 @@ class CompanionService:
         if client_message_id:
             params["clientUserMessageId"] = str(client_message_id)[:64]
         self._ensure_thread(thread_id)
-        result = self._ensure_client().request("turn/start", params)
+        client = self._ensure_client()
+        try:
+            result = client.request("turn/start", params)
+        except AppServerError as error:
+            if not _is_active_writer_error(error):
+                raise
+            result = client.request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "input": params["input"],
+                },
+            )
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str((turn or {}).get("id") or "")
         self.publish(
@@ -987,13 +1016,23 @@ class CompanionService:
         if not content:
             raise ValueError("text")
         self._ensure_thread(thread_id)
-        result = self._ensure_client().request(
-            "turn/steer",
-            {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
-            },
-        )
+        client = self._ensure_client()
+        steer_params = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
+        }
+        try:
+            result = client.request("turn/steer", steer_params)
+        except AppServerError as error:
+            if not _is_no_active_turn_error(error):
+                raise
+            result = client.request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": steer_params["input"],
+                },
+            )
         turn = result.get("turn") if isinstance(result, dict) else None
         return {
             "thread_id": thread_id,
