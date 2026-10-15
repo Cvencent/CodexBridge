@@ -305,6 +305,12 @@ class CompanionService:
         # "手机继续 · …" label. Remember the original so the phone keeps showing
         # the task name the user opened.
         self._fork_titles: dict[str, str] = {}
+        # Forks whose history must still be read after writing moves back to the
+        # original thread. A fork copies the thread it branched from, so its
+        # turns overlap the original's except for the replies the phone made
+        # while the desktop held the writer lock; those extras are appended on
+        # read so reclaiming a thread never hides what the phone already sent.
+        self._fork_tails: dict[str, str] = {}
         self._resumed_lock = threading.Lock()
         self._load_fork_map()
         self._sessions_root = (
@@ -455,17 +461,26 @@ class CompanionService:
     def _writable_thread(self, thread_id: str) -> str:
         """Return a thread id this client may write to.
 
-        app-server allows only one writer per stored thread. When the desktop
-        or another Codex process holds that thread, ``thread/resume`` and
-        ``turn/start`` fail. Forking reuses the full history under a new id we
-        own, so the phone can keep replying without stealing the desktop's
-        session. Free threads are resumed in place and used directly.
+        app-server allows only one writer per stored thread, and the desktop
+        keeps a writer lock on every thread it has opened -- including threads
+        whose turn finished long ago. That lock is a file on disk rather than
+        proof that a turn is running, so clearing it lets us resume the
+        original thread and append to it directly. The phone and the desktop
+        then share one conversation and each sees the other's turns.
+
+        Forking stays only as the fallback for the one case where hijacking is
+        unsafe: the desktop is running a turn on that thread right now.
         """
         if not thread_id:
             return thread_id
         with self._resumed_lock:
             existing = self._forked_threads.get(thread_id)
         if existing:
+            # A fork recorded by an earlier build left this conversation in a
+            # copy the desktop never opens, so the two sides drift apart. Go
+            # back to the original thread so both share one history again.
+            if self._reclaim_original(thread_id, existing):
+                return thread_id
             # A reset app-server forgets loaded threads, so re-hydrate the fork
             # (or the next turn/start fails with "thread not found" again).
             try:
@@ -487,6 +502,11 @@ class CompanionService:
             locked = thread_id in self._locked_threads
         if not locked:
             return thread_id
+        # The desktop holds the writer lock. Take the original thread over
+        # rather than copying it, unless a turn is running on it right now.
+        if self._log_status(thread_id) != "working":
+            if self._take_over(thread_id):
+                return thread_id
         client = self._ensure_client()
         try:
             result = client.request("thread/fork", {"threadId": thread_id})
@@ -518,6 +538,49 @@ class CompanionService:
             }
         )
         return forked_id
+
+    def _take_over(self, thread_id: str) -> bool:
+        """Clear the writer lock and resume the original thread in place.
+
+        Returns True when the thread is now ours to write to, so the phone
+        continues the real conversation instead of a fork of it.
+        """
+        if not thread_id:
+            return False
+        # _ensure_thread may already have cleared the lock, and a lock file that
+        # is gone is success rather than failure, so clear it best-effort and
+        # let the retried resume decide whether we own the thread.
+        _clear_writer_lock(thread_id)
+        with self._resumed_lock:
+            self._resumed_threads.discard(thread_id)
+            self._locked_threads.discard(thread_id)
+        try:
+            self._ensure_thread(thread_id)
+        except AppServerError:
+            with self._resumed_lock:
+                self._locked_threads.add(thread_id)
+            return False
+        # _ensure_thread returns quietly when the lock is still held by someone
+        # else, so the lock set is what tells us whether the thread is ours.
+        with self._resumed_lock:
+            return thread_id not in self._locked_threads
+
+    def _reclaim_original(self, thread_id: str, fork_id: str) -> bool:
+        """Move a forked conversation back onto the thread it came from.
+
+        Forks recorded by earlier builds left the phone's replies in a copy the
+        desktop never opens, so the two sides drift apart. Returns False when
+        the original can no longer be resumed and the fork must be kept.
+        """
+        if not self._take_over(thread_id):
+            return False
+        with self._resumed_lock:
+            self._forked_threads.pop(thread_id, None)
+            self._fork_titles.pop(thread_id, None)
+            # Keep reading the fork's history, but stop writing to it.
+            self._fork_tails[thread_id] = fork_id
+        self._save_fork_map()
+        return True
 
     def _ensure_fork_label(self, thread_id: str, forked_id: str) -> None:
         """Label a fork that predates fork labelling. Failure is cosmetic."""
@@ -583,6 +646,11 @@ class CompanionService:
             for origin, title in titles.items():
                 if isinstance(origin, str) and isinstance(title, str) and origin and title:
                     self._fork_titles[origin] = title
+        tails = payload.get("tails")
+        if isinstance(tails, dict):
+            for origin, tail in tails.items():
+                if isinstance(origin, str) and isinstance(tail, str) and origin and tail:
+                    self._fork_tails[origin] = tail
 
     def _save_fork_map(self) -> None:
         with self._resumed_lock:
@@ -590,6 +658,7 @@ class CompanionService:
                 "version": 1,
                 "forks": dict(self._forked_threads),
                 "titles": dict(self._fork_titles),
+                "tails": dict(self._fork_tails),
             }
         try:
             self._fork_map_path().parent.mkdir(parents=True, exist_ok=True)
@@ -1177,6 +1246,46 @@ class CompanionService:
             return task_status
         return summary_status or "idle"
 
+    def _read_fork_tail_messages(
+        self,
+        fork_id: str,
+        seen_turn_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Return the fork's own turns, which the original thread lacks.
+
+        A fork copies the history of the thread it branched from, so only the
+        turns started after the fork are new. Those are the phone replies made
+        while the desktop held the writer lock, and they must stay visible once
+        writing moves back to the original thread.
+        """
+        if not fork_id:
+            return []
+        try:
+            result = self._read("thread/read", {"threadId": fork_id, "includeTurns": True})
+        except AppServerError:
+            return []
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            return []
+        turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
+        turns.sort(key=lambda turn: _epoch(
+            turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
+        ))
+        messages: list[dict[str, Any]] = []
+        for turn in turns:
+            turn_id = str(turn.get("id") or "")
+            if not turn_id or turn_id in seen_turn_ids:
+                continue
+            for item in turn.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                mapped = self._map_item(item, turn)
+                if mapped is None:
+                    continue
+                mapped["turn_id"] = turn_id
+                messages.append(mapped)
+        return messages
+
     def read_thread(
         self,
         thread_id: str,
@@ -1188,6 +1297,11 @@ class CompanionService:
         # carries its history, but keep reporting the origin id to the phone.
         source_id = self._fork_for(thread_id) or thread_id
         result = self._read("thread/read", {"threadId": source_id, "includeTurns": True})
+        tail_thread: dict[str, Any] | None = None
+        tail_id = ""
+        with self._resumed_lock:
+            if thread_id not in self._forked_threads:
+                tail_id = self._fork_tails.get(thread_id, "")
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             raise ValueError("thread")
@@ -1198,6 +1312,7 @@ class CompanionService:
         turns.sort(key=lambda turn: _epoch(
             turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
         ))
+        seen_turn_ids = {str(turn.get("id") or "") for turn in turns}
         turns = turns[-MAX_TURNS_IN_DETAIL:]
         messages: list[dict[str, Any]] = []
         for turn in turns:
@@ -1210,6 +1325,12 @@ class CompanionService:
                     continue
                 mapped["turn_id"] = turn_id
                 messages.append(mapped)
+        # A reclaimed thread keeps the replies the phone made while it lived in
+        # a fork. Those turns are in the fork's rollout but not in the
+        # original's, so read the tail and append only what is missing.
+        tail_messages = self._read_fork_tail_messages(tail_id, seen_turn_ids)
+        if tail_messages:
+            messages.extend(tail_messages)
         total = len(messages)
         trimmed = messages[-max(1, int(message_limit)):]
         summary = self._summary(thread)
@@ -1368,9 +1489,17 @@ class CompanionService:
         if ephemeral:
             params["ephemeral"] = True
         result = self._ensure_client().request("thread/start", params)
+        # thread/start already loaded the thread in this process, but it has no
+        # rollout file until its first turn runs, so a later resume fails with
+        # "no rollout found". Remember it so the first reply skips the resume.
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             raise AppServerError("App Server 未返回新任务")
+        thread_id = str(thread.get("id") or "")
+        if thread_id:
+            with self._resumed_lock:
+                self._locked_threads.discard(thread_id)
+            self._thread_note(thread_id)
         return {"thread": self._summary(thread)}
 
     def mark_thread_read(self, thread_id: str) -> dict[str, Any]:

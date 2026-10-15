@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.3.17",
+    [string]$Version = "1.3.18",
     [switch]$SkipInstaller,
     [switch]$SkipTests
 )
@@ -55,3 +55,4 @@ if (-not $SkipInstaller) {
 }
 
 Get-ChildItem -LiteralPath $Release | Select-Object Name,Length
+
