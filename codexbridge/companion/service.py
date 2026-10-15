@@ -178,6 +178,29 @@ def _line_stamp(line: str) -> float | None:
     return _parse_stamp(match.group(1))
 
 
+# Rollout records that the app-server writes when it merely loads/resumes a
+# thread. They carry a fresh timestamp but describe no turn progress, so they
+# must not count as "the thread is doing work right now".
+_BOOKKEEPING_EVENT_TYPES = {"thread_settings_applied"}
+
+
+def _is_bookkeeping_line(line: str) -> bool:
+    """Return True for a rollout record that only refreshes thread settings.
+
+    Resuming or reading a thread appends a ``thread_settings_applied`` event
+    with the current time. It is bookkeeping, not turn activity, and must not
+    make an idle thread look like it is running.
+    """
+    if '"event_msg"' not in line:
+        return False
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    return str(payload.get("type") or "") in _BOOKKEEPING_EVENT_TYPES
+
+
 def _log_activity(line: str) -> tuple[float, str] | None:
     if '"event_msg"' not in line:
         return None
@@ -596,14 +619,18 @@ class CompanionService:
         with self._resumed_lock:
             return self._fork_origin.get(key, key)
 
-    def _thread_log(self, thread_id: str) -> tuple[float, str, float, float] | None:
-        """Return (newest_timestamp, last_turn_event) for a rollout log.
+    def _thread_log(self, thread_id: str) -> tuple[float, str, float, float, float] | None:
+        """Return rollout-log activity for a thread.
 
         Result is ``(newest_timestamp, last_turn_event, event_timestamp,
-        log_write_time)``. The
+        log_write_time, real_activity_timestamp)``. The
         event is the last ``task_started`` / ``task_complete`` /
         ``turn_aborted`` line seen in the tail, or ``""`` when the tail is too
-        short to contain one.
+        short to contain one. ``real_activity_timestamp`` is the newest stamp
+        from a record that reflects actual work (anything except the
+        ``thread_settings_applied`` bookkeeping line a resume appends), so
+        callers can tell "a turn is running" apart from "the file was merely
+        touched by a resume".
         """
         key = str(thread_id or "")
         if not key:
@@ -637,7 +664,7 @@ class CompanionService:
         return None
 
     @staticmethod
-    def _read_log_tail(path: Path) -> tuple[float, str, float] | None:
+    def _read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
         try:
             stat = path.stat()
             size = stat.st_size
@@ -652,6 +679,13 @@ class CompanionService:
         # is the ground truth for "is someone still appending right now".
         written_at = float(stat.st_mtime)
         newest = 0.0
+        # Resuming a thread appends a ``thread_settings_applied`` record with a
+        # fresh timestamp but no real turn work. Reading or resuming an idle
+        # task therefore refreshes the file mtime and the newest stamp, which
+        # used to flicker long-finished tasks into "working". Track the newest
+        # stamp that reflects actual turn activity separately so we can ignore
+        # the bookkeeping noise.
+        real_activity = 0.0
         kind = ""
         kind_stamp = 0.0
         with_timestamps = 0
@@ -671,15 +705,17 @@ class CompanionService:
             with_timestamps += 1
             if stamp > newest:
                 newest = stamp
+            if not _is_bookkeeping_line(line) and stamp > real_activity:
+                real_activity = stamp
         if with_timestamps == 0:
             return None
-        return newest, kind, kind_stamp, written_at
+        return newest, kind, kind_stamp, written_at, real_activity
 
     def _log_status(self, thread_id: str) -> str:
         activity = self._thread_log(thread_id)
         if activity is None:
             return ""
-        newest, kind, kind_stamp, written_at = activity
+        newest, kind, kind_stamp, written_at, real_activity = activity
         if newest <= 0:
             return ""
         now = time.time()
@@ -688,11 +724,15 @@ class CompanionService:
                 return "completed"
             if kind == "turn_aborted":
                 return "idle"
-        # Only claim a turn is running when the rollout file itself is still
-        # being appended to. Log timestamps alone are unreliable: a stale tail
-        # can look seconds old while the writer stopped hours ago, which made
-        # idle desktop tasks flicker into "working" on the phone list.
-        if now - written_at <= LOG_ACTIVE_SECONDS and now - newest <= LOG_ACTIVE_SECONDS:
+        # Only claim a turn is running when the rollout file is still being
+        # appended to AND the freshest append reflects real work. A resume or a
+        # read-only ``thread/read`` refreshes the file mtime and drops a
+        # ``thread_settings_applied`` record, but carries no turn activity;
+        # keying off ``real_activity`` (not the raw newest stamp) keeps idle
+        # tasks from flickering into "working" on the phone list.
+        if real_activity <= 0:
+            return ""
+        if now - written_at <= LOG_ACTIVE_SECONDS and now - real_activity <= LOG_ACTIVE_SECONDS:
             return "working"
         return ""
 
@@ -1071,7 +1111,7 @@ class CompanionService:
                 if inferred:
                     summary["status"] = inferred
                     if inferred in {"completed", "failed"} and activity is not None:
-                        _newest, _kind, kind_stamp, _written = activity
+                        _newest, _kind, kind_stamp, _written, _real = activity
                         if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
                             summary["completed_at"] = int(kind_stamp)
             completed_at = int(summary.get("completed_at") or 0)

@@ -217,6 +217,52 @@ class CompanionServiceTests(unittest.TestCase):
         self._write_rollout("t2", "task_started")
         self.assertEqual(self.service._log_status("t2"), "working")
 
+    def _append_rollout_record(self, thread_id: str, payload_type: str, seconds_ago: float = 0.0) -> None:
+        day = datetime.now()
+        folder = (
+            Path(self.temp.name)
+            / "sessions"
+            / f"{day.year:04d}"
+            / f"{day.month:02d}"
+            / f"{day.day:02d}"
+        )
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        record = {
+            "timestamp": stamp.isoformat().replace("+00:00", "Z"),
+            "type": "event_msg",
+            "payload": {"type": payload_type},
+        }
+        path = folder / f"rollout-{thread_id}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+    def test_resume_bookkeeping_does_not_force_working(self) -> None:
+        # Resuming or reading a long-finished task appends a
+        # ``thread_settings_applied`` record with a fresh timestamp, refreshing
+        # the file mtime even though no turn is running. That bookkeeping line
+        # must never make an idle task flicker back into "working".
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=1)
+        self.assertEqual(self.service._log_status("t2"), "")
+
+    def test_real_activity_after_bookkeeping_still_reports_working(self) -> None:
+        # A genuine turn writes real activity records, not just the settings
+        # bookkeeping line, so a live turn stays "working".
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=2)
+        self._append_rollout_record("t2", "item_completed", seconds_ago=1)
+        self.assertEqual(self.service._log_status("t2"), "working")
+
+    def test_list_threads_resume_bookkeeping_stays_idle(self) -> None:
+        # The phone list must not flip a finished task to "working" purely
+        # because the desktop resumed/read it and touched its rollout file.
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=1)
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertNotEqual(statuses["t2"], "working")
+
     def test_list_threads_marks_finished_rollout_completed(self) -> None:
         self._write_rollout("t2", "task_complete", seconds_ago=30)
         result = self.service.list_threads(limit=10)
