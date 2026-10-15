@@ -15,8 +15,8 @@ android {
         applicationId = "com.codexbridge.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.2.13"
+        versionCode = 16
+        versionName = "0.2.14"
         resourceConfigurations += listOf("zh", "en")
     }
 
@@ -82,4 +82,5 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+
 

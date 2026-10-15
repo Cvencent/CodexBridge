@@ -255,6 +255,66 @@ def _is_display_thread(thread: dict[str, Any]) -> bool:
     )
 
 
+def _read_file_tail(path: Path, size: int) -> bytes:
+    """Read the last ``LOG_TAIL_BYTES`` of a file another process is writing.
+
+    Codex holds its rollout file open with sharing flags that reject a plain
+    ``open(path, "rb")`` on Windows, which made the phone read no activity at
+    all for a thread that was being written to right then. Open the file the
+    way Windows allows shared reads instead of giving up.
+    """
+    start = size - LOG_TAIL_BYTES if size > LOG_TAIL_BYTES else 0
+    if os.name != "nt":
+        with path.open("rb") as handle:
+            if start:
+                handle.seek(start)
+            return handle.read()
+    import msvcrt
+
+    try:
+        # _O_RDONLY | _O_BINARY with the sharing flags Windows itself uses, so
+        # a writer that already holds the file open does not lock us out.
+        descriptor = msvcrt.open_osfhandle(
+            _win32_open_shared(str(path), start),
+            os.O_RDONLY | os.O_BINARY,
+        )
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            return stream.read()
+    except OSError:
+        return b""
+
+
+def _win32_open_shared(path: str, offset: int) -> int:
+    """Open a file for shared reading on Windows and return a raw HANDLE."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    handle = kernel32.CreateFileW(
+        wintypes.LPCWSTR(path),
+        wintypes.DWORD(GENERIC_READ),
+        wintypes.DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+        None,
+        wintypes.DWORD(OPEN_EXISTING),
+        wintypes.DWORD(0),
+        wintypes.HANDLE(None),
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if not handle or handle == invalid:
+        raise OSError(ctypes.get_last_error(), "cannot open rollout for shared read", path)
+    if offset and kernel32.SetFilePointer(
+        wintypes.HANDLE(handle), wintypes.LONG(offset), None, wintypes.DWORD(0)
+    ) == 0xFFFFFFFF:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise OSError(ctypes.get_last_error(), "cannot seek rollout", path)
+    return handle
+
+
 class CompanionService:
     """Own the app-server connection that serves paired phones."""
 
@@ -737,10 +797,7 @@ class CompanionService:
         try:
             stat = path.stat()
             size = stat.st_size
-            with path.open("rb") as handle:
-                if size > LOG_TAIL_BYTES:
-                    handle.seek(size - LOG_TAIL_BYTES)
-                blob = handle.read()
+            blob = _read_file_tail(path, size)
         except OSError:
             return None
         # The log records its own timestamps, but a stale tail can carry
@@ -788,22 +845,38 @@ class CompanionService:
         if newest <= 0:
             return ""
         now = time.time()
-        if now - kind_stamp <= LOG_SETTLED_SECONDS:
-            if kind == "task_complete":
-                return "completed"
-            if kind == "turn_aborted":
-                return "idle"
-        # Only claim a turn is running when the rollout file is still being
-        # appended to AND the freshest append reflects real work. A resume or a
-        # read-only ``thread/read`` refreshes the file mtime and drops a
-        # ``thread_settings_applied`` record, but carries no turn activity;
-        # keying off ``real_activity`` (not the raw newest stamp) keeps idle
-        # tasks from flickering into "working" on the phone list.
+        # A finished turn keeps its outcome for as long as the log remembers it.
+        # This used to expire after LOG_SETTLED_SECONDS, which made a task that
+        # failed half an hour ago drop to "idle" in the list while the chat
+        # header still read the turn's own "failed" -- the row and the header
+        # disagreeing about the same task.
+        #
+        # The outcome only holds while it is still the newest real activity. A
+        # thread that completed once and then started another turn has real work
+        # after that completion record, and must report as running rather than
+        # keep showing the older result forever.
+        # ``kind_stamp`` older than the newest real activity means work happened
+        # after that completion, so the completion no longer describes the thread.
+        if kind == "task_complete" and kind_stamp >= real_activity - 1.0:
+            return "completed"
+        if kind == "turn_aborted" and kind_stamp >= real_activity - 1.0:
+            return "idle"
+        # Only claim a turn is running when the freshest append reflects real
+        # work. A resume or a read-only ``thread/read`` drops a
+        # ``thread_settings_applied`` record that carries no turn activity, so
+        # ``real_activity`` is the signal that matters -- the raw newest stamp
+        # would flicker idle tasks into "working" on every read.
+        #
+        # ``real_activity`` comes from the records themselves and is the primary
+        # gate. The file mtime is deliberately NOT required to agree: on this
+        # machine Windows reports a frozen mtime for a rollout that is still
+        # growing, so gating on it reported live turns as idle for hours. The
+        # mtime is only consulted when the tail carries no timestamp at all.
         if real_activity <= 0:
-            return ""
-        if now - written_at <= LOG_ACTIVE_SECONDS and now - real_activity <= LOG_ACTIVE_SECONDS:
-            return "working"
-        return ""
+            # No usable record timestamp, so fall back to the file's own idea
+            # of when it was last touched.
+            return "working" if now - written_at <= LOG_ACTIVE_SECONDS else ""
+        return "working" if now - real_activity <= LOG_ACTIVE_SECONDS else ""
 
     def _read(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None
@@ -1125,6 +1198,29 @@ class CompanionService:
                 self._account_cache = account_snapshot({}, {})
         return self._account_cache
 
+    def _read_thread_summary(self, thread_id: str) -> dict[str, Any] | None:
+        """Return a thread's summary with turns included, or None if unreadable."""
+        try:
+            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except (AppServerError, OSError):
+            return None
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            return None
+        return self._summary(thread)
+
+    def _row_status_from_turn(self, thread_id: str) -> str:
+        """Classify a row from its turn snapshot when the rollout log cannot."""
+        summary = self._read_thread_summary(thread_id)
+        if summary is None:
+            return ""
+        status = str(summary.get("status") or "")
+        # "idle" here only means the app-server has no live turn, which is also
+        # what it reports for a thread it never loaded, so it is not an answer.
+        if not status or status == "idle":
+            return ""
+        return status
+
     def list_threads(
         self,
         limit: int = 40,
@@ -1170,19 +1266,40 @@ class CompanionService:
             if index >= LOG_SCAN_LIMIT:
                 break
             thread_id = str(summary.get("thread_id") or "")
-            if str(summary.get("status") or "") not in ACTIVE_STATUSES:
-                # List rows carry no turns, so a finished task only shows up via
-                # its rollout log. Use that log's completion timestamp as the
-                # read watermark; otherwise completed_at stays 0 and the
-                # "already read" check below can never match.
-                activity = self._thread_log(thread_id)
-                inferred = self._log_status(thread_id)
-                if inferred:
-                    summary["status"] = inferred
-                    if inferred in {"completed", "failed"} and activity is not None:
-                        _newest, _kind, kind_stamp, _written, _real = activity
-                        if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
-                            summary["completed_at"] = int(kind_stamp)
+            # The rollout log is authoritative for every row, not just the ones
+            # this process cannot see. thread/list reports a desktop-owned thread
+            # as unloaded to any second reader, so an "active" row can look idle
+            # here while the chat header shows it running. Ask the log first and
+            # let it win for running work.
+            activity = self._thread_log(thread_id)
+            inferred = self._log_status(thread_id)
+            if inferred:
+                summary["status"] = inferred
+            if activity is not None:
+                _newest, _kind, kind_stamp, _written, _real = activity
+                if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
+                    # List rows carry no turns, so a finished task only shows up
+                    # via its rollout log. Use that log's completion timestamp
+                    # as the read watermark; otherwise completed_at stays 0 and
+                    # the "already read" check below can never match.
+                    summary["completed_at"] = int(kind_stamp)
+            # A long thread's rollout tail can hold no lifecycle event at all:
+            # a 70 MB log spends its last 128 KB on tool output, so the
+            # task_started / task_complete records that say how the turn ended
+            # are far outside the window. The row then has nothing but the
+            # unloaded marker from thread/list and reads as idle, while the chat
+            # header reads the turn and says "failed". Ask the app-server for
+            # the turn itself, but only for rows the log could not classify.
+            if activity is None or not inferred:
+                read_status = self._row_status_from_turn(thread_id)
+                if read_status:
+                    summary["status"] = read_status
+                    if read_status in {"completed", "failed"}:
+                        detail = self._read_thread_summary(thread_id)
+                        if detail is not None:
+                            completed_at = int(detail.get("completed_at") or 0)
+                            if completed_at > int(summary.get("completed_at") or 0):
+                                summary["completed_at"] = completed_at
             completed_at = int(summary.get("completed_at") or 0)
             if (
                 summary.get("status") in {"completed", "failed"}

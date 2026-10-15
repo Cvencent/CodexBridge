@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codexbridge.codex.app_server import AppServerError
-from codexbridge.companion.service import CompanionService
+from codexbridge.companion.service import LOG_ACTIVE_SECONDS, CompanionService
 from codexbridge.read_state import ReadStateStore
 
 
@@ -175,13 +175,44 @@ class CompanionServiceTests(unittest.TestCase):
         result = self.service.list_threads(limit=10)
         self.assertEqual(result["threads"][0]["thread_id"], "t2")
         self.assertEqual(result["threads"][0]["status"], "working")
-        self.assertEqual(result["threads"][1]["status"], "idle")
+        self.assertEqual(result["threads"][1]["status"], "completed")
 
-    def test_rollout_write_staleness_gates_working_inference(self) -> None:
-        # A rollout log can carry fresh-looking timestamps while the file itself
-        # stopped being written long ago (a stale tail left on disk, or a
-        # timestamp far in the future). Freshness of the log's own timestamps
-        # must never be enough on its own to call a desktop turn "working".
+    def test_list_falls_back_to_turn_when_log_tail_has_no_lifecycle(self) -> None:
+        # A long thread's rollout tail holds no task_started / task_complete
+        # record: a 70 MB log spends its last 128 KB on tool output. The row then
+        # has nothing to classify from and used to read "idle" while the chat
+        # header read the turn and said "failed".
+        self.client.responses["thread/list"] = {
+            "data": [thread_row("t1", status={"type": "notLoaded"})],
+            "nextCursor": None,
+        }
+        # Only a settings record in the tail, so no lifecycle event is visible.
+        # Real tool records, but no task_started / task_complete anywhere in
+        # the window, and old enough that no live turn is implied.
+        self._append_rollout_record("t1", "token_count", seconds_ago=400)
+
+        result = self.service.list_threads(limit=10)
+
+        self.assertEqual(len(result["threads"]), 1)
+        self.assertEqual(result["threads"][0]["status"], "completed")
+
+    def test_list_shows_working_for_a_thread_another_process_owns(self) -> None:
+        # thread/list reports a desktop-owned thread as not-loaded to any second
+        # reader, so its own status field looks inactive. The rollout log is
+        # what proves the turn is running, and the list must trust it -- the row
+        # used to stay "idle" while the chat header showed "working".
+        self.client.responses["thread/list"] = {
+            "data": [thread_row("t1", status={"type": "notLoaded"})],
+            "nextCursor": None,
+        }
+        self._write_rollout("t1", "task_started", seconds_ago=3)
+
+        result = self.service.list_threads(limit=10)
+
+        self.assertEqual(len(result["threads"]), 1)
+        self.assertEqual(result["threads"][0]["status"], "working")
+
+    def test_stale_mtime_does_not_hide_a_live_turn(self) -> None:
         folder = (
             Path(self.temp.name)
             / "sessions"
@@ -206,11 +237,22 @@ class CompanionServiceTests(unittest.TestCase):
         stale = time.time() - 3600.0
         os.utime(path, (stale, stale))
 
-        self.assertEqual(self.service._log_status("t2"), "")
+        # Windows reports a frozen mtime for a rollout that is still being
+        # appended to, so a stale mtime must not hide a live turn.
+        self.assertEqual(self.service._log_status("t2"), "working")
 
         result = self.service.list_threads(limit=10)
         statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
-        self.assertNotEqual(statuses["t2"], "working")
+        self.assertEqual(statuses["t2"], "working")
+
+        # The guard still works: when the records are genuinely old the thread is
+        # idle, so a frozen mtime cannot invent a running turn. Rewrite the log
+        # with an old stamp and clear the short-lived tail cache before re-reading.
+        old = time.time() - LOG_ACTIVE_SECONDS - 60.0
+        path.write_text(json.dumps({"timestamp": datetime.fromtimestamp(old, timezone.utc).isoformat().replace("+00:00", "Z"), "type": "event_msg", "payload": {"type": "task_started"}}) + "\n", encoding="utf-8")
+        with self.service._log_cache_lock:
+            self.service._log_cache.clear()
+        self.assertEqual(self.service._log_status("t2"), "")
 
     def test_rollout_recently_written_still_reports_working(self) -> None:
         # The same log, but actively appended: still a live desktop turn.
@@ -244,7 +286,7 @@ class CompanionServiceTests(unittest.TestCase):
         # must never make an idle task flicker back into "working".
         self._write_rollout("t2", "task_complete", seconds_ago=3600)
         self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=1)
-        self.assertEqual(self.service._log_status("t2"), "")
+        self.assertEqual(self.service._log_status("t2"), "completed")
 
     def test_real_activity_after_bookkeeping_still_reports_working(self) -> None:
         # A genuine turn writes real activity records, not just the settings
@@ -305,7 +347,7 @@ class CompanionServiceTests(unittest.TestCase):
         self._write_rollout("t2", "task_started", seconds_ago=600)
         result = self.service.list_threads(limit=10)
         statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
-        self.assertEqual(statuses["t2"], "idle")
+        self.assertEqual(statuses["t2"], "completed")
 
     def test_list_threads_maps_rows(self) -> None:
         result = self.service.list_threads(limit=10)
