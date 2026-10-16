@@ -15,7 +15,7 @@ from codexbridge.messages_store import (
     is_in_flight,
 )
 from codexbridge.protocol.capabilities import effective
-from codexbridge.protocol.messages import clip_text, decode, wire_messages
+from codexbridge.protocol.messages import clip_text, clip_utf8, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
 
@@ -68,6 +68,12 @@ BLOCKING_DEVICE_EVENTS = frozenset(
 # in-flight multi-part command is cheap until its last part arrives, and counting
 # every part against this limit would reject legitimate requests.
 WORKER_QUEUE_LIMIT = 24
+
+# Byte ceilings for one flat `codex_status_snapshot` line. Together they leave
+# comfortable room inside MAX_LINE_BYTES for the field names themselves.
+SNAPSHOT_ID_BYTES = 64
+SNAPSHOT_STATUS_BYTES = 24
+SNAPSHOT_ACTION_BYTES = 240
 
 # Device events whose answer comes from the Codex catalog service. Their
 # "no catalog service" error is cheap enough to return synchronously.
@@ -775,13 +781,10 @@ class BridgeHub:
             return None
         task = live.data.get("task") if isinstance(live.data, dict) else None
         task = task if isinstance(task, dict) else {}
+        # The device owns the character budget; SNAPSHOT_*_BYTES are the room a
+        # single flat record has left inside the 768-byte line. Nothing here is
+        # specific to a model of hardware.
         budget = self.budget_for(device_id)
-        default_chars = 48 if budget is None else min(budget, 48)
-
-        def text(value: Any, limit: int) -> str:
-            raw = str(value if value is not None else "")
-            clipped = clip_text(raw, limit) if budget is not None else raw
-            return clipped[:limit]
 
         def number(value: Any) -> int:
             try:
@@ -791,11 +794,17 @@ class BridgeHub:
 
         return {
             "type": "codex_status_snapshot",
-            "thread_id": text(live.thread_id, 64),
-            "status": text(live.status, 24),
-            "current_action": text(task.get("current_action") or live.body,
-                                   default_chars),
-            "turn_id": text(task.get("turn_id") or "", 40),
+            "thread_id": clip_utf8(str(live.thread_id or ""),
+                                   max_bytes=SNAPSHOT_ID_BYTES),
+            "status": clip_utf8(str(live.status or ""),
+                                max_bytes=SNAPSHOT_STATUS_BYTES),
+            "current_action": clip_utf8(
+                str(task.get("current_action") or live.body or ""),
+                max_chars=budget,
+                max_bytes=SNAPSHOT_ACTION_BYTES,
+            ),
+            "turn_id": clip_utf8(str(task.get("turn_id") or ""),
+                                 max_bytes=SNAPSHOT_ID_BYTES),
             "plan_completed": number(task.get("plan_completed")),
             "plan_total": number(task.get("plan_total")),
             "created_at": int(live.created_at or 0),
