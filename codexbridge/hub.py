@@ -8,7 +8,12 @@ import uuid
 from typing import Any
 
 from codexbridge.devices.registry import DeviceRegistry
-from codexbridge.messages_store import KIND_CAPABILITY, MessageRecord, MessageStore
+from codexbridge.messages_store import (
+    KIND_CAPABILITY,
+    MessageRecord,
+    MessageStore,
+    is_in_flight,
+)
 from codexbridge.protocol.capabilities import effective
 from codexbridge.protocol.messages import clip_text, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
@@ -103,6 +108,10 @@ class BridgeHub:
         self._work: dict[str, "queue.Queue[tuple[str, Any]]"] = {}
         self._workers: dict[str, threading.Thread] = {}
         self._depth: dict[str, int] = {}
+        # Sink for cross-client reads. Set to the companion service (anything
+        # with ``publish(dict)``) so a message read on hardware also clears the
+        # phone's badge, and vice versa through ``handle_cross_client_read``.
+        self.companion_events: Any = None
 
     def set_codex_catalog(self, codex_catalog: Any) -> None:
         with self._lock:
@@ -139,6 +148,11 @@ class BridgeHub:
         if "request_id" in event:
             payload["request_id"] = request_id
         self._send(device_id, payload)
+        snapshot = self._status_snapshot(device_id)
+        if snapshot is not None and "request_id" in event:
+            snapshot["request_id"] = request_id
+        if snapshot is not None:
+            self._send(device_id, snapshot)
 
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
@@ -512,11 +526,20 @@ class BridgeHub:
             pending = [
                 record
                 for record in self.store.pending_for(device_id, capabilities)
-                if not self.read_state.is_message_read(record.message_id)
+                if (
+                    # Live state is not a notification anyone can consume: the
+                    # phone reading "task is working" must not stop a device
+                    # that reconnects later from learning the task is alive.
+                    is_in_flight(record)
+                    or not self.read_state.is_message_read(record.message_id)
+                )
                 and not (
-                    record.thread_id
+                    not is_in_flight(record)
+                    and record.thread_id
                     and record.created_at > 0
-                    and self.read_state.is_thread_read(record.thread_id, int(record.created_at))
+                    and self.read_state.is_thread_read(
+                        record.thread_id, int(record.created_at)
+                    )
                 )
             ]
             visible = self.store.pending_for(
@@ -599,21 +622,125 @@ class BridgeHub:
             record = self.store.mark_read(message_id, device_id)
             if record is None:
                 return
-            self.read_state.mark_message(record.message_id)
+            # ``source`` records who read it. The fan-out below is deliberate
+            # and single-shot, so the shared store stays quiet for this path.
+            self.read_state.mark_message(record.message_id, source=device_id,
+                                         notify=False)
             if record.thread_id and record.created_at > 0:
-                self.read_state.mark_thread(record.thread_id, int(record.created_at))
-            payload = {
-                "type": "read_state",
-                "message_id": record.message_id,
-                "read_by": sorted(record.read_by),
-                "read_at": time.time(),
-            }
-            for other_id, session in self._sessions.items():
-                if (
-                    other_id != device_id
-                    and "read_ack" in self.capabilities_for(other_id)
-                ):
-                    self._send_to(session, payload)
+                self.read_state.mark_thread(
+                    record.thread_id, int(record.created_at),
+                    source=device_id, notify=False,
+                )
+                self._retract_companion_badge(record.thread_id)
+            self._broadcast_read_state(
+                {
+                    "type": "read_state",
+                    "message_id": record.message_id,
+                    "read_by": sorted(record.read_by),
+                    "read_at": time.time(),
+                },
+                exclude=device_id,
+            )
+
+    def _broadcast_read_state(self, payload: dict, exclude: str = "") -> None:
+        with self._lock:
+            targets = [
+                session
+                for device_id, session in self._sessions.items()
+                if device_id != exclude
+                and "read_ack" in self.capabilities_for(device_id)
+            ]
+        for session in targets:
+            self._send_to(session, payload)
+
+    def _retract_companion_badge(self, thread_id: str) -> None:
+        """Tell the phone that a completion the device just opened is consumed.
+
+        Without this the phone keeps a badge for a task the user already read on
+        the hardware, because the two clients never spoke to each other directly.
+        """
+        companion = self.companion_events
+        if not thread_id or companion is None or not hasattr(companion, "publish"):
+            return
+        try:
+            companion.publish({
+                "type": "thread_status",
+                "thread_id": thread_id,
+                "status": "idle",
+                "active_flags": [],
+            })
+        except Exception:  # noqa: BLE001 - the read already happened
+            pass
+
+    def _read_by_for(self, message_id: str, source: str) -> list[str]:
+        with self._lock:
+            record = self.store.get(message_id)
+            if record is not None:
+                return sorted(record.read_by)
+        return [source] if source else []
+
+    def _thread_message_ids(self, thread_id: str, completed_at: int) -> list[str]:
+        if not thread_id:
+            return []
+        with self._lock:
+            return [
+                record.message_id
+                for record in self.store.records()
+                if record.thread_id == thread_id
+                and (completed_at <= 0 or int(record.created_at or 0) <= completed_at)
+            ]
+
+    def handle_cross_client_read(self, event: dict) -> None:
+        """Relay a read made by any client to every other client.
+
+        The store is shared by the phone companion and the device sessions, so
+        one marker is enough to keep a completion badge consistent everywhere:
+        hardware retires it when the phone opens the thread, and the phone
+        retracts its notification when the device does.
+        """
+        if not isinstance(event, dict):
+            return
+        message_id = str(event.get("message_id") or "")
+        thread_id = str(event.get("thread_id") or "")
+        source = str(event.get("source") or "")
+        if message_id:
+            # A single message marker (for example a device read that covers one
+            # record only) still has to reach the clients that show it.
+            self._broadcast_read_state(
+                {
+                    "type": "read_state",
+                    "message_id": message_id,
+                    "read_by": self._read_by_for(message_id, source),
+                    "read_at": time.time(),
+                },
+                exclude=source,
+            )
+            return
+        # The companion marks a *thread* read; hardware tracks individual
+        # message ids. Expand the thread watermark into the device-visible
+        # records it covers so the badge on the device clears too.
+        completed_at = int(event.get("completed_at") or 0)
+        for message_id_item in self._thread_message_ids(thread_id, completed_at):
+            with self._lock:
+                record = self.store.get(message_id_item)
+                read_by = sorted(record.read_by) if record is not None else (
+                    [source] if source else []
+                )
+            if record is not None:
+                # The badge on the device is keyed by message id, so the phone's
+                # thread-level read has to leave the same mark. notify=False keeps
+                # this the one fan-out for the event instead of looping back.
+                self.read_state.mark_message(message_id_item, source,
+                                             notify=False)
+            self._broadcast_read_state(
+                {
+                    "type": "read_state",
+                    "message_id": message_id_item,
+                    "read_by": read_by,
+                    "read_at": time.time(),
+                },
+                exclude=source,
+            )
 
     def _broadcast(self, payload: dict, capability: str) -> None:
         with self._lock:
@@ -632,6 +759,47 @@ class BridgeHub:
             session = self._sessions.get(device_id)
         if session is not None:
             self._send_to(session, self._apply_budget(message, self.budget_for(device_id)))
+
+    def _status_snapshot(self, device_id: str) -> dict | None:
+        """One bounded line describing what Codex is doing right now.
+
+        A device whose screen stopped making progress pulls this instead of
+        waiting for a push that content dedupe will never send. The payload is
+        a single flat record -- thread id, status, current action, turn id and
+        plan counters -- clipped to the device's declared text budget, so the
+        same call works for an ESP32 and for a desktop client.
+        """
+        with self._lock:
+            live = self.store.live_status()
+        if live is None:
+            return None
+        task = live.data.get("task") if isinstance(live.data, dict) else None
+        task = task if isinstance(task, dict) else {}
+        budget = self.budget_for(device_id)
+        default_chars = 48 if budget is None else min(budget, 48)
+
+        def text(value: Any, limit: int) -> str:
+            raw = str(value if value is not None else "")
+            clipped = clip_text(raw, limit) if budget is not None else raw
+            return clipped[:limit]
+
+        def number(value: Any) -> int:
+            try:
+                return max(0, min(1_000_000, int(value)))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "type": "codex_status_snapshot",
+            "thread_id": text(live.thread_id, 64),
+            "status": text(live.status, 24),
+            "current_action": text(task.get("current_action") or live.body,
+                                   default_chars),
+            "turn_id": text(task.get("turn_id") or "", 40),
+            "plan_completed": number(task.get("plan_completed")),
+            "plan_total": number(task.get("plan_total")),
+            "created_at": int(live.created_at or 0),
+        }
 
     def budget_for(self, device_id: str) -> int | None:
         with self._lock:

@@ -23,7 +23,29 @@ class ReadStateStore:
         self._threads: dict[str, int] = {}
         self._messages: set[str] = set()
         self._lock = threading.RLock()
+        # Every client (phone, ESP device, future hardware) writes through this
+        # one store, so it is also the place where a read becomes a notification.
+        # Listeners take ``{"thread_id", "completed_at", "message_id", "source"}``
+        # and are responsible for relaying it to the clients they own.
+        self._listeners: list[Any] = []
         self.load()
+
+    def add_listener(self, listener) -> None:
+        self._listeners.append(listener)
+
+    def _notify(self, thread_id: str, completed_at: int,
+                message_id: str, source: str) -> None:
+        event = {
+            "thread_id": thread_id,
+            "completed_at": completed_at,
+            "message_id": message_id,
+            "source": source,
+        }
+        for listener in list(self._listeners):
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - one bad client must not block reads
+                pass
 
     def load(self) -> None:
         if self.path is None:
@@ -73,7 +95,8 @@ class ReadStateStore:
             return False
         return self.thread_read_at(thread_id) >= int(completed_at)
 
-    def mark_thread(self, thread_id: str, completed_at: int) -> None:
+    def mark_thread(self, thread_id: str, completed_at: int,
+                    source: str = "", notify: bool = True) -> None:
         if not thread_id or completed_at <= 0:
             return
         with self._lock:
@@ -82,12 +105,15 @@ class ReadStateStore:
                 return
             self._threads[thread_id] = int(completed_at)
         self.save()
+        if notify:
+            self._notify(thread_id, int(completed_at), "", source)
 
     def is_message_read(self, message_id: str) -> bool:
         with self._lock:
             return str(message_id or "") in self._messages
 
-    def mark_message(self, message_id: str) -> None:
+    def mark_message(self, message_id: str, source: str = "",
+                     notify: bool = True) -> None:
         if not message_id:
             return
         with self._lock:
@@ -97,3 +123,10 @@ class ReadStateStore:
             if len(self._messages) > MAX_MESSAGE_IDS:
                 self._messages = set(sorted(self._messages)[-MAX_MESSAGE_IDS:])
         self.save()
+        if not notify:
+            return
+        # Message ids are "<kind>:<thread>[:<stamp>]", so the thread is always
+        # the second field. Derived here so one marker serves both fan-out paths.
+        parts = message_id.split(":")
+        thread_id = parts[1] if len(parts) > 1 else ""
+        self._notify(thread_id, 0, message_id, source)

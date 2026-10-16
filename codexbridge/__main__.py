@@ -300,6 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         show_intermediate_events=lambda: companion_store.show_intermediate_events,
     )
     hub.commands = companion_service.commands
+    # One read marker, every client. The store is shared, so a thread opened on
+    # the phone clears the hardware badge and vice versa.
+    hub.companion_events = companion_service
+    read_state.add_listener(hub.handle_cross_client_read)
     companion = CompanionApi(companion_service, companion_store, logger=print)
     companion_discovery = CompanionDiscovery(
         companion_store,

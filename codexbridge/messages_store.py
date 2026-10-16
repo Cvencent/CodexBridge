@@ -36,6 +36,20 @@ def _without_volatile(value: Any) -> Any:
     return value
 
 
+# A task that is still moving is not a notification the user has consumed.
+# These records describe live state, so the host must keep them reachable after
+# any client has marked them read, and a pull must always be able to answer
+# with the current one.
+IN_FLIGHT_KINDS: frozenset[str] = frozenset({"status", "task"})
+IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
+    {"working", "waiting_user", "queued", "starting"}
+)
+
+
+def is_in_flight(record: "MessageRecord") -> bool:
+    return record.kind in IN_FLIGHT_KINDS and record.status in IN_FLIGHT_STATUSES
+
+
 KIND_CAPABILITY: dict[str, str] = {
     "status": "status",
     "task": "tasks",
@@ -115,6 +129,22 @@ class MessageStore:
     def read_by(self, message_id: str) -> set[str]:
         record = self._messages.get(message_id)
         return set(record.read_by) if record is not None else set()
+
+    def live_status(self) -> MessageRecord | None:
+        """Most recent in-flight status record, or None.
+
+        The device asks for this when its screen stops making progress, so the
+        answer has to be the record the host is currently sitting on rather than
+        the last one that happened to look new.
+        """
+        candidates = [
+            record
+            for record in self._messages.values()
+            if is_in_flight(record) and record.kind == "status"
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item.created_at, item.message_id))
 
     def records(self) -> list[MessageRecord]:
         """Snapshot of stored records in insertion order.

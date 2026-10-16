@@ -197,8 +197,9 @@ def handle_request(
             # Omitted means "keep the device declaration"; null restores
             # unlimited. This is one protocol field, not a per-device branch.
             if "max_text_chars" in payload:
-                budget = parse_max_text_chars(payload.get("max_text_chars"))
-                registry.get(device_id).max_text_chars = budget
+                registry.set_max_text_chars(
+                    device_id, payload.get("max_text_chars")
+                )
             registry.save()
             hub.push_capabilities(device_id)
             return 200, {
