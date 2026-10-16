@@ -228,6 +228,17 @@ class CodexCatalogService:
         listing = self._render_thread_list(state, project)
         return selected + listing
 
+    def active_thread(self, device_id: str) -> str:
+        """Thread this device is following, or an empty string.
+
+        The hub uses this to decide which live records may reach the device: a
+        status line about someone else's session must not cut into a screen that
+        is waiting on its own task.
+        """
+        with self._lock:
+            state = self._states.get(device_id)
+            return str(state.active_thread_id or "") if state else ""
+
     def handle_voice_command(self, device_id: str, text: str) -> list[dict[str, Any]]:
         """Turn a confirmed voice instruction into a real Codex turn.
 
@@ -271,7 +282,10 @@ class CodexCatalogService:
             except Exception:
                 return [{"type": "error", "text": "电脑端没有接收这条指令，请重试"}]
         state.active_thread_id = thread_id
-        return [{"type": "task_queued", "text": "指令已发送到电脑端"}]
+        # The id tells the device which conversation now owns its screen, so a
+        # later progress line about somebody else cannot cut into this answer.
+        return [{"type": "task_queued", "text": "指令已发送到电脑端",
+                "thread_id": _safe_text(thread_id, 63)}]
 
     @staticmethod
     def _is_active_turn_error(error: Exception) -> bool:
@@ -613,6 +627,10 @@ class CodexCatalogService:
             "type": "codex_selected",
             "title": _safe_text(title, CATALOG_TITLE_CHARS),
             "project": _safe_text(project_name, CATALOG_DETAIL_CHARS),
+            # The device repeats this id back on every later request, so the
+            # host can answer questions about *this* thread rather than the most
+            # recent one any client touched.
+            "thread_id": _safe_text(state.active_thread_id, 63),
         }
         if last_message:
             payload["last_message"] = last_message

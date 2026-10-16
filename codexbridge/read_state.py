@@ -23,18 +23,42 @@ class ReadStateStore:
         self._threads: dict[str, int] = {}
         self._messages: set[str] = set()
         self._lock = threading.RLock()
-        # Every client (phone, ESP device, future hardware) writes through this
-        # one store, so it is also the place where a read becomes a notification.
-        # Listeners take ``{"thread_id", "completed_at", "message_id", "source"}``
-        # and are responsible for relaying it to the clients they own.
+        # Every client writes through this one store.  Listeners let the hub
+        # turn a global read marker into an immediate fan-out to all devices.
         self._listeners: list[Any] = []
         self.load()
 
-    def add_listener(self, listener) -> None:
+    def add_listener(self, listener: Any) -> None:
+        if self._has_listener(listener):
+            # A hub wires itself at construction; a host that also registers the
+            # same sink must not fan one read out twice to every client.
+            return
         self._listeners.append(listener)
 
-    def _notify(self, thread_id: str, completed_at: int,
-                message_id: str, source: str) -> None:
+    def _has_listener(self, listener: Any) -> bool:
+        for existing in self._listeners:
+            if existing is listener:
+                return True
+            if isinstance(existing, tuple) and isinstance(listener, tuple):
+                if existing == listener:
+                    return True
+                continue
+            bound = getattr(existing, "__func__", None)
+            target = getattr(existing, "__self__", None)
+            other = getattr(listener, "__func__", None)
+            other_target = getattr(listener, "__self__", None)
+            if bound is not None and other is not None:
+                if bound is other and target is other_target:
+                    return True
+        return False
+
+    def _notify(
+        self,
+        thread_id: str,
+        completed_at: int,
+        message_id: str,
+        source: str,
+    ) -> None:
         event = {
             "thread_id": thread_id,
             "completed_at": completed_at,
@@ -95,8 +119,13 @@ class ReadStateStore:
             return False
         return self.thread_read_at(thread_id) >= int(completed_at)
 
-    def mark_thread(self, thread_id: str, completed_at: int,
-                    source: str = "", notify: bool = True) -> None:
+    def mark_thread(
+        self,
+        thread_id: str,
+        completed_at: int,
+        source: str = "",
+        notify: bool = True,
+    ) -> None:
         if not thread_id or completed_at <= 0:
             return
         with self._lock:
@@ -112,8 +141,12 @@ class ReadStateStore:
         with self._lock:
             return str(message_id or "") in self._messages
 
-    def mark_message(self, message_id: str, source: str = "",
-                     notify: bool = True) -> None:
+    def mark_message(
+        self,
+        message_id: str,
+        source: str = "",
+        notify: bool = True,
+    ) -> None:
         if not message_id:
             return
         with self._lock:
@@ -125,8 +158,6 @@ class ReadStateStore:
         self.save()
         if not notify:
             return
-        # Message ids are "<kind>:<thread>[:<stamp>]", so the thread is always
-        # the second field. Derived here so one marker serves both fan-out paths.
         parts = message_id.split(":")
         thread_id = parts[1] if len(parts) > 1 else ""
         self._notify(thread_id, 0, message_id, source)

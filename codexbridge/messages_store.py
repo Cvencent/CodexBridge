@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,8 +47,37 @@ IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
 )
 
 
+# An in-flight record only proves the host is alive while the collector keeps
+# republishing it. A Codex thread that died, or a collector that stopped, leaves
+# the same ``working`` line sitting in the store forever, and a device polling
+# for state would then read "4 tasks running" long after nothing is running.
+# Freshness is measured from ``seen_at`` -- the wall-clock instant the host last
+# received this exact record -- so it needs no per-device knowledge.
+IN_FLIGHT_STALE_AFTER_SECONDS: float = 90.0
+
+
 def is_in_flight(record: "MessageRecord") -> bool:
     return record.kind in IN_FLIGHT_KINDS and record.status in IN_FLIGHT_STATUSES
+
+
+def is_fresh(
+    record: "MessageRecord",
+    now: float | None = None,
+    max_age_seconds: float = IN_FLIGHT_STALE_AFTER_SECONDS,
+) -> bool:
+    """Has the host seen this record recently enough to still call it live?
+
+    ``max_age_seconds <= 0`` disables the rule, and a record with no usable
+    timestamp is treated as fresh so a client that cannot supply clocks is
+    never penalised.
+    """
+    if max_age_seconds <= 0:
+        return True
+    stamp = record.seen_at or record.created_at
+    if stamp <= 0:
+        return True
+    reference = time.time() if now is None else float(now)
+    return reference - stamp <= float(max_age_seconds)
 
 
 KIND_CAPABILITY: dict[str, str] = {
@@ -70,6 +100,9 @@ class MessageRecord:
     created_at: float
     data: dict[str, Any] | None = None
     read_by: set[str] = field(default_factory=set)
+    # Set by the store on every arrival; never part of the fingerprint,
+    # because it is transport metadata rather than renderable content.
+    seen_at: float = 0.0
 
     @property
     def fingerprint(self) -> str:
@@ -110,6 +143,11 @@ class MessageStore:
             record.read_by.update(existing.read_by)
             if record.data is None:
                 record.data = existing.data
+        if record.kind in IN_FLIGHT_KINDS:
+            # A collector cycle that re-reports the same live task is the proof
+            # of life; record the arrival so staleness can be judged later.
+            record.seen_at = time.time()
+        if existing is not None:
             del self._messages[record.message_id]
         self._messages[record.message_id] = record
         while len(self._messages) > self.max_messages:
@@ -130,21 +168,27 @@ class MessageStore:
         record = self._messages.get(message_id)
         return set(record.read_by) if record is not None else set()
 
-    def live_status(self) -> MessageRecord | None:
+    def live_status(self, thread_id: str = "") -> MessageRecord | None:
         """Most recent in-flight status record, or None.
 
         The device asks for this when its screen stops making progress, so the
         answer has to be the record the host is currently sitting on rather than
-        the last one that happened to look new.
+        the last one that happened to look new. ``thread_id`` narrows the answer
+        to the conversation a client is actually watching.
         """
-        candidates = [
-            record
-            for record in self._messages.values()
-            if is_in_flight(record) and record.kind == "status"
-        ]
+        wanted = str(thread_id or "")
+        fresh = [record for record in self._messages.values()
+                 if is_in_flight(record) and is_fresh(record)
+                 and (not wanted or str(record.thread_id or "") == wanted)]
+        status_records = [record for record in fresh if record.kind == "status"]
+        # The task record carries the same live thread when the collector has
+        # only republished one of the pair, so a waiting device is answered
+        # rather than left in silence.
+        candidates = status_records or [record for record in fresh if record.kind == "task"]
         if not candidates:
             return None
-        return max(candidates, key=lambda item: (item.created_at, item.message_id))
+        return max(candidates, key=lambda item: (item.seen_at or item.created_at,
+                                                 item.message_id))
 
     def records(self) -> list[MessageRecord]:
         """Snapshot of stored records in insertion order.

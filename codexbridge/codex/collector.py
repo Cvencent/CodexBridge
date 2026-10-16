@@ -82,6 +82,10 @@ def records_from_snapshot(
                     "generated_at_epoch": generated_at,
                     "account": dict(account),
                     "task": primary,
+                    # The desktop only answers for one thread at a time. This is
+                    # that thread's line, and the one a client that has not
+                    # chosen a conversation is shown instead.
+                    "aggregate": True,
                 },
             )
         )
@@ -97,6 +101,53 @@ def records_from_snapshot(
                 data={
                     "generated_at_epoch": generated_at,
                     "tasks": visible_tasks,
+                    "aggregate": True,
+                },
+            )
+        )
+
+    # Every other running conversation gets the same two records, so a client
+    # watching one of them can follow its own progress instead of whichever
+    # thread the desktop happened to pick as primary.
+    LIVE_TASK_STATUSES = {"working", "waiting_user", "queued", "starting"}
+    for task in visible_tasks:
+        task_thread = str(task.get("thread_id") or "")
+        task_status = str(task.get("status") or "idle")
+        if not task_thread or task_thread == primary_thread:
+            continue
+        if task_status not in LIVE_TASK_STATUSES:
+            # A finished conversation is already reported through its result
+            # record; only live ones need a line a client can follow.
+            continue
+        records.append(
+            MessageRecord(
+                f"status:{task_thread}:{task_status}",
+                task_thread,
+                "status",
+                task_status,
+                str(task.get("title") or "Codex 状态"),
+                str(task.get("current_action") or ""),
+                generated_at,
+                data={
+                    "generated_at_epoch": generated_at,
+                    "task": task,
+                    "aggregate": False,
+                },
+            )
+        )
+        records.append(
+            MessageRecord(
+                f"task:{task_thread}",
+                task_thread,
+                "task",
+                task_status,
+                str(task.get("title") or "Codex 任务"),
+                str(task.get("title") or ""),
+                generated_at,
+                data={
+                    "generated_at_epoch": generated_at,
+                    "tasks": [task],
+                    "aggregate": False,
                 },
             )
         )

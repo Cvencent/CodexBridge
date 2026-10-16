@@ -305,6 +305,9 @@ class CodexCatalogTest(unittest.TestCase):
                     "title": "修复登录",
                     "project": "项目 1",
                     "last_message": "登录问题已经修复。",
+                    # The id tells the host which thread this device now follows,
+                    # so other sessions cannot cut into its screen.
+                    "thread_id": "thread-1",
                 }
             ],
         )
@@ -365,7 +368,12 @@ class CodexCatalogTest(unittest.TestCase):
         )
         self.app.calls.clear()
         reply = service.handle_voice_command("device-1", "帮我把测试跑完")
-        self.assertEqual(reply, [{"type": "task_queued", "text": "指令已发送到电脑端"}])
+        self.assertEqual(
+            reply,
+            [{"type": "task_queued", "text": "指令已发送到电脑端",
+             # the device starts following this conversation for its answer
+             "thread_id": "thread-1"}],
+        )
         turn = [c for c in self.app.calls if c[0] == "turn/start"]
         self.assertEqual(len(turn), 1)
         self.assertEqual(turn[0][1]["threadId"], "thread-1")
