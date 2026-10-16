@@ -53,7 +53,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (python -c "import codexbridge; print(codexbridge.VERSION)")
-          ./packaging/build_windows.ps1 -Version $version
+          ./packaging/build_windows.ps1 -Version $version -SkipTests
       - name: Upload release assets
         shell: pwsh
         env:

@@ -11,6 +11,11 @@ from codexbridge.hub import BridgeHub
 from codexbridge.messages_store import MessageRecord
 
 
+# The assertions cover behaviour, not latency: a loaded CI runner can starve
+# the freshly started session thread for far longer than a second.
+ONLINE_TIMEOUT_SECONDS = 10.0
+
+
 class FakeSession:
     online = threading.Event()
     created = None
@@ -92,7 +97,7 @@ class DeviceManagerTest(unittest.TestCase):
             capabilities=["status", "text", "results", "read_ack"],
         )
         self.manager.sync([result])
-        self.assertTrue(FakeSession.online.wait(1.0))
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
         self.assertNotIn("protocol", FakeSession.created.kwargs)
         self.assertNotIn("capabilities", FakeSession.created.kwargs)
         self.assertNotIn("on_hello", FakeSession.created.kwargs)
@@ -122,7 +127,7 @@ class DeviceManagerTest(unittest.TestCase):
         )
         FakeSession.info_name = None
         self.manager.sync([result])
-        self.assertTrue(FakeSession.online.wait(1.0))
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
         self.assertEqual(self.registry.get("d1").name, "Desk From Discovery")
 
     def test_legacy_record_migrates_token_to_discovered_device_id(self):
@@ -143,7 +148,7 @@ class DeviceManagerTest(unittest.TestCase):
             capabilities=["status", "text", "read_ack"],
         )
         self.manager.sync([result])
-        self.assertTrue(FakeSession.online.wait(1.0))
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
         record = self.registry.get("passport-device")
         self.assertEqual(record.token, "legacy-token-abcdef")
         self.assertIsNone(self.registry.get("legacy:127.0.0.1"))
@@ -160,14 +165,14 @@ class DeviceManagerTest(unittest.TestCase):
         FakeSession.fail_before_online = True
         self.manager.sync([result])
 
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + ONLINE_TIMEOUT_SECONDS
         while "d1" in self.manager._sessions and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertNotIn("d1", self.manager._sessions)
 
         FakeSession.fail_before_online = False
         self.manager.sync([result])
-        self.assertTrue(FakeSession.online.wait(1.0))
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
 
     def test_remove_stops_session_and_clears_hub(self):
         result = DiscoveryResult(
@@ -179,7 +184,7 @@ class DeviceManagerTest(unittest.TestCase):
             capabilities=["status", "text", "results", "read_ack"],
         )
         self.manager.sync([result])
-        self.assertTrue(FakeSession.online.wait(1.0))
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
 
         self.manager.remove("d1")
 
