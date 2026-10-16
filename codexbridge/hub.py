@@ -106,6 +106,11 @@ class BridgeHub:
         self.read_state = read_state or ReadStateStore(None)
         self.read_state.add_listener(self.handle_cross_client_read)
         self.companion_events: Any = None
+        # Which Codex thread each device is looking at, learned from the catalog
+        # selection it confirmed (and echoed back on later requests). Live records
+        # for a thread nobody selected must not drive a screen that is waiting on
+        # its own task.
+        self._device_thread: dict[str, str] = {}
         self.speech = speech
         self.codex_catalog = codex_catalog
         self.commands = commands
@@ -173,7 +178,42 @@ class BridgeHub:
             "failed": failed_unread,
         }
 
+    def note_device_thread(self, device_id: str, thread_id: str) -> None:
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return
+        self._device_thread[device_id] = thread_id
+
+    def followed_thread(self, device_id: str) -> str:
+        return self._device_thread.get(device_id, "")
+
+    def _message_visible(self, device_id: str, payload: dict) -> bool:
+        """Can this record change what the device is showing right now?
+
+        Aggregate counters are always shared -- the home screen legitimately
+        reports how much work the computer is doing. A single thread's progress
+        text is not: without this rule any other Codex session on the desktop
+        could cut into a device that is waiting on its own task.
+        """
+        kind = str(payload.get("kind") or "")
+        if kind not in {"status", "task", "result"}:
+            return True
+        followed = self.followed_thread(device_id)
+        if followed:
+            return str(payload.get("thread_id") or "") == followed
+        # A client that has never picked a conversation keeps the aggregate
+        # feed: older firmware, the phone, and any future reader all learn
+        # about work this way until they say otherwise. Records the collector
+        # marks as one thread's private progress stay out of that feed.
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("aggregate") is False:
+            return False
+        return True
+
     def _send_codex_state(self, device_id: str, event: dict) -> None:
+        asked = event.get("thread_id")
+        if isinstance(asked, str) and asked.strip():
+            self.note_device_thread(device_id, asked)
         payload = {"type": "codex_state", **self.counts()}
         request_id = event.get("request_id")
         if "request_id" in event:
@@ -201,7 +241,7 @@ class BridgeHub:
             if capability is None:
                 return
             payload = {"type": "message", **self._message_payload(record)}
-            self._broadcast(payload, capability)
+            self._broadcast_messages(payload, capability)
             if record.kind in {"task", "result"}:
                 # The badge counts are aggregate state, not a chat message.
                 # Push them as soon as a task enters or leaves the terminal
@@ -463,6 +503,10 @@ class BridgeHub:
         except Exception:
             self._send_error(device_id, "codex_catalog_failed")
             return
+        # The voice path may have started a thread of its own; that is the
+        # conversation this device is now waiting on.
+        if hasattr(service, "active_thread"):
+            self.note_device_thread(device_id, service.active_thread(device_id))
         for message in messages or []:
             if isinstance(message, dict):
                 self._send(device_id, message)
@@ -478,6 +522,9 @@ class BridgeHub:
         except Exception:
             self._send_error(device_id, "codex_catalog_failed")
             return
+        for message in messages or []:
+            if isinstance(message, dict) and message.get("type") == "codex_selected":
+                self.note_device_thread(device_id, message.get("thread_id"))
         request_id = event.get("request_id")
         has_request_id = "request_id" in event
         for message in messages or []:
@@ -782,6 +829,21 @@ class BridgeHub:
                         self._apply_budget(payload, self.budget_for(device_id)),
                     )
 
+    def _broadcast_messages(self, payload: dict, capability: str) -> None:
+        """Fan one record out, but only to devices allowed to see it."""
+        with self._lock:
+            targets = [
+                (device_id, session)
+                for device_id, session in list(self._sessions.items())
+                if capability in self.capabilities_for(device_id)
+                and self._message_visible(device_id, payload)
+            ]
+        for device_id, session in targets:
+            self._send_to(
+                session,
+                self._apply_budget(payload, self.budget_for(device_id)),
+            )
+
     def _send_error(self, device_id: str, code: str) -> None:
         self._send(device_id, {"type": "error", "code": code})
 
@@ -801,7 +863,9 @@ class BridgeHub:
         same call works for an ESP32 and for a desktop client.
         """
         with self._lock:
-            live = self.store.live_status()
+            # Answer about the thread this device is watching, not whichever
+            # record the collector touched last.
+            live = self.store.live_status(self.followed_thread(device_id))
         if live is None:
             return None
         task = live.data.get("task") if isinstance(live.data, dict) else None

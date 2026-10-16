@@ -155,17 +155,20 @@ class MessageStore:
         record = self._messages.get(message_id)
         return set(record.read_by) if record is not None else set()
 
-    def live_status(self) -> MessageRecord | None:
+    def live_status(self, thread_id: str = "") -> MessageRecord | None:
         """Most recent in-flight status record, or None.
 
         The device asks for this when its screen stops making progress, so the
         answer has to be the record the host is currently sitting on rather than
-        the last one that happened to look new.
+        the last one that happened to look new. ``thread_id`` narrows the answer
+        to the conversation a client is actually watching.
         """
+        wanted = str(thread_id or "")
         fresh = [
             record
             for record in self._messages.values()
             if is_in_flight(record) and is_fresh(record)
+            and (not wanted or str(record.thread_id or "") == wanted)
         ]
         status_records = [record for record in fresh if record.kind == "status"]
         # A task record carries the same live thread when only one half of the
