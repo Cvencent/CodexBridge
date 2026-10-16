@@ -437,7 +437,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             return
         code = str(payload.get("code") or "")
         name = str(payload.get("name") or "")
-        claimed = self.app.store.claim(code, name)
+        client_id = str(payload.get("client_id") or "")
+        claimed = self.app.store.claim(code, name, client_id=client_id)
         if claimed is None:
             self._error(403, "pairing_failed", "配对码不正确或已过期")
             return

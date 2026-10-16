@@ -84,6 +84,7 @@ data class ThreadSummary(
     val updated_at: Long = 0,
     val recency_at: Long = 0,
     val completed_at: Long = 0,
+    val turn_id: String = "",
     val tokens: Long = 0,
     val ephemeral: Boolean = false,
     val error_message: String = "",

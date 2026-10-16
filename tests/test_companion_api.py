@@ -216,6 +216,29 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "pairing_failed")
 
+    def test_repairing_the_same_installation_reuses_the_phone_record(self) -> None:
+        code = self.store.pairing_code()["code"]
+        status, first = self.request(
+            "POST",
+            "/api/companion/pair",
+            {"code": code, "name": "测试手机", "client_id": "installation-1"},
+        )
+        self.assertEqual(status, 200, first)
+
+        code = self.store.pairing_code(regenerate=True)["code"]
+        status, second = self.request(
+            "POST",
+            "/api/companion/pair",
+            {"code": code, "name": "测试手机", "client_id": "installation-1"},
+        )
+        self.assertEqual(status, 200, second)
+
+        self.assertEqual(second["phone_id"], first["phone_id"])
+        self.assertNotEqual(second["token"], first["token"])
+        self.assertEqual(len(self.store.snapshot()["phones"]), 1)
+        status, _ = self.request("GET", "/api/companion/status", token=second["token"])
+        self.assertEqual(status, 200)
+
     def test_disabled_store_rejects_requests(self) -> None:
         self.store.set_enabled(False)
         status, payload = self.request("GET", "/api/companion/status")

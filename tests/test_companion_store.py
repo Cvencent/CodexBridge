@@ -43,6 +43,20 @@ class CompanionStoreTests(unittest.TestCase):
             delta=5,
         )
 
+    def test_same_installation_reuses_phone_id(self) -> None:
+        first = self.store.claim(
+            self.store.pairing_code()["code"], "旧名字", client_id="installation-1"
+        )
+        assert first is not None
+        second = self.store.claim(
+            self.store.pairing_code(regenerate=True)["code"],
+            "新名字",
+            client_id="installation-1",
+        )
+        assert second is not None
+        self.assertEqual(second["phone_id"], first["phone_id"])
+        self.assertNotEqual(second["token"], first["token"])
+
     def test_claim_with_correct_code_returns_token(self) -> None:
         code = self.store.pairing_code()["code"]
         claimed = self.store.claim(code, "小手机")

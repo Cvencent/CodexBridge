@@ -18,8 +18,8 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.codexbridge.mobile.data.ApiClient
+import com.codexbridge.mobile.data.CompletionNotificationTracker
 import com.codexbridge.mobile.data.SettingsStore
-import com.codexbridge.mobile.data.completionNotificationKey
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -30,7 +30,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private const val LISTEN_CHANNEL = "codexbridge_listen"
-private const val COMPLETION_CHANNEL = "codexbridge_completion_v4"
+private const val COMPLETION_CHANNEL = "codexbridge_completion_v5"
 private const val LISTEN_NOTIFICATION_ID = 4101
 private const val RETRY_MS = 3000L
 private const val POLL_MS = 5000L
@@ -40,6 +40,8 @@ class CompletionNotificationService : Service() {
     private var job: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private lateinit var completions: CompletionNotificationTracker
+    private var baselineReady = false
 
     override fun onCreate() {
         super.onCreate()
@@ -56,8 +58,9 @@ class CompletionNotificationService : Service() {
         holdConnectionLocks()
         if (job?.isActive != true) {
             job = scope.launch {
-                launch { listenEvents(settings) }
-                launch { pollCompletions(settings) }
+                seedCompletionBaseline(settings)
+                launch { listenEvents(settings, completions) }
+                launch { pollCompletions(settings, completions) }
             }
         }
         return START_STICKY
@@ -150,7 +153,25 @@ class CompletionNotificationService : Service() {
         }
     }
 
-    private suspend fun listenEvents(settings: SettingsStore) {
+    private suspend fun seedCompletionBaseline(settings: SettingsStore) {
+        completions = CompletionNotificationTracker(settings)
+        try {
+            val startedAt = System.currentTimeMillis() / 1000
+            val client = ApiClient(settings.baseUrl, settings.token)
+            completions.seed(
+                client.threads().threads,
+                beforeOrAt = startedAt,
+            )
+            baselineReady = true
+        } catch (_: Exception) {
+            baselineReady = false
+        }
+    }
+
+    private suspend fun listenEvents(
+        settings: SettingsStore,
+        completions: CompletionNotificationTracker,
+    ) {
         while (scope.isActive) {
             try {
                 val client = ApiClient(settings.baseUrl, settings.token)
@@ -167,12 +188,12 @@ class CompletionNotificationService : Service() {
                             }
                             if (event.turn_id.isBlank() && event.completed_at <= 0) return@collect
                             val failed = event.status == "failed"
-                            val key = completionNotificationKey(
-                                event.thread_id,
-                                event.turn_id,
-                                event.completed_at,
-                            )
-                            if (!settings.markNotificationSent(event.thread_id, key)) return@collect
+                            if (!completions.shouldNotify(
+                                    event.thread_id,
+                                    event.turn_id,
+                                    event.completed_at,
+                                )
+                            ) return@collect
                             notifyCompletion(event.thread_id, failed)
                         }
                         "thread_status" -> {
@@ -195,20 +216,31 @@ class CompletionNotificationService : Service() {
      * Events can be missed while the phone sleeps or the stream reconnects.
      * Poll the thread list as a safety net so a finished task still alerts.
      */
-    private suspend fun pollCompletions(settings: SettingsStore) {
+    private suspend fun pollCompletions(
+        settings: SettingsStore,
+        completions: CompletionNotificationTracker,
+    ) {
         while (scope.isActive) {
             delay(POLL_MS)
             try {
                 val client = ApiClient(settings.baseUrl, settings.token)
                 val threads = client.threads().threads
-                threads.forEach { thread ->
-                    val failed = thread.status == "failed"
-                    if ((!failed && thread.status != "completed") || thread.completed_at <= 0) {
-                        return@forEach
-                    }
-                    val key = completionNotificationKey(thread.thread_id, "", thread.completed_at)
-                    if (settings.markNotificationSent(thread.thread_id, key)) {
-                        notifyCompletion(thread.thread_id, failed)
+                if (!baselineReady) {
+                    // The first snapshot is history, not a completion. If the
+                    // service started while offline, establish the baseline on
+                    // the first successful poll instead of replaying it.
+                    val startedAt = System.currentTimeMillis() / 1000
+                    completions.seed(threads, beforeOrAt = startedAt)
+                    baselineReady = true
+                } else {
+                    threads.forEach { thread ->
+                        val failed = thread.status == "failed"
+                        if ((!failed && thread.status != "completed") || thread.completed_at <= 0) {
+                            return@forEach
+                        }
+                        if (completions.shouldNotify(thread.thread_id, thread.turn_id, thread.completed_at)) {
+                            notifyCompletion(thread.thread_id, failed)
+                        }
                     }
                 }
             } catch (_: Exception) {
@@ -264,7 +296,6 @@ private fun postCompletionNotification(context: Context, threadId: String, faile
         intent,
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
-    val sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
     val builder = NotificationCompat.Builder(context, COMPLETION_CHANNEL)
         .setSmallIcon(android.R.drawable.stat_notify_chat)
         .setContentTitle(if (failed) "Codex 任务失败" else "Codex 任务已完成")
@@ -273,29 +304,7 @@ private fun postCompletionNotification(context: Context, threadId: String, faile
         .setAutoCancel(true)
         .setCategory(NotificationCompat.CATEGORY_STATUS)
         .setPriority(NotificationCompat.PRIORITY_HIGH)
-        .setVibrate(longArrayOf(0, 250, 150, 250))
-    if (sound != null) builder.setSound(sound)
     NotificationManagerCompat.from(context).notify(completionId(threadId), builder.build())
-    playNotificationSound(context)
-}
-
-/**
- * Some OEM ROMs cache or override notification channel sound settings.
- * Play the system notification sound directly so the user always hears it,
- * regardless of what the channel does.
- */
-private fun playNotificationSound(context: Context) {
-    try {
-        val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        val ringtone = RingtoneManager.getRingtone(context, uri)
-        ringtone.audioAttributes = android.media.AudioAttributes.Builder()
-            .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
-            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        ringtone.play()
-    } catch (_: Exception) {
-        // Channel sound is the fallback.
-    }
 }
 
 private fun createChannels(context: Context) {
@@ -306,7 +315,9 @@ private fun createChannels(context: Context) {
         },
     )
     // A new channel id is required because Android will not change the sound of
-    // an existing channel after it has been created on the device.
+    // an existing channel after it has been created on the device. The system
+    // channel owns the single sound/vibration event; do not also play a
+    // Ringtone manually.
     manager.createNotificationChannel(
         NotificationChannel(COMPLETION_CHANNEL, "任务完成提醒", NotificationManager.IMPORTANCE_HIGH).apply {
             description = "Codex 任务完成提醒"

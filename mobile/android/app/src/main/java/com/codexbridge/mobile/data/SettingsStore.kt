@@ -2,8 +2,9 @@ package com.codexbridge.mobile.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import java.util.UUID
 
-class SettingsStore(context: Context) {
+class SettingsStore(context: Context) : CompletionNotificationState {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("codexbridge_mobile", Context.MODE_PRIVATE)
 
@@ -18,6 +19,24 @@ class SettingsStore(context: Context) {
     var phoneId: String
         get() = prefs.getString("phone_id", "") ?: ""
         set(value) = prefs.edit().putString("phone_id", value).apply()
+
+    /**
+     * Stable identity for this app installation. Pairing may be renewed with
+     * a new token, but the bridge can then update the existing phone record
+     * instead of creating a second identical device.
+     */
+    val installationId: String
+        get() {
+            val existing = prefs.getString("installation_id", "") ?: ""
+            if (existing.isNotBlank()) return existing
+            // Upgrade path: the previous app version stored the bridge-assigned
+            // phone_id but no installation identity. Reuse it once so the
+            // bridge can claim the existing record instead of creating a twin.
+            val legacyPhoneId = phoneId
+            val generated = legacyPhoneId.ifBlank { UUID.randomUUID().toString() }
+            prefs.edit().putString("installation_id", generated).commit()
+            return generated
+        }
 
     var bridgeName: String
         get() = prefs.getString("bridge_name", "") ?: ""
@@ -47,12 +66,21 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt("discovery_port", ApiClient.DEFAULT_DISCOVERY_PORT)
         set(value) = prefs.edit().putInt("discovery_port", value).apply()
 
-    fun markNotificationSent(threadId: String, notificationKey: String): Boolean {
+    override fun markCompletionSeen(threadId: String, notificationKey: String): Boolean {
         if (threadId.isBlank() || notificationKey.isBlank()) return false
         val key = "notified_$notificationKey"
         if (prefs.getBoolean(key, false)) return false
         prefs.edit().putBoolean(key, true).apply()
         return true
+    }
+
+    override fun completionWatermark(threadId: String): Long =
+        if (threadId.isBlank()) 0L
+        else prefs.getLong("completion_watermark_$threadId", 0L)
+
+    override fun advanceCompletionWatermark(threadId: String, completedAt: Long) {
+        if (threadId.isBlank() || completedAt <= completionWatermark(threadId)) return
+        prefs.edit().putLong("completion_watermark_$threadId", completedAt).apply()
     }
 
     val isPaired: Boolean
@@ -65,7 +93,11 @@ class SettingsStore(context: Context) {
     fun clearPairing() {
         val editor = prefs.edit().remove("token").remove("phone_id").remove("notification_watermark")
         prefs.all.keys
-            .filter { it.startsWith("completion_seen_") || it.startsWith("notified_") }
+            .filter {
+                it.startsWith("completion_seen_") ||
+                    it.startsWith("completion_watermark_") ||
+                    it.startsWith("notified_")
+            }
             .forEach(editor::remove)
         editor.apply()
     }

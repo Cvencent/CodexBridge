@@ -152,7 +152,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     entered
                 }
-                val response = withContext(Dispatchers.IO) { client.pair(code.trim(), phoneName()) }
+                val response = withContext(Dispatchers.IO) {
+                    client.pair(code.trim(), phoneName(), settings.installationId)
+                }
                 if (!response.ok || response.token.isBlank()) {
                     throw ApiException("配对失败，请重新生成配对码")
                 }
@@ -847,10 +849,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleError(error: Throwable) {
-        if (error is ApiException && error.unauthorized) {
-            unpair()
+        // A 401 can be a transient bridge restart or a stale token. Keep the
+        // saved address/token/installation identity so the next launch can
+        // reconnect; only the explicit settings action clears pairing.
+        val disconnected = error is ApiException && error.unauthorized
+        _state.update {
+            it.copy(
+                error = friendly(error),
+                connected = if (disconnected) false else it.connected,
+            )
         }
-        _state.update { it.copy(error = friendly(error), connected = !(error is ApiException && error.unauthorized)) }
     }
 
     private fun friendly(error: Throwable): String = when (error) {

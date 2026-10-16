@@ -46,6 +46,9 @@ class PhoneRecord:
     created_at: float
     last_seen: float = 0.0
     enabled: set[str] = field(default_factory=lambda: set(PHONE_CAPABILITIES))
+    # Stable installation identity supplied by the phone. Older records keep
+    # this empty and are migrated the first time their phone pairs again.
+    client_id: str = ""
 
     def capabilities(self) -> set[str]:
         return self.enabled & PHONE_CAPABILITIES
@@ -170,7 +173,28 @@ class CompanionStore:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if isinstance(payload, dict) and self._apply_payload(payload):
+        if not isinstance(payload, dict):
+            return
+        # Treat the merge as reload-only. If an older-format file temporarily
+        # has no phone while this instance still holds a newer in-memory
+        # record, retain the in-memory copy instead of letting the next save
+        # erase it. Newer records on disk still win by last_seen below.
+        before = dict(self.phones)
+        migrated = self._apply_payload(payload)
+        for phone_id, record in before.items():
+            current = self.phones.get(phone_id)
+            if current is None or record.last_seen > current.last_seen:
+                self.phones[phone_id] = record
+        phones = payload.get("phones")
+        disk_phone_ids: set[str] = set()
+        if isinstance(phones, list):
+            disk_phone_ids = {
+                record.phone_id
+                for record in (self._record_from(item) for item in phones)
+                if record is not None
+            }
+        recovered = any(phone_id not in disk_phone_ids for phone_id in before)
+        if migrated or recovered:
             self.save()
 
     @staticmethod
@@ -189,6 +213,7 @@ class CompanionStore:
         enabled = value.get('enabled', list(PHONE_CAPABILITIES))
         if not isinstance(enabled, list) or any(not isinstance(item, str) for item in enabled):
             enabled = []
+        client_id = value.get('client_id')
         return PhoneRecord(
             phone_id=phone_id,
             name=name if isinstance(name, str) else "",
@@ -196,6 +221,7 @@ class CompanionStore:
             created_at=float(created) if isinstance(created, (int, float)) else 0.0,
             last_seen=float(last_seen) if isinstance(last_seen, (int, float)) else 0.0,
             enabled=set(enabled) & PHONE_CAPABILITIES,
+            client_id=client_id.strip()[:128] if isinstance(client_id, str) else "",
         )
 
     def save(self) -> None:
@@ -216,6 +242,7 @@ class CompanionStore:
                         "created_at": record.created_at,
                         "last_seen": record.last_seen,
                         "enabled": sorted(record.capabilities()),
+                        "client_id": record.client_id,
                     }
                     for record in self.phones.values()
                 ],
@@ -310,7 +337,7 @@ class CompanionStore:
             self.save()
         return {"code": code, "expires_at": expires_at}
 
-    def claim(self, code: str, name: str) -> dict | None:
+    def claim(self, code: str, name: str, client_id: str = "") -> dict | None:
         if not isinstance(code, str) or not code:
             return None
         with self._lock:
@@ -327,17 +354,53 @@ class CompanionStore:
                     self._code_expires_at = 0.0
                 self.save()
                 return None
-            if len(self.phones) >= MAX_PHONES:
-                oldest = min(self.phones.values(), key=lambda item: item.created_at)
+            stable_id = client_id.strip()[:128] if isinstance(client_id, str) else ""
+            existing = None
+            if stable_id:
+                matches = [
+                    record for record in self.phones.values()
+                    if record.client_id == stable_id
+                ]
+                if not matches and stable_id in self.phones:
+                    # Migration path for a phone that already stored a bridge
+                    # assigned phone_id before installation_id existed.
+                    matches = [self.phones[stable_id]]
+                if matches:
+                    matches.sort(
+                        key=lambda record: (record.last_seen, record.created_at),
+                        reverse=True,
+                    )
+                    existing = matches[0]
+                    for duplicate in matches[1:]:
+                        self.phones.pop(duplicate.phone_id, None)
+                    existing.client_id = stable_id
+
+            if existing is None and len(self.phones) >= MAX_PHONES:
+                # Prefer evicting an unclaimed legacy record over one that can
+                # still be recognized by its installation identity.
+                oldest = min(
+                    self.phones.values(),
+                    key=lambda item: (bool(item.client_id), item.created_at),
+                )
                 self.phones.pop(oldest.phone_id, None)
-            phone_id = "phone-" + secrets.token_hex(6)
+
+            if existing is None:
+                phone_id = "phone-" + secrets.token_hex(6)
+                record = PhoneRecord(
+                    phone_id=phone_id,
+                    name=(name or "").strip()[:48],
+                    token_hash="",
+                    created_at=now,
+                    client_id=stable_id,
+                )
+            else:
+                phone_id = existing.phone_id
+                record = existing
+                record.name = (name or "").strip()[:48]
+
             token = _new_token()
-            record = PhoneRecord(
-                phone_id=phone_id,
-                name=(name or "").strip()[:48],
-                token_hash=_hash_token(token),
-                created_at=now,
-            )
+            record.token_hash = _hash_token(token)
+            record.last_seen = now
             self.phones[phone_id] = record
             self._code = ""
             self._code_expires_at = 0.0

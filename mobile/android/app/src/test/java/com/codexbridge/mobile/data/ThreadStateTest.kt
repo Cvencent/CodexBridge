@@ -1,8 +1,25 @@
 package com.codexbridge.mobile.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+
+private class FakeCompletionState : CompletionNotificationState {
+    val watermarks = mutableMapOf<String, Long>()
+    val seenKeys = mutableSetOf<String>()
+
+    override fun completionWatermark(threadId: String): Long = watermarks[threadId] ?: 0L
+
+    override fun advanceCompletionWatermark(threadId: String, completedAt: Long) {
+        if (completedAt > completionWatermark(threadId)) {
+            watermarks[threadId] = completedAt
+        }
+    }
+
+    override fun markCompletionSeen(threadId: String, notificationKey: String): Boolean =
+        seenKeys.add(notificationKey)
+}
 
 class ThreadStateTest {
     @Test
@@ -38,20 +55,55 @@ class ThreadStateTest {
     }
 
     @Test
-    fun completionNotificationKeyIsSharedBySseAndPolling() {
+    fun completionNotificationKeyIsSharedBySseAndPollingWhenTurnIsKnown() {
         val fromSse = completionNotificationKey("thread-1", "turn-1", 1000)
-        val fromPolling = completionNotificationKey("thread-1", "", 1000)
+        val fromPolling = completionNotificationKey("thread-1", "turn-1", 1001)
         assertEquals(fromSse, fromPolling)
-        assertTrue(fromSse != completionNotificationKey("thread-1", "", 1001))
-        assertTrue(fromSse != completionNotificationKey("thread-2", "", 1000))
+        assertTrue(fromSse != completionNotificationKey("thread-1", "turn-2", 1000))
+        assertTrue(fromSse != completionNotificationKey("thread-2", "turn-1", 1000))
     }
 
     @Test
-    fun completionNotificationKeyFallsBackToTurnId() {
-        val first = completionNotificationKey("thread-1", "turn-1")
-        assertEquals(first, completionNotificationKey("thread-1", "turn-1"))
-        assertTrue(first != completionNotificationKey("thread-1", "turn-2"))
-        assertTrue(first != completionNotificationKey("thread-2", "turn-1"))
+    fun completionNotificationKeyFallsBackToCompletionTime() {
+        val first = completionNotificationKey("thread-1", "", 1000)
+        assertEquals(first, completionNotificationKey("thread-1", "", 1000))
+        assertTrue(first != completionNotificationKey("thread-1", "", 1001))
+        assertTrue(first != completionNotificationKey("thread-2", "", 1000))
+        assertEquals("thread-1", completionNotificationKey("thread-1", "", 0))
+    }
+
+    @Test
+    fun historicalCompletionSnapshotOnlySeedsTheWatermark() {
+        val state = FakeCompletionState()
+        val tracker = CompletionNotificationTracker(state)
+        tracker.seed(
+            listOf(
+                ThreadSummary(
+                    thread_id = "thread-1",
+                    turn_id = "turn-1",
+                    status = "completed",
+                    completed_at = 1000,
+                ),
+            ),
+            beforeOrAt = 2000,
+        )
+
+        assertFalse(tracker.shouldNotify("thread-1", "turn-1", 0))
+        assertFalse(tracker.shouldNotify("thread-1", "turn-1", 1000))
+    }
+
+    @Test
+    fun sseAndPollingNotifyOneCompletionOnlyOnce() {
+        val state = FakeCompletionState()
+        val tracker = CompletionNotificationTracker(state)
+        tracker.seed(
+            listOf(ThreadSummary(thread_id = "thread-1", status = "working")),
+            beforeOrAt = 2000,
+        )
+
+        assertTrue(tracker.shouldNotify("thread-1", "turn-2", 0))
+        assertFalse(tracker.shouldNotify("thread-1", "turn-2", 2001))
+        assertFalse(tracker.shouldNotify("thread-1", "turn-2", 2001))
     }
 
     @Test

@@ -46,8 +46,61 @@ fun sortThreadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
     )
 
 fun completionNotificationKey(threadId: String, turnId: String, completedAt: Long = 0): String =
-    if (completedAt > 0) {
-        "$threadId:at-$completedAt"
-    } else {
-        "$threadId:turn-$turnId"
+    when {
+        turnId.isNotBlank() -> "$threadId:turn-$turnId"
+        completedAt > 0 -> "$threadId:at-$completedAt"
+        else -> threadId
     }
+
+interface CompletionNotificationState {
+    fun completionWatermark(threadId: String): Long
+    fun advanceCompletionWatermark(threadId: String, completedAt: Long)
+    fun markCompletionSeen(threadId: String, notificationKey: String): Boolean
+}
+
+/**
+ * Keep completion notifications monotonic per thread.
+ *
+ * The stream and the list poll can observe the same completion at different
+ * moments, and the first list snapshot after a service restart contains every
+ * historical finished task. Seed the watermark before listening, then accept
+ * only completions newer than that watermark and only once.
+ */
+class CompletionNotificationTracker(private val state: CompletionNotificationState) {
+    @Synchronized
+    fun seed(threads: List<ThreadSummary>, beforeOrAt: Long = Long.MAX_VALUE) {
+        threads.forEach { thread ->
+            val completedAt = thread.completed_at
+            if (
+                completedAt > 0 &&
+                thread.status in setOf("completed", "failed") &&
+                completedAt <= beforeOrAt
+            ) {
+                state.advanceCompletionWatermark(thread.thread_id, completedAt)
+                state.markCompletionSeen(
+                    thread.thread_id,
+                    completionNotificationKey(thread.thread_id, thread.turn_id, completedAt),
+                )
+            }
+        }
+    }
+
+    @Synchronized
+    fun shouldNotify(threadId: String, turnId: String, completedAt: Long): Boolean {
+        if (threadId.isBlank()) return false
+        val watermark = state.completionWatermark(threadId)
+        if (completedAt > 0) {
+            if (completedAt <= watermark) return false
+        } else if (turnId.isBlank()) {
+            return false
+        }
+        val unseen = state.markCompletionSeen(
+            threadId,
+            completionNotificationKey(threadId, turnId, completedAt),
+        )
+        if (completedAt > 0) {
+            state.advanceCompletionWatermark(threadId, completedAt)
+        }
+        return unseen
+    }
+}

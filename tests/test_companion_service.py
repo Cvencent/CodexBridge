@@ -243,7 +243,7 @@ class CompanionServiceTests(unittest.TestCase):
             listed = self.service.list_threads()['threads'][0]
         self.assertEqual(listed['status'], 'working')
 
-    def test_desktop_first_terminal_snapshot_emits_completion(self):
+    def test_desktop_first_terminal_snapshot_only_establishes_baseline(self):
         events = self.service.subscribe()
         self.service.handle_desktop_event({'type': 'broadcast', 'version': 11,
             'sourceClientId': 'owner', 'method': 'thread-stream-state-changed', 'params': {
@@ -261,9 +261,7 @@ class CompanionServiceTests(unittest.TestCase):
         while not events.empty():
             received.append(events.get_nowait())
         completions = [event for event in received if event['type'] == 'turn_completed']
-        self.assertEqual(len(completions), 1)
-        self.assertEqual(completions[0]['thread_id'], 't-first-terminal')
-        self.assertEqual(completions[0]['turn_id'], 'turn-first')
+        self.assertEqual(completions, [])
 
     def test_desktop_snapshot_emits_completed_turn_once(self):
         events = self.service.subscribe()

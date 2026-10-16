@@ -392,6 +392,11 @@ class CompanionService:
         self._desktop_status_order: dict[tuple[str, str], int] = {}
         self._desktop_status_seq = 0
         self._desktop_completed_turns: set[tuple[str, str, str]] = set()
+        # A desktop snapshot can arrive after the bridge restart with a whole
+        # history of already-finished turns. Establish that snapshot as a
+        # baseline and only publish completions on a later active -> terminal
+        # transition for a turn we have actually observed as active.
+        self._desktop_active_turns: set[tuple[str, str]] = set()
         self._desktop_pump: threading.Thread | None = None
         self._desktop_reconnect_lock = threading.Lock()
         self.desktop_state_path = (
@@ -2181,11 +2186,20 @@ class CompanionService:
                     self._desktop_turn_started[key] = started_at
                 terminal = status if status in {'completed', 'failed', 'interrupted'} else ''
                 completed_key = (thread_id, turn_id, terminal)
-                if terminal and completed_key not in self._desktop_completed_turns:
-                    self._desktop_completed_turns.add(completed_key)
-                    self.publish({'type': 'turn_completed', 'thread_id': thread_id,
-                        'turn_id': turn_id,
-                        'status': 'completed' if terminal == 'completed' else 'failed'})
+                # A terminal snapshot for a turn we have never seen active is
+                # history, not a new completion. It must only seed the
+                # baseline so a Bridge restart cannot replay old tasks.
+                if terminal:
+                    if key in self._desktop_active_turns and completed_key not in self._desktop_completed_turns:
+                        self._desktop_completed_turns.add(completed_key)
+                        self.publish({'type': 'turn_completed', 'thread_id': thread_id,
+                            'turn_id': turn_id,
+                            'status': 'completed' if terminal == 'completed' else 'failed'})
+                    else:
+                        self._desktop_completed_turns.add(completed_key)
+                    self._desktop_active_turns.discard(key)
+                else:
+                    self._desktop_active_turns.add(key)
             owner = message.get('sourceClientId')
             requests = state.get('requests', [])
             if isinstance(owner, str) and isinstance(requests, list):

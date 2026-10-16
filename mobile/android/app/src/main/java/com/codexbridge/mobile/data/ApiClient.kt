@@ -110,10 +110,17 @@ class ApiClient(
     suspend fun ping(): PingResponse =
         json.decodeFromString(PingResponse.serializer(), getText("/api/companion/ping"))
 
-    suspend fun pair(code: String, name: String): PairResponse =
+    suspend fun pair(code: String, name: String, clientId: String = ""): PairResponse =
         json.decodeFromString(
             PairResponse.serializer(),
-            postText("/api/companion/pair", buildJsonObject { put("code", code); put("name", name) }),
+            postText(
+                "/api/companion/pair",
+                buildJsonObject {
+                    put("code", code)
+                    put("name", name)
+                    if (clientId.isNotBlank()) put("client_id", clientId)
+                },
+            ),
         )
 
     suspend fun status(): StatusResponse =
