@@ -16,6 +16,13 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn("taskkill.exe", script)
         self.assertIn("/F /T /IM CodexBridge.exe", script)
 
+    def test_repair_code_tracks_the_installer_app_id(self) -> None:
+        from codexbridge import uninstall_record
+
+        script = (ROOT / "packaging" / "CodexBridge.iss").read_text(encoding="utf-8-sig")
+
+        self.assertIn("AppId={" + uninstall_record.APP_ID, script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,14 +75,14 @@ or set `CODEXBRIDGE_VOSK_MODEL` to the model directory.
 Download the Windows installer from the GitHub Releases page:
 
 ```text
-CodexBridge-Setup-1.4.0-win64.exe
+CodexBridge-Setup-1.4.1-win64.exe
 ```
 
 A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 1.4.0
+./packaging/build_windows.ps1 -Version 1.4.1
 ```
 
 `CodexBridge.exe` stays in the system tray and only handles the Codex side:
@@ -94,6 +94,9 @@ on demand and does not stay resident.
 The installer is Simplified Chinese by default. Installing a newer CodexBridge
 version over an older one upgrades the application in place and keeps user data
 in `%LOCALAPPDATA%\CodexBridge`, including paired devices and speech settings.
+The packaged app also repairs the Windows uninstall record at startup, so the
+version listed under Settings > Apps matches the installed build even when an
+upgrade wizard is cut short.
 
 The installer is built with Inno Setup 6. Install it locally with:
 

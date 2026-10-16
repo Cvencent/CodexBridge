@@ -48,6 +48,21 @@ def _migrate_legacy(registry: DeviceRegistry) -> None:
         registry.migrate_legacy(legacy)
 
 
+def _repair_uninstall_record() -> None:
+    """Fix the Apps & features entry when an upgrade was cut short."""
+
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        from codexbridge.uninstall_record import sync_uninstall_record
+
+        repaired = sync_uninstall_record()
+    except Exception:
+        return
+    for key in repaired:
+        emit(f"已修正 Windows 卸载记录中的版本号：{key}")
+
+
 def _discovery_loop(
     manager: DeviceManager,
     stop: threading.Event,
@@ -243,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
 
         webbrowser.open("http://127.0.0.1:8788/settings")
         return 0
+
+    _repair_uninstall_record()
 
     data_dir = _data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
