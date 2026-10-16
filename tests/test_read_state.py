@@ -37,6 +37,37 @@ class ReadStateStoreTests(unittest.TestCase):
         self.assertTrue(store.is_message_read("result:thread-1:1000"))
         self.assertFalse(store.is_message_read("result:thread-1:1001"))
 
+    def test_listener_is_notified_once_when_thread_becomes_read(self) -> None:
+        store = ReadStateStore(None)
+        events = []
+        store.add_listener(events.append)
+
+        store.mark_thread("thread-1", 2000, source="phone")
+        store.mark_thread("thread-1", 2000, source="phone")
+        store.mark_thread("thread-1", 1000, source="phone")
+
+        self.assertEqual(
+            events,
+            [
+                {
+                    "thread_id": "thread-1",
+                    "completed_at": 2000,
+                    "message_id": "",
+                    "source": "phone",
+                }
+            ],
+        )
+
+    def test_notify_false_marks_read_without_rebroadcasting(self) -> None:
+        store = ReadStateStore(None)
+        events = []
+        store.add_listener(events.append)
+
+        store.mark_message("result:thread-1:2000", source="phone", notify=False)
+
+        self.assertTrue(store.is_message_read("result:thread-1:2000"))
+        self.assertEqual(events, [])
+
 
 if __name__ == "__main__":
     unittest.main()
