@@ -8,9 +8,9 @@ import threading
 from typing import Any
 
 from codexbridge import VERSION
-from codexbridge.companion.store import CompanionStore
+from codexbridge.companion.store import CompanionStore, DEFAULT_DISCOVERY_PORT
 
-DISCOVERY_PORT = 8766
+DISCOVERY_PORT = DEFAULT_DISCOVERY_PORT
 DISCOVERY_REQUEST = b"CODEXBRIDGE_COMPANION_DISCOVER"
 MAX_REPLY_BYTES = 512
 BIND_RETRY_SECONDS = 1.0

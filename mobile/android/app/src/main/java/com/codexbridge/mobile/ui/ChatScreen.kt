@@ -189,6 +189,12 @@ fun ChatScreen(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
+            if (state.task.status == "failed" && state.task.errorMessage.isNotBlank()) {
+                ChatBanner(
+                    text = "上一轮失败：" + state.task.errorMessage,
+                    accent = MaterialTheme.colorScheme.error,
+                )
+            }
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 LazyColumn(
                     state = listState,
@@ -292,6 +298,23 @@ fun ChatScreen(
                 onPickModel(model.slug)
             },
             onDismiss = { showModels = false },
+        )
+    }
+}
+
+@Composable
+private fun ChatBanner(text: String, accent: androidx.compose.ui.graphics.Color) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = accent.copy(alpha = 0.14f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.5f)),
+    ) {
+        Text(
+            text = text,
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
         )
     }
 }

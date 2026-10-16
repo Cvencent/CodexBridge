@@ -14,16 +14,21 @@ from typing import Any, Callable
 from codexbridge.companion.events import EventStream
 from codexbridge.protocol.commands import CommandDispatcher
 
+from codexbridge.read_state import ReadStateStore
 from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
     _resolve_codex_command,
+    _turn_error,
     account_snapshot,
     thread_snapshot,
 )
 from codexbridge.codex.desktop_ipc import DesktopIpcError
 
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
+# Name given to a continuation fork so the desktop can tell it apart from the
+# original task the phone opened.
+FORK_TITLE_PREFIX = "手机继续 · "
 INTERNAL_THREAD_PREFIXES = ("The following is the Codex agent history",)
 MAX_MESSAGE_CHARS = 20000
 MAX_MESSAGE_ITEMS = 400
@@ -35,6 +40,11 @@ ACCOUNT_CACHE_SECONDS = 45.0
 LOG_TAIL_BYTES = 131072
 LOG_ACTIVE_SECONDS = 150.0
 _BRIDGE_PENDING_TITLE = "新任务"
+LOG_SETTLED_SECONDS = 1800.0
+LOG_CACHE_SECONDS = 8.0
+# How many days of rollout folders to search for a thread's log.
+ROLLOUT_SCAN_DAYS = 3
+LOG_SCAN_LIMIT = 24
 
 APPROVAL_KINDS: dict[str, str] = {
     "item/commandExecution/requestApproval": "command",
@@ -57,11 +67,30 @@ def _is_active_writer_error(error: BaseException) -> bool:
     )
 
 
-def _is_no_active_turn_error(error: BaseException) -> bool:
-    text = str(error or "").strip().lower()
-    if "no active turn" in text or "no active writer" in text:
+def writer_lock_path(thread_id: str) -> Path:
+    return Path.home() / ".codex" / "thread-writer-locks" / f"{thread_id}.lock"
+
+
+def _clear_writer_lock(thread_id: str) -> bool:
+    """Remove a stale Codex thread writer lock when Windows allows it.
+
+    The desktop app-server can keep its lock file after a turn finishes. The
+    lock is advisory and owned by an independent process, but Windows POSIX
+    semantics let us delete it by rename; once removed a new app-server can
+    resume and write the same stored thread. Failure is safe: callers fall back
+    to the previous locked-thread behavior.
+    """
+    if not thread_id or Path(thread_id).name != thread_id:
+        return False
+    path = writer_lock_path(thread_id)
+    try:
+        if not path.is_file():
+            return False
+        path.replace(path.with_name(path.name + ".removed"))
+        path.with_name(path.name + ".removed").unlink(missing_ok=True)
         return True
-    return "not active" in text and ("turn" in text or "writer" in text or "steer" in text)
+    except OSError:
+        return False
 
 
 def _as_number(value: Any) -> float | None:
@@ -153,6 +182,29 @@ def _line_stamp(line: str) -> float | None:
     return _parse_stamp(match.group(1))
 
 
+# Rollout records that the app-server writes when it merely loads/resumes a
+# thread. They carry a fresh timestamp but describe no turn progress, so they
+# must not count as "the thread is doing work right now".
+_BOOKKEEPING_EVENT_TYPES = {"thread_settings_applied"}
+
+
+def _is_bookkeeping_line(line: str) -> bool:
+    """Return True for a rollout record that only refreshes thread settings.
+
+    Resuming or reading a thread appends a ``thread_settings_applied`` event
+    with the current time. It is bookkeeping, not turn activity, and must not
+    make an idle thread look like it is running.
+    """
+    if '"event_msg"' not in line:
+        return False
+    try:
+        record = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    return str(payload.get("type") or "") in _BOOKKEEPING_EVENT_TYPES
+
+
 def _log_activity(line: str) -> tuple[float, str] | None:
     if '"event_msg"' not in line:
         return None
@@ -241,6 +293,66 @@ def _is_display_thread(thread: dict[str, Any]) -> bool:
     )
 
 
+def _read_file_tail(path: Path, size: int) -> bytes:
+    """Read the last ``LOG_TAIL_BYTES`` of a file another process is writing.
+
+    Codex holds its rollout file open with sharing flags that reject a plain
+    ``open(path, "rb")`` on Windows, which made the phone read no activity at
+    all for a thread that was being written to right then. Open the file the
+    way Windows allows shared reads instead of giving up.
+    """
+    start = size - LOG_TAIL_BYTES if size > LOG_TAIL_BYTES else 0
+    if os.name != "nt":
+        with path.open("rb") as handle:
+            if start:
+                handle.seek(start)
+            return handle.read()
+    import msvcrt
+
+    try:
+        # _O_RDONLY | _O_BINARY with the sharing flags Windows itself uses, so
+        # a writer that already holds the file open does not lock us out.
+        descriptor = msvcrt.open_osfhandle(
+            _win32_open_shared(str(path), start),
+            os.O_RDONLY | os.O_BINARY,
+        )
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            return stream.read()
+    except OSError:
+        return b""
+
+
+def _win32_open_shared(path: str, offset: int) -> int:
+    """Open a file for shared reading on Windows and return a raw HANDLE."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    handle = kernel32.CreateFileW(
+        wintypes.LPCWSTR(path),
+        wintypes.DWORD(GENERIC_READ),
+        wintypes.DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+        None,
+        wintypes.DWORD(OPEN_EXISTING),
+        wintypes.DWORD(0),
+        wintypes.HANDLE(None),
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if not handle or handle == invalid:
+        raise OSError(ctypes.get_last_error(), "cannot open rollout for shared read", path)
+    if offset and kernel32.SetFilePointer(
+        wintypes.HANDLE(handle), wintypes.LONG(offset), None, wintypes.DWORD(0)
+    ) == 0xFFFFFFFF:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise OSError(ctypes.get_last_error(), "cannot seek rollout", path)
+    return handle
+
+
 class CompanionService:
     """Own the app-server connection that serves paired phones."""
 
@@ -252,6 +364,7 @@ class CompanionService:
         client_factory: Callable[[list[str], Path], Any] | None = None,
         desktop_state_path: Path | None = None,
         sessions_root: Path | None = None,
+        read_state: ReadStateStore | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
@@ -290,20 +403,41 @@ class CompanionService:
         self._account_cache_epoch = 0.0
         self._log: list[str] = []
         self._resumed_threads: set[str] = set()
+        # Threads whose writer lock is held by another Codex client (desktop
+        # app-server). The app-server refuses to resume these, so a turn/start
+        # on them fails with a bare "thread not found"; remember the real cause
+        # so the phone gets an actionable message instead.
+        self._locked_threads: set[str] = set()
+        # When a thread is locked by another writer we continue it in a fork
+        # that shares its full history, and remember the mapping so a repeat
+        # reply reuses the same fork instead of branching again.
+        self._forked_threads: dict[str, str] = {}
+        # Reverse map (hidden fork id -> phone-visible thread id) so reads and
+        # events stay attached to the thread the phone actually opened.
+        self._fork_origin: dict[str, str] = {}
+        # The fork inherits the original title, which we then overwrite with a
+        # "手机继续 · …" label. Remember the original so the phone keeps showing
+        # the task name the user opened.
+        self._fork_titles: dict[str, str] = {}
+        # Forks whose history must still be read after writing moves back to the
+        # original thread. A fork copies the thread it branched from, so its
+        # turns overlap the original's except for the replies the phone made
+        # while the desktop held the writer lock; those extras are appended on
+        # read so reclaiming a thread never hides what the phone already sent.
+        self._fork_tails: dict[str, str] = {}
         self._resumed_lock = threading.Lock()
+        self._load_fork_map()
         self._sessions_root = (
             Path(sessions_root)
             if sessions_root is not None
             else Path.home() / ".codex" / "sessions"
         )
-        self._log_cache: dict[str, tuple[tuple[int, int] | None, tuple[float, str, float] | None]] = {}
+        self._log_cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
         self._log_cache_lock = threading.Lock()
-        self._rollout_index: dict[str, Path] = {}
-        self._rollout_index_epoch = 0.0
-        self._detail_status_cache: dict[str, tuple[str, int, str]] = {}
         self._observed_threads: dict[str, dict[str, Any]] | None = None
         self._poll_thread: threading.Thread | None = None
         self._untitled_threads: set[str] = set()
+        self._read_state = read_state or ReadStateStore(self.data_dir / "read-state.json")
 
     def start(self) -> None:
         self._stop.clear()
@@ -374,6 +508,7 @@ class CompanionService:
             self._generation += 1
         with self._resumed_lock:
             self._resumed_threads.clear()
+            self._locked_threads.clear()
         if client is not None:
             try:
                 client.close()
@@ -434,6 +569,7 @@ class CompanionService:
             self._generation += 1
         with self._resumed_lock:
             self._resumed_threads.clear()
+            self._locked_threads.clear()
         if client is not None:
             try:
                 client.close()
@@ -460,14 +596,28 @@ class CompanionService:
             return
         client = self._ensure_client()
         error: AppServerError | None = None
+        lock_cleared = False
         for attempt in range(2):
             try:
                 client.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+                with self._resumed_lock:
+                    self._locked_threads.discard(thread_id)
                 self._thread_note(thread_id)
                 return
             except AppServerError as exc:
                 error = exc
                 message = str(exc)
+                if _is_active_writer_error(exc):
+                    # The desktop keeps a stale writer lock after it finishes a
+                    # turn. Remove it so the phone continues the original
+                    # conversation instead of silently forking it.
+                    if not lock_cleared and _clear_writer_lock(thread_id):
+                        lock_cleared = True
+                        continue
+                    with self._resumed_lock:
+                        self._locked_threads.add(thread_id)
+                    self._thread_note(thread_id)
+                    return
                 if "not found" in message.lower():
                     raise
                 self._reset_client()
@@ -477,103 +627,325 @@ class CompanionService:
         if error is not None:
             raise error
 
-    def _thread_log(
-        self,
-        thread_id: str,
-        rollout_path: Path | str | None = None,
-    ) -> tuple[float, str, float] | None:
-        """Return (newest_timestamp, last_turn_event) for a rollout log.
+    def _active_turn_id(self, thread_id: str) -> str:
+        """Return the id of the turn currently running on a thread, if any."""
+        try:
+            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except AppServerError:
+            return ""
+        thread = result.get("thread") if isinstance(result, dict) else None
+        turns = (thread or {}).get("turns") if isinstance(thread, dict) else None
+        if not isinstance(turns, list):
+            return ""
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            status = str(turn.get("status") or "").replace("_", "").lower()
+            if status in {"inprogress", "running", "active"}:
+                return str(turn.get("id") or "")
+            # A desktop-owned turn is reported as "interrupted" to any second
+            # reader even while it is still running, so treat an unfinished
+            # turn that is still being written as active too.
+            if status == "interrupted" and turn.get("completedAt") is None:
+                return str(turn.get("id") or "")
+        return ""
 
-        Result is ``(newest_timestamp, last_turn_event, event_timestamp)``. The
+    def _writable_thread(self, thread_id: str) -> str:
+        """Return a thread id this client may write to.
+
+        app-server allows only one writer per stored thread, and the desktop
+        keeps a writer lock on every thread it has opened -- including threads
+        whose turn finished long ago. That lock is a file on disk rather than
+        proof that a turn is running, so clearing it lets us resume the
+        original thread and append to it directly. The phone and the desktop
+        then share one conversation and each sees the other's turns.
+
+        Forking stays only as the fallback for the one case where hijacking is
+        unsafe: the desktop is running a turn on that thread right now.
+        """
+        if not thread_id:
+            return thread_id
+        with self._resumed_lock:
+            existing = self._forked_threads.get(thread_id)
+        if existing:
+            # A fork recorded by an earlier build left this conversation in a
+            # copy the desktop never opens, so the two sides drift apart. Go
+            # back to the original thread so both share one history again.
+            if self._reclaim_original(thread_id, existing):
+                return thread_id
+            # A reset app-server forgets loaded threads, so re-hydrate the fork
+            # (or the next turn/start fails with "thread not found" again).
+            try:
+                self._ensure_thread(existing)
+            except AppServerError:
+                # The fork is gone; drop the stale mapping and branch again.
+                with self._resumed_lock:
+                    self._forked_threads.pop(thread_id, None)
+                    self._fork_origin.pop(existing, None)
+                    self._fork_titles.pop(thread_id, None)
+                self._save_fork_map()
+            else:
+                # Forks created before this version were left unnamed, so give
+                # them their label the first time they are reused.
+                self._ensure_fork_label(thread_id, existing)
+                return existing
+        self._ensure_thread(thread_id)
+        with self._resumed_lock:
+            locked = thread_id in self._locked_threads
+        if not locked:
+            return thread_id
+        # The desktop holds the writer lock. Take the original thread over
+        # rather than copying it, unless a turn is running on it right now.
+        if self._log_status(thread_id) != "working":
+            if self._take_over(thread_id):
+                return thread_id
+        client = self._ensure_client()
+        try:
+            result = client.request("thread/fork", {"threadId": thread_id})
+        except AppServerError as error:
+            raise AppServerError(
+                "该任务正在电脑端 Codex 中使用，无法同时从手机继续；"
+                "请先在电脑端关闭该会话后重试。"
+            ) from error
+        thread = result.get("thread") if isinstance(result, dict) else None
+        forked_id = str((thread or {}).get("id") or "")
+        if not forked_id:
+            raise AppServerError("电脑端无法为该任务创建可继续的会话")
+        self._thread_note(forked_id)
+        with self._resumed_lock:
+            self._forked_threads[thread_id] = forked_id
+            self._fork_origin[forked_id] = thread_id
+        self._save_fork_map()
+        label, origin_title = self._label_fork(forked_id, thread)
+        if origin_title:
+            with self._resumed_lock:
+                self._fork_titles[thread_id] = origin_title
+            self._save_fork_map()
+        self.publish(
+            {
+                "type": "thread_forked",
+                "thread_id": thread_id,
+                "continued_as": forked_id,
+                "title": label,
+            }
+        )
+        return forked_id
+
+    def _take_over(self, thread_id: str) -> bool:
+        """Clear the writer lock and resume the original thread in place.
+
+        Returns True when the thread is now ours to write to, so the phone
+        continues the real conversation instead of a fork of it.
+        """
+        if not thread_id:
+            return False
+        # _ensure_thread may already have cleared the lock, and a lock file that
+        # is gone is success rather than failure, so clear it best-effort and
+        # let the retried resume decide whether we own the thread.
+        _clear_writer_lock(thread_id)
+        with self._resumed_lock:
+            self._resumed_threads.discard(thread_id)
+            self._locked_threads.discard(thread_id)
+        try:
+            self._ensure_thread(thread_id)
+        except AppServerError:
+            with self._resumed_lock:
+                self._locked_threads.add(thread_id)
+            return False
+        # _ensure_thread returns quietly when the lock is still held by someone
+        # else, so the lock set is what tells us whether the thread is ours.
+        with self._resumed_lock:
+            return thread_id not in self._locked_threads
+
+    def _reclaim_original(self, thread_id: str, fork_id: str) -> bool:
+        """Move a forked conversation back onto the thread it came from.
+
+        Forks recorded by earlier builds left the phone's replies in a copy the
+        desktop never opens, so the two sides drift apart. Returns False when
+        the original can no longer be resumed and the fork must be kept.
+        """
+        if not self._take_over(thread_id):
+            return False
+        with self._resumed_lock:
+            self._forked_threads.pop(thread_id, None)
+            self._fork_titles.pop(thread_id, None)
+            # Keep reading the fork's history, but stop writing to it.
+            self._fork_tails[thread_id] = fork_id
+        self._save_fork_map()
+        return True
+
+    def _ensure_fork_label(self, thread_id: str, forked_id: str) -> None:
+        """Label a fork that predates fork labelling. Failure is cosmetic."""
+        if self._original_title(thread_id):
+            return
+        try:
+            result = self._read("thread/read", {"threadId": forked_id, "includeTurns": False})
+        except AppServerError:
+            return
+        thread = result.get("thread") if isinstance(result, dict) else None
+        _label, origin_title = self._label_fork(forked_id, thread)
+        if not origin_title:
+            return
+        with self._resumed_lock:
+            self._fork_titles[thread_id] = origin_title
+        self._save_fork_map()
+
+    def _label_fork(self, forked_id: str, forked: Any) -> tuple[str, str]:
+        """Name a continuation fork so it is identifiable in the desktop app.
+
+        The desktop owns the original thread's writer lock, so the phone reply
+        lands in a fork that would otherwise look like an unnamed duplicate of
+        the same task. Give it a distinct name; failure here is cosmetic.
+
+        ``forked`` is the thread object ``thread/fork`` returned. It still
+        carries the name inherited from the original thread, which we return as
+        ``origin_title`` so the phone list keeps showing the task the user
+        opened.
+        """
+        base = ""
+        if isinstance(forked, dict):
+            base = str(forked.get("name") or forked.get("preview") or "").strip()
+        # Re-labelling an already labelled fork must stay idempotent.
+        if base.startswith(FORK_TITLE_PREFIX):
+            base = base[len(FORK_TITLE_PREFIX):].strip()
+        label = _clip(f"{FORK_TITLE_PREFIX}{base}".strip() if base else f"{FORK_TITLE_PREFIX}CodexBridge", 120)
+        try:
+            self._ensure_client().request("thread/name/set", {"threadId": forked_id, "name": label})
+        except AppServerError:
+            return "", base
+        return label, base
+
+    def _fork_map_path(self) -> Path:
+        return self.data_dir / "fork-map.json"
+
+    def _load_fork_map(self) -> None:
+        try:
+            payload = json.loads(self._fork_map_path().read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        forks = payload.get("forks")
+        if not isinstance(forks, dict):
+            return
+        for origin, fork in forks.items():
+            if not isinstance(origin, str) or not isinstance(fork, str) or not origin or not fork:
+                continue
+            self._forked_threads[origin] = fork
+            self._fork_origin[fork] = origin
+        titles = payload.get("titles")
+        if isinstance(titles, dict):
+            for origin, title in titles.items():
+                if isinstance(origin, str) and isinstance(title, str) and origin and title:
+                    self._fork_titles[origin] = title
+        tails = payload.get("tails")
+        if isinstance(tails, dict):
+            for origin, tail in tails.items():
+                if isinstance(origin, str) and isinstance(tail, str) and origin and tail:
+                    self._fork_tails[origin] = tail
+
+    def _save_fork_map(self) -> None:
+        with self._resumed_lock:
+            payload = {
+                "version": 1,
+                "forks": dict(self._forked_threads),
+                "titles": dict(self._fork_titles),
+                "tails": dict(self._fork_tails),
+            }
+        try:
+            self._fork_map_path().parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._fork_map_path().with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self._fork_map_path())
+        except OSError:
+            return
+
+    def _fork_for(self, thread_id: str) -> str:
+        with self._resumed_lock:
+            return self._forked_threads.get(str(thread_id or ""), "")
+
+    def _original_title(self, thread_id: str) -> str:
+        with self._resumed_lock:
+            return self._fork_titles.get(str(thread_id or ""), "")
+
+    def _is_fork_id(self, thread_id: str) -> bool:
+        with self._resumed_lock:
+            return str(thread_id or "") in self._fork_origin
+
+    def visible_thread_id(self, thread_id: str) -> str:
+        """Map a hidden fork id back to the thread the phone opened."""
+        key = str(thread_id or "")
+        if not key:
+            return ""
+        with self._resumed_lock:
+            return self._fork_origin.get(key, key)
+
+    def _thread_log(self, thread_id: str) -> tuple[float, str, float, float, float] | None:
+        """Return rollout-log activity for a thread.
+
+        Result is ``(newest_timestamp, last_turn_event, event_timestamp,
+        log_write_time, real_activity_timestamp)``. The
         event is the last ``task_started`` / ``task_complete`` /
         ``turn_aborted`` line seen in the tail, or ``""`` when the tail is too
-        short to contain one.
+        short to contain one. ``real_activity_timestamp`` is the newest stamp
+        from a record that reflects actual work (anything except the
+        ``thread_settings_applied`` bookkeeping line a resume appends), so
+        callers can tell "a turn is running" apart from "the file was merely
+        touched by a resume".
         """
         key = str(thread_id or "")
         if not key:
             return None
-        path = self._find_rollout_log(key, rollout_path)
-        try:
-            stat = path.stat() if path is not None else None
-            signature = (stat.st_mtime_ns, stat.st_size) if stat is not None else None
-        except OSError:
-            signature = None
+        # A continuation fork is authoritative for the thread it branched from,
+        # so read the fork's rollout when the phone asks about the origin.
+        key = self._fork_for(key) or key
+        now = time.monotonic()
         with self._log_cache_lock:
             cached = self._log_cache.get(key)
-        if cached is not None and signature is not None and cached[0] == signature:
+        if cached is not None and now - cached[0] <= LOG_CACHE_SECONDS:
             return cached[1]
+        path = self._find_rollout_log(key)
         found = self._read_log_tail(path) if path is not None else None
         with self._log_cache_lock:
             if len(self._log_cache) > 512:
                 self._log_cache.clear()
-            self._log_cache[key] = (signature, found)
+            self._log_cache[key] = (now, found)
         return found
 
-    def _find_rollout_log(
-        self,
-        thread_id: str,
-        hint: Path | str | None = None,
-    ) -> Path | None:
-        """Locate a thread's rollout file.
-
-        The app-server ``thread/list`` rows carry the exact rollout ``path``,
-        so prefer that hint. Fall back to a full sessions index rather than
-        only today and yesterday, which previously left older threads
-        resolving to a stale list status.
-        """
-        if hint:
+    def _find_rollout_log(self, thread_id: str) -> Path | None:
+        for offset in range(ROLLOUT_SCAN_DAYS):
+            day = datetime.now() - timedelta(days=offset)
+            folder = self._sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
             try:
-                candidate = Path(str(hint))
-                if candidate.is_file():
-                    return candidate
-            except OSError:
-                pass
-        return self._rollout_index_get().get(str(thread_id))
-
-    def _rollout_index_get(self, *, refresh: bool = False) -> dict[str, Path]:
-        now = time.monotonic()
-        with self._log_cache_lock:
-            fresh = bool(self._rollout_index) and now - self._rollout_index_epoch < 30.0
-            if fresh and not refresh:
-                return dict(self._rollout_index)
-        found: dict[str, Path] = {}
-        roots = [self._sessions_root, self._sessions_root.parent / "archived_sessions"]
-        for root in roots:
-            if not root.is_dir():
-                continue
-            try:
-                candidates = list(root.rglob("rollout-*.jsonl"))
+                entries = list(folder.glob(f"*{thread_id}.jsonl"))
             except OSError:
                 continue
-            for path in candidates:
-                thread_id = _rollout_thread_id(path.name)
-                if not thread_id:
-                    continue
-                previous = found.get(thread_id)
-                try:
-                    if previous is None or path.stat().st_mtime > previous.stat().st_mtime:
-                        found[thread_id] = path
-                except OSError:
-                    continue
-        with self._log_cache_lock:
-            self._rollout_index = found
-            self._rollout_index_epoch = time.monotonic()
-        return dict(found)
+            if entries:
+                return max(entries, key=lambda item: item.stat().st_mtime)
+        return None
 
     @staticmethod
-    def _read_log_tail(path: Path) -> tuple[float, str, float] | None:
+    def _read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
         try:
-            size = path.stat().st_size
-            with path.open("rb") as handle:
-                if size > LOG_TAIL_BYTES:
-                    handle.seek(size - LOG_TAIL_BYTES)
-                blob = handle.read()
+            stat = path.stat()
+            size = stat.st_size
+            blob = _read_file_tail(path, size)
         except OSError:
             return None
+        # The log records its own timestamps, but a stale tail can carry
+        # fresh-looking stamps long after the writer stopped. The file's mtime
+        # is the ground truth for "is someone still appending right now".
+        written_at = float(stat.st_mtime)
         newest = 0.0
+        # Resuming a thread appends a ``thread_settings_applied`` record with a
+        # fresh timestamp but no real turn work. Reading or resuming an idle
+        # task therefore refreshes the file mtime and the newest stamp, which
+        # used to flicker long-finished tasks into "working". Track the newest
+        # stamp that reflects actual turn activity separately so we can ignore
+        # the bookkeeping noise.
+        real_activity = 0.0
         kind = ""
         kind_stamp = 0.0
-        last_record_type = ""
         with_timestamps = 0
         for raw in blob.splitlines():
             line = raw.decode("utf-8", "replace")
@@ -584,290 +956,59 @@ class CompanionService:
                 stamp, activity_kind = activity
                 kind = activity_kind
                 kind_stamp = stamp
-                last_record_type = ""
             else:
                 stamp = _line_stamp(line)
-                # Keep enough information to distinguish a usage-only append
-                # from a real turn event when the turn marker fell outside the
-                # bounded tail.
-                last_record_type = (
-                    "token_usage_record"
-                    if '"type": "token_usage_record"' in line
-                    else ""
-                )
             if stamp is None:
                 continue
             with_timestamps += 1
             if stamp > newest:
                 newest = stamp
+            if not _is_bookkeeping_line(line) and stamp > real_activity:
+                real_activity = stamp
         if with_timestamps == 0:
             return None
-        if not kind and last_record_type == "token_usage_record":
-            kind = "usage_only"
-            kind_stamp = newest
-        return newest, kind, kind_stamp
+        return newest, kind, kind_stamp, written_at, real_activity
 
-    def _log_status(self, thread_id: str, rollout_path: Path | str | None = None) -> str:
-        activity = self._thread_log(thread_id, rollout_path)
+    def _log_status(self, thread_id: str) -> str:
+        activity = self._thread_log(thread_id)
         if activity is None:
             return ""
-        newest, kind, kind_stamp = activity
-        if newest <= 0 or not kind:
+        newest, kind, kind_stamp, written_at, real_activity = activity
+        if newest <= 0:
             return ""
         now = time.time()
-        # Terminal rollout markers are durable evidence, not a short-lived
-        # activity hint. Keeping them after the active window is what makes
-        # list and detail agree when thread/list omits turn history.
-        if kind == "task_complete":
+        # A finished turn keeps its outcome for as long as the log remembers it.
+        # This used to expire after LOG_SETTLED_SECONDS, which made a task that
+        # failed half an hour ago drop to "idle" in the list while the chat
+        # header still read the turn's own "failed" -- the row and the header
+        # disagreeing about the same task.
+        #
+        # The outcome only holds while it is still the newest real activity. A
+        # thread that completed once and then started another turn has real work
+        # after that completion record, and must report as running rather than
+        # keep showing the older result forever.
+        # ``kind_stamp`` older than the newest real activity means work happened
+        # after that completion, so the completion no longer describes the thread.
+        if kind == "task_complete" and kind_stamp >= real_activity - 1.0:
             return "completed"
-        if kind == "task_failed":
-            return "failed"
-        if kind == "turn_aborted":
+        if kind == "turn_aborted" and kind_stamp >= real_activity - 1.0:
             return "idle"
-        if kind == "task_started" and now - newest <= LOG_ACTIVE_SECONDS:
-            return "working"
-        if kind == "task_started":
-            # A stale start with no terminal marker means the turn was
-            # abandoned (usually an app-server restart). Callers may confirm
-            # the terminal status from turn history.
-            return "stale_active"
-        return ""
-
-    def _desktop_status_entry(
-        self, thread_id: str, turn_id: str = ""
-    ) -> tuple[str, int]:
-        """Return the latest desktop turn status and its start time."""
-        if turn_id:
-            key = (thread_id, turn_id)
-            status = self._desktop_turn_status.get(key)
-            if status:
-                return status, self._desktop_turn_started.get(key, 0)
-        matches = [
-            key for key in self._desktop_turn_status
-            if key[0] == thread_id
-        ]
-        if not matches:
-            return "", 0
-        latest = max(matches, key=lambda key: self._desktop_status_order.get(key, 0))
-        return (
-            self._desktop_turn_status.get(latest, ""),
-            self._desktop_turn_started.get(latest, 0),
-        )
-
-    def _desktop_status(self, thread_id: str, turn_id: str = "") -> str:
-        return self._desktop_status_entry(thread_id, turn_id)[0]
-
-    def _resolve_status(
-        self,
-        thread: dict[str, Any],
-        summary: dict[str, Any],
-        *,
-        allow_log: bool = True,
-        allow_detail: bool = True,
-    ) -> str:
-        """Resolve list and detail status from the same ordered evidence.
-
-        Desktop IPC events are authoritative for desktop-owned turns. Rollout
-        markers are the next strongest evidence because they are written at
-        the turn boundary. The list row is the fallback.
-        """
-        thread_id = str(summary.get("thread_id") or thread.get("id") or "")
-        turn_id = str(summary.get("turn_id") or "")
-        rollout_path = summary.get("_rollout_path") or thread.get("path")
-        desktop, desktop_started_at = self._desktop_status_entry(thread_id, turn_id)
-        if desktop:
-            normalized = str(desktop).replace("_", "").lower()
-            if normalized in {
-                "inprogress", "running", "active",
-                "waitinguser", "waiting", "approval",
-            }:
-                if allow_log:
-                    inferred = self._log_status(thread_id, rollout_path)
-                    activity = self._thread_log(thread_id, rollout_path)
-                    if inferred in {"completed", "failed", "idle"} and activity is not None:
-                        marker_at = int(activity[2] or 0)
-                        started_at = max(
-                            int(summary.get("started_at") or 0),
-                            int(desktop_started_at or 0),
-                        )
-                        if not started_at or marker_at >= started_at:
-                            return inferred
-                if normalized in {"waitinguser", "waiting", "approval"}:
-                    return "waiting_user"
-                return "working"
-            if normalized == "completed":
-                return "completed"
-            if normalized in {"failed", "interrupted", "cancelled", "canceled"}:
-                return "failed"
-        if not turn_id and allow_detail:
-            remembered = self._detail_status(
-                thread_id,
-                rollout_path,
-                turn_id=turn_id,
-                started_at=int(summary.get("started_at") or 0),
-            )
-            if remembered:
-                return remembered
-        if allow_log:
-            inferred = self._log_status(thread_id, rollout_path)
-            if inferred:
-                activity = self._thread_log(thread_id, rollout_path)
-                started_at = int(summary.get("started_at") or 0)
-                # A terminal marker older than the latest known turn is stale.
-                # Include ``failed``: a previous failed turn must not override
-                # a newer turn that is currently running.
-                if activity is not None and inferred in {"completed", "idle", "failed"}:
-                    if started_at and int(activity[2]) < started_at:
-                        settled = self._confirm_terminal_status(thread_id) if allow_detail else ""
-                        if settled and int(activity[2]) >= started_at:
-                            return settled
-                        log_started = self._log_status(thread_id, rollout_path)
-                        if log_started == "stale_active":
-                            return "working"
-                        return str(summary.get("status") or "idle")
-                # A stale ``task_started`` with no terminal marker means the
-                # turn was abandoned. Confirm with turn history so list and
-                # detail agree, then cache the terminal status.
-                if inferred == "stale_active":
-                    settled = self._confirm_terminal_status(thread_id)
-                    if settled:
-                        return settled
-                    return "working"
-                return inferred
-            # No turn marker survived in the rollout tail. Confirm with turn
-            # history whenever a rollout exists so the list cannot disagree
-            # with the detail view. Usage-only and response-only appends can
-            # be recent even after the turn has already ended.
-            if allow_detail and not inferred and not turn_id:
-                activity = self._thread_log(thread_id, rollout_path)
-                # Without a rollout there is nothing stronger than the list
-                # row to appeal to.
-                if activity is not None:
-                    settled = self._detail_status(
-                        thread_id,
-                        rollout_path,
-                        turn_id=turn_id,
-                        started_at=int(summary.get("started_at") or 0),
-                    )
-                    if not settled:
-                        settled = self._confirm_terminal_status(thread_id)
-                    if settled:
-                        return settled
-        return str(summary.get("status") or "idle")
-
-    def _detail_status(
-        self,
-        thread_id: str,
-        rollout_path: Any = None,
-        turn_id: str = "",
-        started_at: int = 0,
-    ) -> str:
-        """Return a cached settled status while it still describes the latest turn.
-
-        Rollout files receive unrelated usage records between turns, so the
-        cache is keyed by turn identity rather than by the file signature.
-        """
-        if not thread_id:
-            return ""
-        with self._log_cache_lock:
-            entry = self._detail_status_cache.get(thread_id)
-        if entry is None:
-            return ""
-        cached_turn_id, cached_started_at, status = entry
-        if turn_id and cached_turn_id and turn_id != cached_turn_id:
-            return ""
-        if started_at and cached_started_at and started_at > cached_started_at:
-            return ""
-        activity = self._thread_log(thread_id, rollout_path)
-        if activity is not None:
-            _, kind, kind_stamp = activity
-            marker_at = int(kind_stamp or 0)
-            if (
-                kind in {"task_started", "task_complete", "task_failed", "turn_aborted"}
-                and marker_at > cached_started_at
-            ):
-                return ""
-        return status
-
-    def _rollout_signature(
-        self, thread_id: str, rollout_path: Any = None
-    ) -> tuple[int, int] | None:
-        path = self._find_rollout_log(thread_id, rollout_path) if thread_id else None
-        if path is None:
-            return None
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
-        return stat.st_mtime_ns, stat.st_size
-
-    def _remember_detail_status(
-        self,
-        thread_id: str,
-        status: str,
-        rollout_path: Any = None,
-        turn_id: str = "",
-        started_at: int = 0,
-    ) -> None:
-        """Cache a settled detail status for the latest known turn."""
-        if not thread_id or status not in {"completed", "failed"}:
-            return
-        with self._log_cache_lock:
-            previous = self._detail_status_cache.get(thread_id)
-            if previous is not None:
-                previous_turn_id, previous_started_at, _ = previous
-                if turn_id and previous_turn_id and turn_id != previous_turn_id:
-                    if started_at and previous_started_at and started_at < previous_started_at:
-                        return
-                elif started_at and previous_started_at and started_at < previous_started_at:
-                    return
-            if len(self._detail_status_cache) > 512:
-                self._detail_status_cache.clear()
-            self._detail_status_cache[thread_id] = (turn_id, started_at, status)
-
-    def _confirm_terminal_status(self, thread_id: str) -> str:
-        """Read turn history to settle a thread whose rollout tail is dangling."""
-        if not thread_id:
-            return ""
-        result: Any = None
-        for attempt in range(3):
-            try:
-                result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
-                break
-            except (AppServerError, OSError, ValueError):
-                if attempt < 2:
-                    time.sleep(0.05)
-        if result is None:
-            return ""
-        thread = result.get("thread") if isinstance(result, dict) else None
-        if not isinstance(thread, dict):
-            return ""
-        turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
-        if not turns:
-            return ""
-        turns.sort(key=lambda turn: _epoch(
-            turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
-        ))
-        latest = turns[-1]
-        status = str(latest.get("status") or "").replace("_", "").lower()
-        settled = ""
-        if status == "completed":
-            settled = "completed"
-        elif status in {"failed", "interrupted", "cancelled", "canceled"}:
-            settled = "failed"
-        if not settled:
-            return ""
-        self._remember_detail_status(
-            thread_id,
-            settled,
-            turn_id=str(latest.get("id") or ""),
-            started_at=_epoch(
-                latest.get("startedAt")
-                or latest.get("createdAt")
-                or latest.get("updatedAt")
-            ),
-        )
-        return settled
+        # Only claim a turn is running when the freshest append reflects real
+        # work. A resume or a read-only ``thread/read`` drops a
+        # ``thread_settings_applied`` record that carries no turn activity, so
+        # ``real_activity`` is the signal that matters -- the raw newest stamp
+        # would flicker idle tasks into "working" on every read.
+        #
+        # ``real_activity`` comes from the records themselves and is the primary
+        # gate. The file mtime is deliberately NOT required to agree: on this
+        # machine Windows reports a frozen mtime for a rollout that is still
+        # growing, so gating on it reported live turns as idle for hours. The
+        # mtime is only consulted when the tail carries no timestamp at all.
+        if real_activity <= 0:
+            # No usable record timestamp, so fall back to the file's own idea
+            # of when it was last touched.
+            return "working" if now - written_at <= LOG_ACTIVE_SECONDS else ""
+        return "working" if now - real_activity <= LOG_ACTIVE_SECONDS else ""
 
     def _read(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None
@@ -946,7 +1087,7 @@ class CompanionService:
                 "request_id": request_id,
                 "kind": kind,
                 "method": method,
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or params.get("callId") or ""),
                 "command": str(params.get("command") or ""),
@@ -1078,7 +1219,7 @@ class CompanionService:
         if method == "item/agentMessage/delta":
             return {
                 "type": "agent_delta",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or ""),
                 "delta": str(params.get("delta") or params.get("text") or ""),
@@ -1086,7 +1227,7 @@ class CompanionService:
         if method == "item/commandExecution/outputDelta":
             return {
                 "type": "command_output",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item_id": str(params.get("itemId") or ""),
                 "delta": str(params.get("delta") or params.get("chunk") or ""),
@@ -1100,7 +1241,7 @@ class CompanionService:
                 return None
             return {
                 "type": "item_started" if method == "item/started" else "item_completed",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "item": mapped,
             }
@@ -1108,40 +1249,59 @@ class CompanionService:
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             return {
                 "type": "turn_started",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(turn.get("id") or ""),
                 "status": "working",
             }
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             status = str(turn.get("status") or "completed")
+            thread_id = self.visible_thread_id(str(params.get("threadId") or ""))
+            completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
             return {
                 "type": "turn_completed",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": thread_id,
                 "turn_id": str(turn.get("id") or ""),
                 "status": "completed" if status == "completed" else "failed",
                 "duration_ms": turn.get("durationMs"),
+                "completed_at": completed_at,
+                "error_message": _turn_error(turn),
+                # App-server notifications only reach the bridge that owns a
+                # turn. This marker tells every connected client to append the
+                # completed turn from disk so desktop-created work is visible
+                # even when this process never called turn/start.
+                "append_only": True,
+                "read": bool(
+                    thread_id
+                    and completed_at > 0
+                    and self._read_state.is_thread_read(thread_id, completed_at)
+                ),
             }
         if method == "thread/status/changed":
             status = params.get("status") if isinstance(params.get("status"), dict) else {}
             return {
                 "type": "thread_status",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "status": str(status.get("type") or "unknown"),
                 "active_flags": [str(flag) for flag in status.get("activeFlags") or []],
             }
         if method == "thread/name/updated":
+            raw_id = str(params.get("threadId") or "")
+            # Relabelling a hidden continuation fork must not rename the task
+            # the phone is showing.
+            if self._is_fork_id(raw_id):
+                return None
             return {
                 "type": "thread_name",
-                "thread_id": str(params.get("threadId") or ""),
-                "title": str(params.get("threadName") or params.get("name") or ""),
+                "thread_id": self.visible_thread_id(raw_id),
+                "title": str(params.get("name") or ""),
             }
         if method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") if isinstance(params.get("tokenUsage"), dict) else {}
             total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
             return {
                 "type": "token_usage",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
                 "total_tokens": int(_as_number(total.get("totalTokens")) or 0),
                 "context_window": int(_as_number(usage.get("modelContextWindow")) or 0),
@@ -1151,7 +1311,7 @@ class CompanionService:
         if method == "error":
             return {
                 "type": "error",
-                "thread_id": str(params.get("threadId") or ""),
+                "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "message": _clip(str(params.get("message") or params.get("error") or ""), 500),
             }
         return None
@@ -1206,6 +1366,29 @@ class CompanionService:
                 self._account_cache = account_snapshot({}, {})
         return self._account_cache
 
+    def _read_thread_summary(self, thread_id: str) -> dict[str, Any] | None:
+        """Return a thread's summary with turns included, or None if unreadable."""
+        try:
+            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+        except (AppServerError, OSError):
+            return None
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            return None
+        return self._summary(thread)
+
+    def _row_status_from_turn(self, thread_id: str) -> str:
+        """Classify a row from its turn snapshot when the rollout log cannot."""
+        summary = self._read_thread_summary(thread_id)
+        if summary is None:
+            return ""
+        status = str(summary.get("status") or "")
+        # "idle" here only means the app-server has no live turn, which is also
+        # what it reports for a thread it never loaded, so it is not an answer.
+        if not status or status == "idle":
+            return ""
+        return status
+
     def list_threads(
         self,
         limit: int = 40,
@@ -1227,30 +1410,71 @@ class CompanionService:
         rows = result.get("data") if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         threads = []
+        seen: set[str] = set()
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or not row.get("id"):
                 continue
             if not _is_display_thread(row):
                 continue
+            # A thread we forked to keep replying is still shown as the thread
+            # the phone opened; never list the hidden fork as a second task.
+            visible_id = self.visible_thread_id(str(row.get("id") or ""))
+            if visible_id in seen:
+                continue
+            seen.add(visible_id)
             summary = self._summary(row)
-            # Retain the exact rollout path from the row as a private hint for
-            # status resolution; it is stripped before the list is returned.
-            summary["_rollout_path"] = str(row.get("path") or "")
+            summary["thread_id"] = visible_id
+            # The hidden fork was renamed for the desktop's benefit; keep the
+            # phone row showing the task the user actually opened.
+            original = self._original_title(visible_id)
+            if original:
+                summary["title"] = original
             threads.append(summary)
-        for summary in threads:
-            status = self._resolve_status(
-                {"id": summary.get("thread_id")}, summary, allow_log=True
-            )
-            if status:
-                summary["status"] = status
-            activity = self._thread_log(
-                str(summary.get("thread_id") or ""),
-                summary.get("_rollout_path"),
-            )
-            if activity is not None and status == "completed":
-                summary["completed_at"] = int(activity[2])
-        for summary in threads:
-            summary.pop("_rollout_path", None)
+        for index, summary in enumerate(threads):
+            if index >= LOG_SCAN_LIMIT:
+                break
+            thread_id = str(summary.get("thread_id") or "")
+            # The rollout log is authoritative for every row, not just the ones
+            # this process cannot see. thread/list reports a desktop-owned thread
+            # as unloaded to any second reader, so an "active" row can look idle
+            # here while the chat header shows it running. Ask the log first and
+            # let it win for running work.
+            activity = self._thread_log(thread_id)
+            inferred = self._log_status(thread_id)
+            if inferred:
+                summary["status"] = inferred
+            if activity is not None:
+                _newest, _kind, kind_stamp, _written, _real = activity
+                if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
+                    # List rows carry no turns, so a finished task only shows up
+                    # via its rollout log. Use that log's completion timestamp
+                    # as the read watermark; otherwise completed_at stays 0 and
+                    # the "already read" check below can never match.
+                    summary["completed_at"] = int(kind_stamp)
+            # A long thread's rollout tail can hold no lifecycle event at all:
+            # a 70 MB log spends its last 128 KB on tool output, so the
+            # task_started / task_complete records that say how the turn ended
+            # are far outside the window. The row then has nothing but the
+            # unloaded marker from thread/list and reads as idle, while the chat
+            # header reads the turn and says "failed". Ask the app-server for
+            # the turn itself, but only for rows the log could not classify.
+            if activity is None or not inferred:
+                read_status = self._row_status_from_turn(thread_id)
+                if read_status:
+                    summary["status"] = read_status
+                    if read_status in {"completed", "failed"}:
+                        detail = self._read_thread_summary(thread_id)
+                        if detail is not None:
+                            completed_at = int(detail.get("completed_at") or 0)
+                            if completed_at > int(summary.get("completed_at") or 0):
+                                summary["completed_at"] = completed_at
+            completed_at = int(summary.get("completed_at") or 0)
+            if (
+                summary.get("status") in {"completed", "failed"}
+                and completed_at > 0
+                and self._read_state.is_thread_read(thread_id, completed_at)
+            ):
+                summary["status"] = "idle"
         threads.sort(
             key=lambda item: (
                 0 if str(item.get("status") or "") in ACTIVE_STATUSES else 1,
@@ -1282,18 +1506,100 @@ class CompanionService:
             "started_at": _epoch(latest_turn.get("startedAt")),
             "tokens": int(_as_number(total.get("totalTokens")) or 0),
             "ephemeral": bool(row.get("ephemeral")),
+            "error_message": _turn_error(latest_turn),
         }
-    def read_thread(self, thread_id: str, message_limit: int = MAX_MESSAGE_ITEMS) -> dict[str, Any]:
-        if not thread_id:
-            raise ValueError("thread_id")
-        result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+    @staticmethod
+    def _resolve_status(
+        thread_id: str,
+        summary: dict[str, Any],
+        task: dict[str, Any],
+        live_status: str,
+    ) -> str:
+        """Pick the one status both the list row and the chat header will use.
+
+        The two views used to be derived by different code paths, so a thread
+        could be listed as idle but open as "working". A live rollout write is
+        the strongest signal, then the turn snapshot, then the row summary.
+        """
+        if live_status:
+            return live_status
+        task_status = str(task.get("status") or "")
+        summary_status = str(summary.get("status") or "")
+        if task_status in ACTIVE_STATUSES:
+            return task_status
+        if summary_status in ACTIVE_STATUSES:
+            return summary_status
+        if task_status:
+            return task_status
+        return summary_status or "idle"
+
+    def _read_fork_tail_messages(
+        self,
+        fork_id: str,
+        seen_turn_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Return the fork's own turns, which the original thread lacks.
+
+        A fork copies the history of the thread it branched from, so only the
+        turns started after the fork are new. Those are the phone replies made
+        while the desktop held the writer lock, and they must stay visible once
+        writing moves back to the original thread.
+        """
+        if not fork_id:
+            return []
+        try:
+            result = self._read("thread/read", {"threadId": fork_id, "includeTurns": True})
+        except AppServerError:
+            return []
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
-            raise ValueError("thread")
+            return []
         turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
         turns.sort(key=lambda turn: _epoch(
             turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
         ))
+        messages: list[dict[str, Any]] = []
+        for turn in turns:
+            turn_id = str(turn.get("id") or "")
+            if not turn_id or turn_id in seen_turn_ids:
+                continue
+            for item in turn.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                mapped = self._map_item(item, turn)
+                if mapped is None:
+                    continue
+                mapped["turn_id"] = turn_id
+                messages.append(mapped)
+        return messages
+
+    def read_thread(
+        self,
+        thread_id: str,
+        message_limit: int = MAX_MESSAGE_ITEMS,
+    ) -> dict[str, Any]:
+        if not thread_id:
+            raise ValueError("thread_id")
+        # When the origin thread is locked by the desktop we read the fork that
+        # carries its history, but keep reporting the origin id to the phone.
+        source_id = self._fork_for(thread_id) or thread_id
+        result = self._read("thread/read", {"threadId": source_id, "includeTurns": True})
+        tail_thread: dict[str, Any] | None = None
+        tail_id = ""
+        with self._resumed_lock:
+            if thread_id not in self._forked_threads:
+                tail_id = self._fork_tails.get(thread_id, "")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            raise ValueError("thread")
+        live_status = self._log_status(thread_id)
+        if live_status:
+            thread = {**thread, "__codexbridge_live_status": live_status}
+        turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
+        turns.sort(key=lambda turn: _epoch(
+            turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
+        ))
+        seen_turn_ids = {str(turn.get("id") or "") for turn in turns}
         turns = turns[-MAX_TURNS_IN_DETAIL:]
         messages: list[dict[str, Any]] = []
         for turn in turns:
@@ -1306,26 +1612,44 @@ class CompanionService:
                     continue
                 mapped["turn_id"] = turn_id
                 messages.append(mapped)
+        # A reclaimed thread keeps the replies the phone made while it lived in
+        # a fork. Those turns are in the fork's rollout but not in the
+        # original's, so read the tail and append only what is missing.
+        tail_messages = self._read_fork_tail_messages(tail_id, seen_turn_ids)
+        if tail_messages:
+            messages.extend(tail_messages)
         total = len(messages)
         trimmed = messages[-max(1, int(message_limit)):]
         summary = self._summary(thread)
-        rollout_path = str(thread.get("path") or "")
-        summary["_rollout_path"] = rollout_path
-        summary["status"] = self._resolve_status(thread, summary, allow_log=True)
-        summary.pop("_rollout_path", None)
-        self._remember_detail_status(
-            str(summary.get("thread_id") or ""),
-            str(summary.get("status") or ""),
-            rollout_path,
-            turn_id=str(summary.get("turn_id") or ""),
-            started_at=int(summary.get("started_at") or 0),
-        )
+        summary["thread_id"] = thread_id
+        original = self._original_title(thread_id)
+        if original:
+            summary["title"] = original
         task = thread_snapshot(thread)
-        task["status"] = summary["status"]
+        task["thread_id"] = thread_id
+        # The phone list renders thread.status while the chat header renders
+        # task.status. Resolve them once so the two can never disagree, which
+        # used to show a task as idle in the list but "working" after opening it.
+        resolved = self._resolve_status(
+            thread_id=thread_id,
+            summary=summary,
+            task=task,
+            live_status=live_status,
+        )
+        summary["status"] = resolved
+        task["status"] = resolved
+        if resolved in {"completed", "failed"}:
+            completed_at = int(summary.get("completed_at") or task.get("completed_at_epoch") or 0)
+            if completed_at <= 0:
+                completed_at = int(summary.get("updated_at") or 0)
+            if completed_at > 0 and self._read_state.is_thread_read(thread_id, completed_at):
+                summary["status"] = "idle"
+                task["status"] = "idle"
         return {
             "thread": summary,
             "task": task,
             "messages": trimmed,
+            "continued_as": self._fork_for(thread_id),
             "message_count": total,
             "truncated": total > len(trimmed),
             "pending_approvals": [
@@ -1502,7 +1826,8 @@ class CompanionService:
             # Interactive phone-created tasks must classify as user tasks so
             # Codex Desktop can hydrate and open them normally.
             params["threadSource"] = "user"
-        if self._creation_client_factory is not None and not ephemeral:
+        use_desktop_handoff = self._creation_client_factory is not None and not ephemeral
+        if use_desktop_handoff:
             creator = self._creation_client_factory()
             try:
                 creator.start()
@@ -1515,7 +1840,7 @@ class CompanionService:
                     # the thread commits its session file before handing the
                     # active writer over to the desktop.
                     creator.request('thread/name/set',
-                                    {'threadId': thread_id, 'name': '新任务'})
+                                    {'threadId': thread_id, 'name': _BRIDGE_PENDING_TITLE})
             finally:
                 # The desktop cannot hydrate a task while another writer owns it.
                 creator.close()
@@ -1528,6 +1853,13 @@ class CompanionService:
         if not thread_id:
             raise AppServerError('App Server 未返回任务 ID')
         self._untitled_threads.add(thread_id)
+        if not use_desktop_handoff:
+            # thread/start already loaded the thread in this process, but it has no
+            # rollout file until its first turn runs, so a later resume fails with
+            # "no rollout found". Remember it so the first reply skips the resume.
+            with self._resumed_lock:
+                self._locked_threads.discard(thread_id)
+            self._thread_note(thread_id)
         if self._desktop is not None or self._client_factory is None:
             self._desktop_required.add(thread_id)
             owner = None
@@ -1553,6 +1885,40 @@ class CompanionService:
         self.publish({'type': 'threads_changed', 'thread_id': thread_id})
         return {"thread": self._summary(thread)}
 
+    def mark_thread_read(self, thread_id: str) -> dict[str, Any]:
+        if not thread_id:
+            raise ValueError("thread_id")
+        # Read without an acknowledging reader so the summary still carries the
+        # completion state we need to detect an unread result.
+        detail = self.read_thread(thread_id, message_limit=1)
+        summary = detail["thread"]
+        status = str(summary.get("status") or "idle")
+        completed_at = int(summary.get("completed_at") or 0)
+        # The list derives its completion time from the rollout log, which can
+        # be a beat later than the turn's completedAt. Mark the later value so
+        # the list's read check matches and the row flips to idle too.
+        log_activity = self._thread_log(thread_id)
+        if log_activity is not None:
+            completed_at = max(completed_at, int(log_activity[2] or 0))
+        if status in {"completed", "failed"} and completed_at > 0:
+            was_unread = not self._read_state.is_thread_read(thread_id, completed_at)
+            self._read_state.mark_thread(thread_id, completed_at)
+            if was_unread:
+                self.publish(
+                    {
+                        "type": "thread_status",
+                        "thread_id": thread_id,
+                        "status": "idle",
+                        "active_flags": [],
+                    }
+                )
+            status = "idle"
+        return {
+            "thread_id": thread_id,
+            "read_at": self._read_state.thread_read_at(thread_id),
+            "status": status,
+        }
+
     def start_turn(
         self,
         thread_id: str,
@@ -1568,8 +1934,9 @@ class CompanionService:
             raise ValueError("text")
         if thread_id in self._desktop_required and thread_id not in self._desktop_followed:
             raise DesktopIpcError('desktop_handoff_pending')
+        target_id = thread_id
         params: dict[str, Any] = {
-            "threadId": thread_id,
+            "threadId": target_id,
             "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
         }
         if model:
@@ -1615,20 +1982,10 @@ class CompanionService:
                           'user_message': _clip(content, MAX_MESSAGE_CHARS)})
             return {'thread_id': thread_id, 'turn_id': turn_id, 'status': 'working',
                     'execution_transport': 'desktop_owner'}
-        self._ensure_thread(thread_id)
+        target_id = self._writable_thread(thread_id)
+        params["threadId"] = target_id
         client = self._ensure_client()
-        try:
-            result = client.request("turn/start", params)
-        except AppServerError as error:
-            if not _is_active_writer_error(error):
-                raise
-            result = client.request(
-                "turn/steer",
-                {
-                    "threadId": thread_id,
-                    "input": params["input"],
-                },
-            )
+        result = client.request("turn/start", params)
         turn = result.get("turn") if isinstance(result, dict) else None
         turn_id = str((turn or {}).get("id") or "")
         self._assign_generated_title(thread_id, content)
@@ -1641,7 +1998,12 @@ class CompanionService:
                 "user_message": _clip(content, MAX_MESSAGE_CHARS),
             }
         )
-        return {"thread_id": thread_id, "turn_id": turn_id, "status": "working"}
+        return {
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "status": "working",
+            "continued_as": target_id if target_id != thread_id else "",
+        }
 
     def _desktop_owner(self, thread_id: str) -> str | None:
         from codexbridge.codex.desktop_ipc import DesktopIpcClient, DesktopIpcError
@@ -1831,28 +2193,21 @@ class CompanionService:
             turn = result.get('turn') if isinstance(result, dict) else None
             return {'thread_id': thread_id, 'turn_id': str((turn or {}).get('id') or ''),
                     'status': 'working', 'execution_transport': 'desktop_owner'}
-        self._ensure_thread(thread_id)
+        target_id = self._writable_thread(thread_id)
         client = self._ensure_client()
         steer_params = {
-            "threadId": thread_id,
+            "threadId": target_id,
             "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
         }
-        try:
-            result = client.request("turn/steer", steer_params)
-        except AppServerError as error:
-            if not _is_no_active_turn_error(error):
-                raise
-            result = client.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": steer_params["input"],
-                },
-            )
+        expected_turn_id = self._active_turn_id(target_id)
+        if not expected_turn_id:
+            raise AppServerError("该任务当前没有进行中的对话，无法追加消息")
+        steer_params["expectedTurnId"] = expected_turn_id
+        result = client.request("turn/steer", steer_params)
         turn = result.get("turn") if isinstance(result, dict) else None
         return {
             "thread_id": thread_id,
-            "turn_id": str((turn or {}).get("id") or ""),
+            "turn_id": str((turn or {}).get("id") or expected_turn_id),
             "status": "working",
         }
 
@@ -1866,14 +2221,16 @@ class CompanionService:
                           'turn_id': turn_id})
             return {'thread_id': thread_id, 'turn_id': turn_id,
                     'execution_transport': 'desktop_owner'}
-        params: dict[str, Any] = {"threadId": thread_id}
-        self._ensure_thread(thread_id)
+        target_id = self._writable_thread(thread_id)
+        params: dict[str, Any] = {"threadId": target_id}
         if turn_id:
             params["turnId"] = turn_id
         else:
-            detail = self.read_thread(thread_id, message_limit=1)
-            task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
-            turn_id = str(task.get("turn_id") or "")
+            turn_id = self._active_turn_id(target_id)
+            if not turn_id:
+                detail = self.read_thread(thread_id, message_limit=1)
+                task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
+                turn_id = str(task.get("turn_id") or "")
             if not turn_id:
                 raise ValueError("turn_id")
             params["turnId"] = turn_id

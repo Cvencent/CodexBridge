@@ -137,7 +137,7 @@ fun PairScreen(
             value = host,
             onValueChange = { host = it },
             label = { Text("电脑地址") },
-            placeholder = { Text("192.168.1.10:8791") },
+            placeholder = { Text("192.168.1.10:8568") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier.fillMaxWidth(),

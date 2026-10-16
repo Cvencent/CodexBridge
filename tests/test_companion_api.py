@@ -150,6 +150,37 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(status, 200, sent)
         self.assertEqual(sent["turn_id"], "turn-2")
 
+    def test_read_ack_is_shared_by_all_paired_phones(self) -> None:
+        code = self.store.pairing_code()["code"]
+        _, first = self.request(
+            "POST",
+            "/api/companion/pair",
+            {"code": code, "name": "手机一"},
+        )
+        first_token = first["token"]
+        code = self.store.pairing_code(regenerate=True)["code"]
+        _, second = self.request(
+            "POST",
+            "/api/companion/pair",
+            {"code": code, "name": "手机二"},
+        )
+        second_token = second["token"]
+
+        status, read = self.request(
+            "POST",
+            "/api/companion/threads/t1/read",
+            token=first_token,
+        )
+        self.assertEqual(status, 200, read)
+
+        status, threads = self.request(
+            "GET",
+            "/api/companion/threads",
+            token=second_token,
+        )
+        self.assertEqual(status, 200, threads)
+        self.assertEqual(threads["threads"][0]["status"], "idle")
+
     def test_pairing_failure_is_reported(self) -> None:
         status, payload = self.request(
             "POST",

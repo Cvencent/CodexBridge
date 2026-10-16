@@ -45,8 +45,8 @@ HTTP API。
 | 设备会话 | TCP | `8765` | CodexBridge 主动连接设备 |
 | CodexBridge 本机管理 | HTTP | `127.0.0.1:8788` | 本机浏览器或本机程序 |
 | Dotii 管理中心 | HTTP | `127.0.0.1:8787` | 本机浏览器；设备端仅访问其快照接口 |
-| 手机发现 | UDP | `8766`（可在管理页修改） | 手机广播，CodexBridge 应答 |
-| 手机伴侣 API | HTTP + SSE | `TCP 8791`（可在管理页修改） | 已配对手机 |
+| 手机发现 | UDP | `8569`（可在管理页修改） | 手机广播，CodexBridge 应答 |
+| 手机伴侣 API | HTTP + SSE | `TCP 8568`（可在管理页修改） | 已配对手机 |
 
 设备 TCP 会话使用 UTF-8 JSON，每条消息一行，以 `\n` 分隔。设备是 TCP 服务端，
 CodexBridge 是 TCP 客户端。设备切换 IP 后仍必须上报同一个稳定
@@ -197,8 +197,10 @@ CodexBridge 在发现设备并取得已保存令牌后建立独立会话。当�
    不带 `request_id`，用于固件在重连后已经处于目录加载态时退出加载。
    设备在正常目录请求期间仍应按 `request_id` 过滤响应。
 
-已读按 `message_id` 和设备维度保存。重放的是在线期间仍存在于消息中心的消息；
-消息中心当前最多保留 `200` 条记录。
+设备维度的已读按 `message_id` 和设备维度保存，用于兼容各设备的本地去重。除此之外
+CodexBridge 维护一份全局已读标记：任一客户端（手机伴侣或 ESP 设备）读过一条消息后，
+其他客户端重连或刷新时都不会再把它当作未读下发。重放的是在线期间仍存在于消息中心
+的消息；消息中心当前最多保留 `200` 条记录。
 
 ## 7. 能力协商与权限模型
 
@@ -685,9 +687,10 @@ CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发�
 
 ### 11.3 重连重放
 
-设备重新连接后，CodexBridge 推送该设备尚未读过且符合能力的消息，并推送带有
-已读记录的 `read_state`。这保证同一消息在多台设备之间保持一致，不依赖设备
-本地缓存。
+设备重新连接后，CodexBridge 推送尚未被任何客户端读过的消息，并推送带有已读
+记录的 `read_state`。任一设备上报 `read_ack` 后，CodexBridge 同时更新全局已读标记，
+因此其他在线设备会收到 `read_state`，稍后重连的设备也不会再收到该消息。这保证同一
+消息在多台设备之间保持一致，不依赖设备本地缓存。
 
 ## 12. 错误与边界
 
@@ -806,20 +809,20 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 
 | 用途 | 传输 | 端口 | 发起方 |
 | --- | --- | --- | --- |
-| 手机发现 | UDP | `8766` | 手机广播，CodexBridge 应答 |
-| 手机伴侣 API | HTTP + SSE | `TCP 8791`（可在管理页修改） | 已配对手机 |
+| 手机发现 | UDP | `8569` | 手机广播，CodexBridge 应答 |
+| 手机伴侣 API | HTTP + SSE | `TCP 8568`（可在管理页修改） | 已配对手机 |
 
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.4.0","port":8791,"discovery_port":8766,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.4.0","port":8568,"discovery_port":8569,"requires_pairing":true}
 ```
 
-默认连接端口为 `8791`，默认发现端口为 `8766`，并在管理页面显示每个端口的健康状态。
+默认连接端口为 `8568`，默认发现端口为 `8569`，并在管理页面显示每个端口的健康状态。
 手机连接端口和手机发现端口都可以在电脑端修改；修改发现端口后，手机端“扫描端口”
 必须填写同一个值。`8764` 和 `8765` 是设备固件定义的固定端口。`8790` 由本机其他程序
 保留，CodexBridge 不接受配置或回退到该端口；旧版本保存的 `8790` 会在升级后自动迁移为
-`8791`，配对令牌保持不变。修改端口时，新端口先完成监听才会释放旧端口；目标端口无效
+`8568`，配对令牌保持不变。修改端口时，新端口先完成监听才会释放旧端口；目标端口无效
 或被占用时继续使用原端口。
 
 ### 17.1 配对与鉴权
@@ -838,7 +841,8 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 | GET | `/api/companion/threads` | 线程列表，支持 `limit`、`search`、`cursor` |
 | POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model` |
 | GET | `/api/companion/threads/<id>` | 线程详情与归一化消息 |
-| POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务 |
+| POST | `/api/companion/threads/<id>/read` | 标记该线程当前完成状态为已读，返回最新 `status` |
+| POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务；响应中的 `continued_as`（非空时）指向实际承接历史的线程 id |
 | POST | `/api/companion/threads/<id>/interrupt` | 中断任务，`turn_id` 可省略 |
 | POST | `/api/companion/approvals/<request_id>` | 审批决定，`decision` 取 `accept`、`acceptForSession`、`decline`、`cancel` |
 | GET | `/api/companion/models` | 可用模型与推理档位 |
@@ -863,8 +867,8 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 
 SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
 `turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
-`token_usage`、`thread_status`、`thread_name`、`rate_limits`、`approval_request`、
-`approval_resolved`、`threads_changed`、`resync_required`、`error`。手机端必须忽略未知 `type`。审批请求超过 `600` 秒未处理会在电脑端失效。
+`token_usage`、`thread_status`、`thread_name`、`thread_forked`、`threads_changed`、`resync_required`、
+`rate_limits`、`approval_request`、`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳、`read` 布尔值与 `error_message`（失败原因，成功时为空字符串）；手机端应使用前两者判断完成先后、给状态栏提醒去重，并在 `read=true` 时不再提醒，失败时直接展示 `error_message`。审批请求超过 `600` 秒未处理会在电脑端失效。
 
 Bridge 每 2 秒校准最近线程的外部变更，变化时发送 `threads_changed`（携带
 `thread_id`），并对观测期间发生的完成补发 `turn_completed`。首次扫描不会重放
@@ -886,7 +890,29 @@ Windows 没有可用的桌面共享 App Server socket，Bridge 因此对桌面�
 正常加载并立即刷新，不会生成旧的 `CodexBridge` 占位会话。桌面 IPC 是 Bridge 内部适配层，不属于
 ESP/设备协议；设备只使用后文的通用命令协议。
 
-### 17.4 本机管理
+完成与失败的提醒在多台客户端之间保持一致：`completed`/`failed` 的线程在任一台设备
+打开（`GET /api/companion/threads/<id>` 或 `POST /api/companion/threads/<id>/read`）后即被
+标记为全局已读，线程列表状态回落为 `idle`，并向所有在线客户端广播 `thread_status`
+的 `idle` 事件，其他设备据此撤回尚未展示的完成提醒。
+
+### 17.4 电脑端占用线程时的续写
+
+app-server 对同一线程只允许一个 writer。电脑端 Codex（或另一个 app-server 进程）打开某线程后，
+可能仍留下 `~/.codex/thread-writer-locks/<thread_id>.lock`。CodexBridge 收到“已有活跃 writer”时
+优先清除这个陈旧锁并重新 `thread/resume`，随后手机和电脑继续使用同一个线程 id，历史不复制。
+
+- 清锁成功时 `POST /api/companion/threads/<id>/messages` 的 `continued_as` 为空；所有 SSE 事件、
+  线程列表和详情都使用原线程 id。
+- 电脑端 finish 后可能不会自动重渲染旧快照。`turn_completed` 事件会标记 `append_only=true`，客户端
+  收到后可重新拉取该线程详情，把电脑端这次对话追加到同一会话里。
+- 只有锁文件无法删除、resume 仍被拒绝时，才退回到旧的 `thread/fork` 兜底。fork 会重命名为
+  `手机继续 · <原任务名>`，映射保存在 `%LOCALAPPDATA%\CodexBridge\fork-map.json`；`continued_as`
+  非空时手机可提示这条极端路径。
+- 若 fork 也失败，返回明确的中文错误，提示先在电脑端关闭该会话后重试。
+- `mode=steer` 需带进行中的 `expectedTurnId`；当前没有进行中的对话时返回“该任务当前没有
+  进行中的对话，无法追加消息”。
+
+### 17.5 本机管理
 
 事件恢复：SSE `id` 与 JSON 的 `event_id` 为同一不透明游标，不得按数字比较。
 客户端重连通过 `Last-Event-ID` 请求头或 `after` 参数提交最后已接收游标。
@@ -900,6 +926,6 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
 设备不得依赖桌面的命名管道、私有消息版本或 conversationState 结构。
 
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
-- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8791}` 和 `{"action":"set_port","kind":"discovery","port":8766}`。
+- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 ```

@@ -35,6 +35,10 @@ data class SendResponse(
     val thread_id: String = "",
     val turn_id: String = "",
     val status: String = "",
+    val read_at: Long = 0,
+    // Set when the desktop held the original thread, so the reply continued in
+    // a forked copy that shares its history.
+    val continued_as: String = "",
 )
 
 @Serializable
@@ -82,6 +86,7 @@ data class ThreadSummary(
     val completed_at: Long = 0,
     val tokens: Long = 0,
     val ephemeral: Boolean = false,
+    val error_message: String = "",
 )
 
 @Serializable
@@ -151,6 +156,7 @@ data class TaskSnapshot(
     val started_at_epoch: Long = 0,
     val last_updated_epoch: Long = 0,
     val completed_at_epoch: Long = 0,
+    @SerialName("error_message") val errorMessage: String = "",
 ) {
     val isWorking: Boolean get() = status == "working" || status == "waiting_user"
 }
@@ -200,6 +206,7 @@ data class ThreadDetailResponse(
     val messages: List<MessageItem> = emptyList(),
     val message_count: Int = 0,
     val truncated: Boolean = false,
+    val continued_as: String = "",
     val pending_approvals: List<ApprovalRequest> = emptyList(),
 )
 
@@ -255,6 +262,8 @@ data class StreamEvent(
     val item_id: String = "",
     val delta: String = "",
     val status: String = "",
+    val completed_at: Long = 0,
+    val read: Boolean = false,
     val title: String = "",
     val message: String = "",
     val decision: String = "",
@@ -263,6 +272,8 @@ data class StreamEvent(
     val context_window: Long = 0,
     val duration_ms: Long? = null,
     val active_flags: List<String> = emptyList(),
+    val continued_as: String = "",
+    val error_message: String = "",
     val item: MessageItem? = null,
     // Approval payload fields.
     val kind: String = "",

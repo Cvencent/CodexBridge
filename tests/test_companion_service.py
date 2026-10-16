@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from codexbridge.codex.app_server import AppServerError
-from codexbridge.companion.service import CompanionService
+from codexbridge.companion.service import LOG_ACTIVE_SECONDS, CompanionService
+from codexbridge.read_state import ReadStateStore
 
 
 class FakeClient:
@@ -180,62 +183,8 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(detail['thread']['status'], 'completed')
         self.assertEqual(listed['status'], detail['thread']['status'])
 
-    def test_remembered_failed_status_wins_over_later_idle_list_row(self):
-        from unittest.mock import Mock, patch
-        desktop = Mock()
-        desktop.find_thread_owner.return_value = 'owner'
-        self.service._desktop = desktop
-        self.service._detail_status_cache['t1'] = ('', 0, 'failed')
-        self.client.responses['thread/list'] = {'data': [thread_row(status={'type': 'notLoaded'})]}
-        with patch.object(self.service, '_thread_log', return_value=None), patch.object(
-                self.service, '_rollout_signature', return_value=None):
-            listed = self.service.list_threads()['threads'][0]
-        self.assertEqual(listed['status'], 'failed')
 
-    def test_first_list_retries_terminal_confirmation_before_returning_idle(self):
-        from unittest.mock import patch
-        failed_detail = thread_detail()
-        failed_detail["thread"]["turns"][0]["status"] = "failed"
-        calls = {"count": 0}
 
-        def read(params):
-            calls["count"] += 1
-            if calls["count"] <= 2:
-                raise AppServerError("http 503")
-            return failed_detail
-
-        self.client.responses["thread/list"] = {"data": [thread_row()]}
-        self.client.responses["thread/read"] = read
-        with patch.object(self.service, "_thread_log",
-                          return_value=(time.time() - 1000, "", 0)), \
-                patch.object(self.service, "_rollout_signature", return_value=None):
-            listed = self.service.list_threads()["threads"][0]
-        detail = self.service.read_thread("t1")
-        self.assertEqual(listed["status"], "failed")
-        self.assertEqual(detail["thread"]["status"], "failed")
-        self.assertEqual(detail["task"]["status"], "failed")
-
-    def test_snapshot_uses_resolved_status_for_list_detail_and_result_buckets(self):
-        from unittest.mock import Mock
-        desktop = Mock()
-        desktop.find_thread_owner.return_value = 'owner'
-        self.service._desktop = desktop
-        self.service._desktop_turn_status[('t1', 'turn-1')] = 'inProgress'
-        self.client.responses['thread/list'] = {
-            'data': [thread_row(status={'type': 'notLoaded'})],
-        }
-        self.client.responses['thread/read'] = thread_detail()
-
-        listed = self.service.list_threads()['threads'][0]
-        detail = self.service.read_thread('t1')
-        snapshot = self.service.snapshot()
-
-        self.assertEqual(listed['status'], 'working')
-        self.assertEqual(detail['thread']['status'], 'working')
-        self.assertEqual(detail['task']['status'], 'working')
-        self.assertEqual(snapshot['task']['status'], 'working')
-        self.assertEqual([task['status'] for task in snapshot['tasks']], ['working'])
-        self.assertEqual(snapshot['result'], {})
 
     def test_pending_desktop_handoff_never_falls_back(self):
         from unittest.mock import Mock
@@ -289,7 +238,8 @@ class CompanionServiceTests(unittest.TestCase):
             'startedAt': 1791000200, 'completedAt': 0,
         }])
         self.client.responses['thread/list'] = {'data': [row]}
-        with patch.object(self.service, '_thread_log', return_value=(1791000100, 'task_failed', 1791000100)):
+        self.client.responses['thread/read'] = {'thread': row}
+        with patch.object(self.service, '_thread_log', return_value=(1791000100.0, 'task_failed', 1791000100.0, 0.0, 1791000100.0)):
             listed = self.service.list_threads()['threads'][0]
         self.assertEqual(listed['status'], 'working')
 
@@ -566,165 +516,44 @@ class CompanionServiceTests(unittest.TestCase):
         result = self.service.list_threads(limit=10)
         self.assertEqual(result["threads"][0]["thread_id"], "t2")
         self.assertEqual(result["threads"][0]["status"], "working")
-        self.assertEqual(result["threads"][1]["status"], "idle")
+        self.assertEqual(result["threads"][1]["status"], "completed")
 
-    def test_list_threads_marks_finished_rollout_completed(self) -> None:
-        self._write_rollout("t2", "task_complete", seconds_ago=30)
-        result = self.service.list_threads(limit=10)
-        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
-        self.assertEqual(statuses["t2"], "completed")
-
-    def test_stale_rollout_start_defers_to_turn_history(self) -> None:
-        # A dangling ``task_started`` with no terminal marker means the turn
-        # was abandoned; the list must agree with the turn history rather than
-        # guessing idle or working.
-        self._write_rollout("t2", "task_started", seconds_ago=600)
-        self.client.responses["thread/read"] = thread_detail("t2")
-        result = self.service.list_threads(limit=10)
-        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
-        self.assertEqual(statuses["t2"], "completed")
-
-    def test_completed_rollout_overrides_stale_active_list_row(self) -> None:
+    def test_list_falls_back_to_turn_when_log_tail_has_no_lifecycle(self) -> None:
+        # A long thread's rollout tail holds no task_started / task_complete
+        # record: a 70 MB log spends its last 128 KB on tool output. The row then
+        # has nothing to classify from and used to read "idle" while the chat
+        # header read the turn and said "failed".
         self.client.responses["thread/list"] = {
-            "data": [thread_row(status={"type": "active"})],
+            "data": [thread_row("t1", status={"type": "notLoaded"})],
+            "nextCursor": None,
         }
-        self._write_rollout("t1", "task_complete")
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "completed")
+        # Only a settings record in the tail, so no lifecycle event is visible.
+        # Real tool records, but no task_started / task_complete anywhere in
+        # the window, and old enough that no live turn is implied.
+        self._append_rollout_record("t1", "token_count", seconds_ago=400)
 
-    def test_terminal_rollout_overrides_stale_active_desktop_status(self) -> None:
-        from unittest.mock import Mock
-        desktop = Mock()
-        desktop.find_thread_owner.return_value = 'owner'
-        self.service._desktop = desktop
-        self.service._desktop_turn_status[('t1', 'turn-1')] = 'inProgress'
-        self.client.responses['thread/list'] = {
-            'data': [thread_row(status={'type': 'active'})],
+        result = self.service.list_threads(limit=10)
+
+        self.assertEqual(len(result["threads"]), 1)
+        self.assertEqual(result["threads"][0]["status"], "completed")
+
+    def test_list_shows_working_for_a_thread_another_process_owns(self) -> None:
+        # thread/list reports a desktop-owned thread as not-loaded to any second
+        # reader, so its own status field looks inactive. The rollout log is
+        # what proves the turn is running, and the list must trust it -- the row
+        # used to stay "idle" while the chat header showed "working".
+        self.client.responses["thread/list"] = {
+            "data": [thread_row("t1", status={"type": "notLoaded"})],
+            "nextCursor": None,
         }
-        self._write_rollout('t1', 'task_complete')
-        self.assertEqual(
-            self.service.list_threads()['threads'][0]['status'],
-            'completed',
-        )
+        self._write_rollout("t1", "task_started", seconds_ago=3)
 
-    def test_old_completion_does_not_override_newer_running_turn(self) -> None:
-        self.client.responses["thread/list"] = {"data": [thread_row(
-            status={"type": "active"}, turns=[{
-                "id": "new-turn", "status": "inProgress", "startedAt": int(time.time()),
-            }],
-        )]}
-        self._write_rollout("t1", "task_complete", seconds_ago=30)
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "working")
+        result = self.service.list_threads(limit=10)
 
-    def test_old_terminal_rollout_matches_detail_without_list_turn_history(self) -> None:
-        self.client.responses["thread/list"] = {"data": [thread_row()]}
-        self.client.responses["thread/read"] = thread_detail()
-        self._write_rollout("t1", "task_complete", seconds_ago=7200)
+        self.assertEqual(len(result["threads"]), 1)
+        self.assertEqual(result["threads"][0]["status"], "working")
 
-        listed = self.service.list_threads()["threads"][0]
-        detail = self.service.read_thread("t1")
-
-        self.assertEqual(listed["status"], "completed")
-        self.assertEqual(detail["thread"]["status"], listed["status"])
-        self.assertEqual(detail["task"]["status"], listed["status"])
-
-    def test_cached_terminal_status_survives_unrelated_rollout_append(self) -> None:
-        self.client.responses["thread/list"] = {"data": [thread_row()]}
-        self.client.responses["thread/read"] = {
-            "thread": {
-                **thread_row(),
-                "turns": [
-                    {
-                        "id": "turn-failed",
-                        "status": "failed",
-                        "startedAt": 1791000000,
-                        "items": [],
-                    }
-                ],
-            }
-        }
-        self._write_rollout("t1", "token_usage_record")
-
-        detail = self.service.read_thread("t1")
-        self.assertEqual(detail["thread"]["status"], "failed")
-
-        rollout = next(
-            (Path(self.temp.name) / "sessions").rglob("rollout-t1.jsonl")
-        )
-        with rollout.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "timestamp": datetime.now(timezone.utc)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-                        "type": "token_usage_record",
-                        "payload": {},
-                    }
-                )
-                + "\n"
-            )
-
-        listed = self.service.list_threads()["threads"][0]
-        self.assertEqual(listed["status"], "failed")
-    def test_cached_failed_status_does_not_override_newer_running_turn(self) -> None:
-        self.client.responses["thread/list"] = {"data": [thread_row()]}
-        self.client.responses["thread/read"] = {
-            "thread": {
-                **thread_row(),
-                "turns": [
-                    {
-                        "id": "turn-failed",
-                        "status": "failed",
-                        "startedAt": 1791000000,
-                        "items": [],
-                    }
-                ],
-            }
-        }
-        detail = self.service.read_thread("t1")
-        self.assertEqual(detail["thread"]["status"], "failed")
-
-        self.client.responses["thread/list"] = {"data": [thread_row(
-            status={"type": "active"},
-            turns=[{
-                "id": "turn-new",
-                "status": "inProgress",
-                "startedAt": 1791000200,
-            }],
-        )]}
-        listed = self.service.list_threads()["threads"][0]
-        self.assertEqual(listed["status"], "working")
-        self.assertEqual(listed["turn_id"], "turn-new")
-    def test_terminal_rollout_matches_detail_for_thread_beyond_old_scan_limit(self) -> None:
-        rows = [
-            thread_row(
-                f"t{index}",
-                name=f"Task {index}",
-                recencyAt=1791000200 - index,
-            )
-            for index in range(1, 27)
-        ]
-        self.client.responses["thread/list"] = {"data": rows}
-        self.client.responses["thread/read"] = thread_detail("t26")
-        self._write_rollout("t26", "task_complete", seconds_ago=7200)
-
-        listed = next(
-            item for item in self.service.list_threads(limit=80)["threads"]
-            if item["thread_id"] == "t26"
-        )
-        detail = self.service.read_thread("t26")
-
-        self.assertEqual(listed["status"], "completed")
-        self.assertEqual(detail["thread"]["status"], listed["status"])
-        self.assertEqual(detail["task"]["status"], listed["status"])
-
-    def test_rollout_changes_invalidate_status_cache_immediately(self) -> None:
-        self._write_rollout("t1", "task_started")
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "working")
-        self._write_rollout("t1", "task_complete")
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "completed")
-
-    def test_recent_rollout_without_turn_marker_confirms_detail_status(self) -> None:
+    def test_stale_mtime_does_not_hide_a_live_turn(self) -> None:
         folder = (
             Path(self.temp.name)
             / "sessions"
@@ -733,28 +562,46 @@ class CompanionServiceTests(unittest.TestCase):
             / f"{datetime.now().day:02d}"
         )
         folder.mkdir(parents=True, exist_ok=True)
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "type": "response_item",
-            "payload": {"type": "message", "role": "assistant", "content": "noise"},
-        }
-        (folder / "rollout-t1.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "completed")
+        path = folder / "rollout-t2.jsonl"
+        stamp = datetime.now(timezone.utc)
+        path.write_text(
+            json.dumps(
+                {
+                    "timestamp": stamp.isoformat().replace("+00:00", "Z"),
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stale = time.time() - 3600.0
+        os.utime(path, (stale, stale))
 
-    def test_recent_usage_record_does_not_hide_terminal_turn_status(self) -> None:
-        failed_detail = thread_detail()
-        failed_detail["thread"]["turns"][0]["status"] = "failed"
-        self.client.responses["thread/read"] = failed_detail
-        self._write_rollout("t1", "token_usage_record")
+        # Windows reports a frozen mtime for a rollout that is still being
+        # appended to, so a stale mtime must not hide a live turn.
+        self.assertEqual(self.service._log_status("t2"), "working")
 
-        listed = self.service.list_threads()["threads"][0]
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "working")
 
-        self.assertEqual(listed["status"], "failed")
+        # The guard still works: when the records are genuinely old the thread is
+        # idle, so a frozen mtime cannot invent a running turn. Rewrite the log
+        # with an old stamp and clear the short-lived tail cache before re-reading.
+        old = time.time() - LOG_ACTIVE_SECONDS - 60.0
+        path.write_text(json.dumps({"timestamp": datetime.fromtimestamp(old, timezone.utc).isoformat().replace("+00:00", "Z"), "type": "event_msg", "payload": {"type": "task_started"}}) + "\n", encoding="utf-8")
+        with self.service._log_cache_lock:
+            self.service._log_cache.clear()
+        self.assertEqual(self.service._log_status("t2"), "")
 
-    def test_list_status_resolves_rollout_from_older_dated_folder(self) -> None:
-        # The rollout lives under a previous day's folder, which the old
-        # today/yesterday scan could never find.
-        day = datetime.now() - timedelta(days=5)
+    def test_rollout_recently_written_still_reports_working(self) -> None:
+        # The same log, but actively appended: still a live desktop turn.
+        self._write_rollout("t2", "task_started")
+        self.assertEqual(self.service._log_status("t2"), "working")
+
+    def _append_rollout_record(self, thread_id: str, payload_type: str, seconds_ago: float = 0.0) -> None:
+        day = datetime.now()
         folder = (
             Path(self.temp.name)
             / "sessions"
@@ -763,52 +610,85 @@ class CompanionServiceTests(unittest.TestCase):
             / f"{day.day:02d}"
         )
         folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timestamp": stamp.isoformat().replace("+00:00", "Z"),
             "type": "event_msg",
-            "payload": {"type": "task_complete"},
+            "payload": {"type": payload_type},
         }
-        (folder / "rollout-t1.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
-        self.assertEqual(self.service.list_threads()["threads"][0]["status"], "completed")
+        path = folder / f"rollout-{thread_id}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
 
-    def test_failed_task_complete_is_reported_failed_in_list_and_detail(self) -> None:
-        folder = (
-            Path(self.temp.name)
-            / "sessions"
-            / f"{datetime.now().year:04d}"
-            / f"{datetime.now().month:02d}"
-            / f"{datetime.now().day:02d}"
+    def test_resume_bookkeeping_does_not_force_working(self) -> None:
+        # Resuming or reading a long-finished task appends a
+        # ``thread_settings_applied`` record with a fresh timestamp, refreshing
+        # the file mtime even though no turn is running. That bookkeeping line
+        # must never make an idle task flicker back into "working".
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=1)
+        self.assertEqual(self.service._log_status("t2"), "completed")
+
+    def test_real_activity_after_bookkeeping_still_reports_working(self) -> None:
+        # A genuine turn writes real activity records, not just the settings
+        # bookkeeping line, so a live turn stays "working".
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=2)
+        self._append_rollout_record("t2", "item_completed", seconds_ago=1)
+        self.assertEqual(self.service._log_status("t2"), "working")
+
+    def test_list_threads_resume_bookkeeping_stays_idle(self) -> None:
+        # The phone list must not flip a finished task to "working" purely
+        # because the desktop resumed/read it and touched its rollout file.
+        self._write_rollout("t2", "task_complete", seconds_ago=3600)
+        self._append_rollout_record("t2", "thread_settings_applied", seconds_ago=1)
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertNotEqual(statuses["t2"], "working")
+
+    def test_list_threads_marks_finished_rollout_completed(self) -> None:
+        self._write_rollout("t2", "task_complete", seconds_ago=30)
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "completed")
+
+    def test_read_thread_uses_live_rollout_status_for_desktop_turn(self) -> None:
+        detail = thread_detail("t2")
+        detail["thread"]["status"] = {"type": "notLoaded"}
+        detail["thread"]["turns"][-1]["status"] = "interrupted"
+        self.client.responses["thread/read"] = detail
+        self._write_rollout("t2", "task_started", seconds_ago=1)
+
+        result = self.service.read_thread("t2")
+
+        self.assertEqual(result["thread"]["status"], "working")
+        self.assertEqual(result["task"]["status"], "working")
+
+    def test_list_threads_marks_read_completion_idle(self) -> None:
+        self._write_rollout("t2", "task_complete", seconds_ago=30)
+        read_state = ReadStateStore(None)
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            read_state=read_state,
         )
-        folder.mkdir(parents=True, exist_ok=True)
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "type": "event_msg",
-            "payload": {"type": "task_complete", "error": {"message": "stream disconnected"}},
-        }
-        (folder / "rollout-t1.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
-        self.client.responses["thread/read"] = thread_detail()
+        try:
+            service.list_threads(limit=10)  # populate the log cache
+            read_state.mark_thread("t2", int(self.service._thread_log("t2")[2]))
+            result = service.list_threads(limit=10)
+        finally:
+            service.stop()
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
+        self.assertEqual(statuses["t2"], "idle")
 
-        listed = self.service.list_threads()["threads"][0]
-        detail = self.service.read_thread("t1")
-
-        self.assertEqual(listed["status"], "failed")
-        self.assertEqual(detail["thread"]["status"], listed["status"])
-
-    def test_list_prefers_row_rollout_path_hint(self) -> None:
-        # A row that points at its real rollout file wins over directory scans,
-        # which keeps list and detail aligned even for relocated sessions.
-        cached = Path(self.temp.name) / "custom" / "rollout-anything-t2.jsonl"
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        cached.write_text(json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "type": "event_msg",
-            "payload": {"type": "task_complete"},
-        }) + "\n", encoding="utf-8")
-        self.client.responses["thread/list"] = {"data": [thread_row("t2", path=str(cached))]}
-        statuses = {
-            item["thread_id"]: item["status"]
-            for item in self.service.list_threads()["threads"]
-        }
+    def test_list_threads_ignores_stale_rollout(self) -> None:
+        self._write_rollout("t2", "task_started", seconds_ago=600)
+        self.client.responses["thread/read"] = thread_detail("t2")
+        result = self.service.list_threads(limit=10)
+        statuses = {item["thread_id"]: item["status"] for item in result["threads"]}
         self.assertEqual(statuses["t2"], "completed")
 
     def test_poll_detects_completion_without_replaying_old_completions(self) -> None:
@@ -845,6 +725,78 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(detail["messages"][3]["detail"]["exit_code"], 0)
         self.assertEqual(detail["messages"][3]["detail"]["output"], "BUILD SUCCESSFUL")
         self.assertEqual(detail["thread"]["completed_at"], 1791000100)
+
+    def test_detail_reports_one_status_for_list_and_chat(self) -> None:
+        # The phone list renders thread.status while the chat header renders
+        # task.status. They must never disagree for the same thread.
+        self.client.responses["thread/read"] = self._interrupted_desktop_thread()
+
+        detail = self.service.read_thread("t1")
+
+        self.assertEqual(detail["thread"]["status"], detail["task"]["status"])
+
+    def test_interrupted_turn_without_live_activity_is_not_working(self) -> None:
+        # A desktop thread that stopped long ago must not be reported as a
+        # running turn, otherwise the chat header shows "正在处理任务" forever.
+        self.client.responses["thread/read"] = self._interrupted_desktop_thread()
+
+        detail = self.service.read_thread("t1")
+
+        self.assertNotEqual(detail["task"]["status"], "working")
+        self.assertNotEqual(detail["thread"]["status"], "working")
+
+    def _interrupted_desktop_thread(self, seconds_ago: float = 833.0) -> dict:
+        """A desktop-owned thread whose last turn was interrupted a while ago.
+
+        Mirrors a real thread (01a13af3): the last turn is ``interrupted`` with
+        ``completedAt: None`` and a single userMessage item, runtime status is
+        ``notLoaded``, source is ``vscode``, and ``recencyAt``/``updatedAt`` are
+        ``seconds_ago`` old (well past any plausible activity window).
+        CodexBridge must not call this a running turn.
+        """
+        stamp = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        epoch = int(stamp.timestamp())
+        started = (stamp - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+        older = (stamp - timedelta(seconds=300)).isoformat().replace("+00:00", "Z")
+        return {
+            "thread": {
+                **thread_row("t1"),
+                "status": {"type": "notLoaded"},
+                "source": "vscode",
+                "recencyAt": epoch,
+                "updatedAt": epoch,
+                "createdAt": older,
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "startedAt": older,
+                        "completedAt": older,
+                        "items": [
+                            {
+                                "id": "item-1",
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "第一句"}],
+                            }
+                        ],
+                    },
+                    {
+                        "id": "turn-2",
+                        # Real payloads carry no updatedAt on an interrupted turn.
+                        "status": "interrupted",
+                        "startedAt": started,
+                        "completedAt": None,
+                        "items": [
+                            {
+                                "id": "item-2",
+                                "type": "userMessage",
+                                "content": [{"type": "text", "text": "继续"}],
+                            }
+                        ],
+                    },
+                ],
+            }
+        }
 
     def test_new_thread_uses_pending_title_and_tracks_untitled(self) -> None:
         from unittest.mock import Mock
@@ -918,39 +870,659 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(params["input"][0]["text"], "继续修复")
         self.assertEqual(params["model"], "gpt-5.1-codex")
 
-    def test_start_turn_uses_steer_when_active_writer_rejects_new_turn(self) -> None:
-        calls = {"start": 0, "steer": 0}
+    def test_start_turn_falls_back_to_fork_when_lock_cannot_be_cleared(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
 
-        def start(_params):
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(params):
+            calls["fork"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
             calls["start"] += 1
-            raise AppServerError("thread already has an active writer")
-
-        def steer(_params):
-            calls["steer"] += 1
+            self.assertEqual(params["threadId"], "t1-fork")
             return {"turn": {"id": "turn-2", "status": "inProgress"}}
 
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
         self.client.responses["turn/start"] = start
-        self.client.responses["turn/steer"] = steer
-        result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+
+        with mock.patch(
+            "codexbridge.companion.service._clear_writer_lock", return_value=False
+        ):
+            result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+
         self.assertEqual(result["status"], "working")
-        self.assertEqual(calls, {"start": 1, "steer": 1})
+        self.assertEqual(result["continued_as"], "t1-fork")
+        self.assertEqual(calls, {"resume": 2, "fork": 1, "start": 1})
 
-    def test_steer_turn_falls_back_to_start_when_no_active_writer(self) -> None:
-        calls = {"start": 0, "steer": 0}
+    def test_active_writer_lock_is_cleared_before_forking(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
+        original_resume = {"thread": thread_row()}
 
-        def steer(_params):
-            calls["steer"] += 1
-            raise AppServerError("no active turn to steer")
+        def resume(_params):
+            calls["resume"] += 1
+            if calls["resume"] == 1:
+                raise AppServerError("thread t1 already has an active writer")
+            return original_resume
+
+        def fork(_params):
+            calls["fork"] += 1
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
+            calls["start"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["turn/start"] = start
+
+        with mock.patch(
+            "codexbridge.companion.service._clear_writer_lock", return_value=True
+        ) as clear:
+            result = self.service.start_turn("t1", "继续同一个任务")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(result["continued_as"], "")
+        self.assertEqual(calls, {"resume": 2, "fork": 0, "start": 1})
+        clear.assert_called_once_with("t1")
+
+    def test_stale_writer_lock_file_is_removed_from_disk(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {"USERPROFILE": self.temp.name, "HOME": self.temp.name},
+        ):
+            lock_dir = Path(self.temp.name) / ".codex" / "thread-writer-locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = lock_dir / "t1.lock"
+            lock.write_bytes(b"locked")
+            self.client.responses["thread/resume"] = lambda _params: (_ for _ in ()).throw(
+                AppServerError("thread t1 already has an active writer")
+            )
+
+            with mock.patch(
+                "codexbridge.companion.service.writer_lock_path",
+                return_value=lock,
+            ):
+                self.service._ensure_thread("t1")
+
+            self.assertFalse(lock.exists())
+            self.assertFalse((lock_dir / "t1.lock.removed").exists())
+
+    def test_turn_completed_event_marks_history_append(self) -> None:
+        payload = {
+            "threadId": "t1",
+            "turn": {"id": "turn-9", "status": "completed", "completedAt": 1791000300},
+        }
+
+        event = self.service._event_payload({"method": "turn/completed", "params": payload})
+
+        self.assertTrue(event["append_only"])
+
+    def test_start_turn_forks_while_the_desktop_runs_a_turn(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
+
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(params):
+            calls["fork"] += 1
+            self.assertEqual(params["threadId"], "t1")
+            return {"thread": thread_row("t1-fork")}
+
+        def start(params):
+            calls["start"] += 1
+            # turn runs on the fork we own, not the locked original
+            self.assertEqual(params["threadId"], "t1-fork")
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["turn/start"] = start
+
+        self._write_rollout("t1", "task_started", seconds_ago=5)
+        result = self.service.start_turn("t1", "继续这个任务", model="gpt-5.1-codex")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(result["continued_as"], "t1-fork")
+        self.assertEqual(calls, {"resume": 1, "fork": 1, "start": 1})
+
+    def test_start_turn_reuses_fork_on_next_reply(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        forks = {"n": 0}
+
+        def fork(_params):
+            forks["n"] += 1
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "第一次")
+        result = self.service.start_turn("t1", "第二次")
+
+        self.assertEqual(forks["n"], 1)
+        self.assertEqual(result["continued_as"], "t1-fork")
+
+    def test_fork_is_named_so_the_desktop_can_tell_it_apart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            self.assertEqual(params["threadId"], "t1-fork")
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        names: list[dict] = []
+
+        def name_set(params):
+            names.append(params)
+            return {}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = name_set
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        self.assertEqual(len(names), 1)
+        self.assertEqual(names[0]["threadId"], "t1-fork")
+        self.assertIn("手机继续", names[0]["name"])
+        self.assertIn("桌面任务", names[0]["name"])
+
+    def test_renaming_the_fork_keeps_the_phone_task_title(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            if params["threadId"] == "t1-fork":
+                # Once renamed, the stored fork no longer carries the old name.
+                return {"thread": thread_row("t1-fork", name="手机继续 · 桌面任务")}
+            return thread_detail()
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = {}
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        listing = self.service.list_threads()
+        row = next(item for item in listing["threads"] if item["thread_id"] == "t1")
+        self.assertEqual(row["title"], "桌面任务")
+
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["thread"]["title"], "桌面任务")
+
+    def test_fork_titles_survive_restart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork", name="桌面任务")}
+
+        def read(params):
+            if params["threadId"] == "t1-fork":
+                return {"thread": thread_row("t1-fork", name="手机继续 · 桌面任务")}
+            return thread_detail()
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/read"] = read
+        self.client.responses["thread/name/set"] = {}
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        restarted = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            detail = restarted.read_thread("t1")
+            self.assertEqual(detail["thread"]["title"], "桌面任务")
+        finally:
+            restarted.stop()
+
+    def test_fork_naming_failure_does_not_break_the_reply(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        def name_set(_params):
+            raise AppServerError("thread metadata update failed")
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["thread/name/set"] = name_set
+
+        result = self.service.start_turn("t1", "继续这个任务")
+
+        self.assertEqual(result["continued_as"], "t1-fork")
+
+    def test_fork_publishes_thread_forked_event(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        subscriber = self.service.subscribe()
+        try:
+            self.service.start_turn("t1", "继续")
+            events = []
+            while not subscriber.empty():
+                events.append(subscriber.get_nowait())
+        finally:
+            self.service.unsubscribe(subscriber)
+
+        forked = [event for event in events if event.get("type") == "thread_forked"]
+        self.assertEqual(len(forked), 1)
+        self.assertEqual(forked[0]["thread_id"], "t1")
+        self.assertEqual(forked[0]["continued_as"], "t1-fork")
+
+    def test_existing_fork_mapping_is_reclaimed_back_to_the_original(self) -> None:
+        # A fork recorded by an earlier build. The phone must go back to the
+        # original thread instead of keeping a copy the desktop never opens.
+        fork_map = Path(self.temp.name) / "fork-map.json"
+        fork_map.write_text(
+            json.dumps({"version": 1, "forks": {"t1": "t1-fork"}}),
+            encoding="utf-8",
+        )
+        self.client.responses["thread/resume"] = {"thread": thread_row("t1")}
+        self.client.responses["thread/read"] = {"thread": thread_row("t1")}
+        names: list[dict] = []
+        self.client.responses["thread/name/set"] = lambda params: names.append(params) or {}
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            result = service.start_turn("t1", "\u7ee7\u7eed")
+        finally:
+            service.stop()
+
+        self.assertEqual(result["continued_as"], "")
+        started = [params for method, params in self.client.requests if method == "turn/start"]
+        self.assertEqual(started[-1]["threadId"], "t1")
+        # The reclaimed fork is only kept for reading, never renamed.
+        self.assertEqual(names, [])
+        saved = json.loads(fork_map.read_text(encoding="utf-8"))
+        self.assertEqual(saved["forks"], {})
+        self.assertEqual(saved["tails"], {"t1": "t1-fork"})
+
+    def test_reclaimed_fork_history_stays_visible(self) -> None:
+        fork_map = Path(self.temp.name) / "fork-map.json"
+        fork_map.write_text(
+            json.dumps({"version": 1, "forks": {"t1": "t1-fork"}, "tails": {"t1": "t1-fork"}}),
+            encoding="utf-8",
+        )
+        # The original carries the desktop history; the fork carries an extra
+        # turn the phone made while the desktop held the writer lock.
+        self.client.responses["thread/resume"] = {"thread": thread_row("t1")}
+        self.client.responses["thread/read"] = thread_detail("t1")
+        fork_turn = {
+            "id": "turn-phone",
+            "status": "completed",
+            "startedAt": 1791000400,
+            "items": [
+                {"id": "i1", "type": "userMessage", "content": [{"type": "input_text", "text": "\u624b\u673a\u53d1\u7684"}]}
+            ],
+        }
+
+        def read(params):
+            if params.get("threadId") == "t1-fork":
+                return {"thread": thread_row("t1-fork", turns=[fork_turn])}
+            return thread_detail("t1")
+
+        self.client.responses["thread/read"] = read
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            detail = service.read_thread("t1")
+        finally:
+            service.stop()
+
+        texts = [str(message.get("text") or "") for message in detail["messages"]]
+        self.assertIn("\u624b\u673a\u53d1\u7684", texts)
+
+    def test_fork_tail_read_failure_does_not_break_the_reply(self) -> None:
+        fork_map = Path(self.temp.name) / "fork-map.json"
+        fork_map.write_text(
+            json.dumps({"version": 1, "tails": {"t1": "t1-fork"}}),
+            encoding="utf-8",
+        )
+        self.client.responses["thread/resume"] = {"thread": thread_row("t1")}
+
+        def read(params):
+            if params.get("threadId") == "t1-fork":
+                raise AppServerError("thread not found")
+            return thread_detail("t1")
+
+        self.client.responses["thread/read"] = read
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            detail = service.read_thread("t1")
+        finally:
+            service.stop()
+        self.assertTrue(detail["messages"])
+
+    def test_read_thread_reports_continuation_fork(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "继续")
+
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["continued_as"], "t1-fork")
+
+    def test_read_thread_reports_no_continuation_for_free_thread(self) -> None:
+        detail = self.service.read_thread("t1")
+        self.assertEqual(detail["continued_as"], "")
+
+    def test_thread_summary_surfaces_provider_failure_reason(self) -> None:
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "[workbuddy] upstream client (http 400): "
+                    + json.dumps({"code": 11129, "msg": "invalid function call parameters"})
+                }
+            }
+        )
+        detail = thread_detail("t1")
+        detail["thread"]["turns"][0]["status"] = "failed"
+        detail["thread"]["turns"][0]["error"] = {"message": payload}
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(
+            result["thread"]["error_message"],
+            "[workbuddy] upstream client (http 400): invalid function call parameters",
+        )
+
+    def test_turn_completed_event_carries_provider_error(self) -> None:
+        payload = {
+            "threadId": "t1",
+            "turn": {
+                "id": "turn-9",
+                "status": "failed",
+                "completedAt": 1791000300,
+                "error": {"message": json.dumps({"error": {"message": "provider exploded"}})},
+            },
+        }
+
+        event = self.service._event_payload({"method": "turn/completed", "params": payload})
+
+        self.assertEqual(event["status"], "failed")
+        self.assertEqual(event["error_message"], "provider exploded")
+
+    def test_fork_rename_does_not_retitle_the_phone_thread(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        self.service.start_turn("t1", "继续")
+
+        event = self.service._event_payload(
+            {"method": "thread/name/updated", "params": {"threadId": "t1-fork", "name": "手机继续 · 桌面任务"}}
+        )
+        self.assertIsNone(event)
+
+    def test_start_turn_reports_locked_thread_when_fork_fails(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            raise AppServerError("fork unsupported")
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+
+        with self.assertRaises(AppServerError) as ctx:
+            self.service.start_turn("t1", "继续")
+
+        self.assertIn("电脑端", str(ctx.exception))
+
+    def test_forked_reply_is_transparent_in_list_and_read(self) -> None:
+        # Lock t1, continue it, then make sure the phone still sees one task
+        # named t1 whose history comes from the fork.
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        detail = thread_detail("t1-fork")
+        detail["thread"]["turns"][0]["status"] = "completed"
+        self.client.responses["thread/read"] = detail
+        self.client.responses["thread/list"] = {
+            "data": [thread_row("t1-fork"), thread_row("t2", name="第二个任务")],
+            "nextCursor": None,
+        }
+
+        self.service.start_turn("t1", "继续这个任务")
+
+        listing = self.service.list_threads(limit=10)
+        visible = [item["thread_id"] for item in listing["threads"]]
+        self.assertIn("t1", visible)
+        self.assertNotIn("t1-fork", visible)
+
+        read = self.service.read_thread("t1")
+        self.assertEqual(read["thread"]["thread_id"], "t1")
+        self.assertEqual(read["task"]["thread_id"], "t1")
+
+    def test_fork_completion_flips_to_idle_after_read(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        detail = thread_detail("t1-fork")
+        self.client.responses["thread/read"] = detail
+        self.client.responses["thread/list"] = {"data": [thread_row("t1-fork")], "nextCursor": None}
+
+        self.service.start_turn("t1", "继续")
+        self._write_rollout("t1-fork", "task_complete", seconds_ago=20)
+
+        before = self.service.list_threads(limit=10)["threads"][0]
+        self.assertEqual(before["status"], "completed")
+
+        self.service.mark_thread_read("t1")
+
+        after = self.service.list_threads(limit=10)["threads"][0]
+        self.assertEqual(after["thread_id"], "t1")
+        self.assertEqual(after["status"], "idle")
+
+    def test_fork_events_report_origin_thread_id(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.service.start_turn("t1", "继续")
+
+        payload = self.service._event_payload(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "t1-fork", "turnId": "turn-2", "itemId": "i1", "delta": "好"},
+            }
+        )
+        self.assertEqual(payload["thread_id"], "t1")
+
+    def test_fork_mapping_survives_restart(self) -> None:
+        def resume(_params):
+            raise AppServerError("thread t1 already has an active writer")
+
+        def fork(_params):
+            return {"thread": thread_row("t1-fork")}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.service.start_turn("t1", "继续")
+        self.service.stop()
+
+        restored = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            forks = {"n": 0}
+
+            def fork_again(_params):
+                forks["n"] += 1
+                return {"thread": thread_row("t1-fork2")}
+
+            self.client.responses["thread/fork"] = fork_again
+            result = restored.start_turn("t1", "第二次")
+        finally:
+            restored.stop()
+        # The persisted mapping is reused, so no second fork is created.
+        self.assertEqual(forks["n"], 0)
+        self.assertEqual(result["continued_as"], "t1-fork")
+
+    def test_start_turn_tolerates_active_writer_during_resume(self) -> None:
+        calls = {"resume": 0, "fork": 0, "start": 0}
+
+        def resume(_params):
+            calls["resume"] += 1
+            raise AppServerError("thread already has an active writer")
+
+        def fork(_params):
+            calls["fork"] += 1
+            return {"thread": thread_row("t1-fork")}
 
         def start(_params):
             calls["start"] += 1
+            return {"turn": {"id": "turn-2", "status": "inProgress"}}
+
+        self.client.responses["thread/resume"] = resume
+        self.client.responses["thread/fork"] = fork
+        self.client.responses["turn/start"] = start
+
+        self._write_rollout("t1", "task_started", seconds_ago=5)
+        result = self.service.start_turn("t1", "继续这个旧任务")
+
+        self.assertEqual(result["status"], "working")
+        self.assertEqual(calls, {"resume": 1, "fork": 1, "start": 1})
+
+    def test_turn_completed_event_uses_desktop_completion_timestamp(self) -> None:
+        event = self.service._event_payload(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "t1",
+                    "turn": {
+                        "id": "turn-2",
+                        "status": "completed",
+                        "completedAt": 1791000100,
+                        "durationMs": 1200,
+                    },
+                },
+            }
+        )
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event["completed_at"], 1791000100)
+
+    def test_steer_turn_requires_an_active_turn(self) -> None:
+        # A resident thread with no in-progress turn cannot be steered; the
+        # app-server requires expectedTurnId, so surface a clear error instead
+        # of sending an invalid steer.
+        calls = {"steer": 0}
+
+        def steer(_params):
+            calls["steer"] += 1
             return {"turn": {"id": "turn-3", "status": "inProgress"}}
 
         self.client.responses["turn/steer"] = steer
-        self.client.responses["turn/start"] = start
-        result = self.service.steer_turn("t1", "换个方向")
-        self.assertEqual(result["status"], "working")
-        self.assertEqual(calls, {"start": 1, "steer": 1})
+
+        with self.assertRaises(AppServerError):
+            self.service.steer_turn("t1", "换个方向")
+
+        self.assertEqual(calls["steer"], 0)
+
+    def test_steer_turn_sends_expected_turn_id(self) -> None:
+        detail = thread_detail()
+        detail["thread"]["turns"].append(
+            {
+                "id": "turn-9",
+                "status": "inProgress",
+                "startedAt": 1791000200,
+                "items": [],
+            }
+        )
+        self.client.responses["thread/read"] = detail
+        seen = {}
+
+        def steer(params):
+            seen.update(params)
+            return {"turn": {"id": "turn-9", "status": "inProgress"}}
+
+        self.client.responses["turn/steer"] = steer
+        self.service.steer_turn("t1", "换个方向")
+
+        self.assertEqual(seen["expectedTurnId"], "turn-9")
+        self.assertEqual(seen["threadId"], "t1")
     def test_start_turn_resumes_disk_thread_first(self) -> None:
         self.service.start_turn("t1", "继续修复", model="gpt-5.1-codex")
         methods = [method for method, _ in self.client.requests]
@@ -971,7 +1543,12 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(len(turns), 2)
 
     def test_steer_turn_resumes_thread(self) -> None:
-        self.client.responses["turn/steer"] = {"turn": {"id": "turn-2", "status": "inProgress"}}
+        detail = thread_detail()
+        detail["thread"]["turns"].append(
+            {"id": "turn-9", "status": "inProgress", "startedAt": 1791000200, "items": []}
+        )
+        self.client.responses["thread/read"] = detail
+        self.client.responses["turn/steer"] = {"turn": {"id": "turn-9", "status": "inProgress"}}
         self.service.steer_turn("t1", "改一下方向")
         methods = [method for method, _ in self.client.requests]
         self.assertLess(methods.index("thread/resume"), methods.index("turn/steer"))
@@ -1008,6 +1585,34 @@ class CompanionServiceTests(unittest.TestCase):
             [method for method, _ in clients[1].requests if method == "thread/resume"],
             ["thread/resume"],
         )
+
+    def test_completed_thread_shows_idle_once_read(self) -> None:
+        read_state = ReadStateStore(None)
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            read_state=read_state,
+        )
+        try:
+            self.assertEqual(service.read_thread("t1")["thread"]["status"], "completed")
+            read_state.mark_thread("t1", 1791000100)
+            self.assertEqual(service.read_thread("t1")["thread"]["status"], "idle")
+        finally:
+            service.stop()
+
+    def test_mark_thread_read_publishes_idle_for_other_clients(self) -> None:
+        target = self.service.subscribe()
+
+        result = self.service.mark_thread_read("t1")
+
+        self.assertEqual(result["status"], "idle")
+        event = target.get(timeout=1.0)
+        self.assertEqual(event["type"], "thread_status")
+        self.assertEqual(event["thread_id"], "t1")
+        self.assertEqual(event["status"], "idle")
 
     def test_notification_pump_forwards_agent_delta(self) -> None:
         self.service.start()

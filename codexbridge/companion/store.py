@@ -12,9 +12,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_PORT = 8791
-DEFAULT_DISCOVERY_PORT = 8766
+DEFAULT_PORT = 8568
+DEFAULT_DISCOVERY_PORT = 8569
 LEGACY_PORT = 8790
+LEGACY_COMPANION_PORT = 8791
+LEGACY_DISCOVERY_PORT = 8766
 PAIRING_CODE_TTL_SECONDS = 10 * 60
 PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
@@ -103,7 +105,7 @@ class CompanionStore:
             self.enabled = enabled
         port = payload.get("port")
         if isinstance(port, int) and 1 <= port <= 65535:
-            if port == LEGACY_PORT:
+            if port in {LEGACY_PORT, LEGACY_COMPANION_PORT}:
                 self.port = DEFAULT_PORT
                 migrated = True
             else:
@@ -111,7 +113,11 @@ class CompanionStore:
 
         discovery_port = payload.get("discovery_port")
         if isinstance(discovery_port, int) and 1 <= discovery_port <= 65535:
-            self.discovery_port = discovery_port
+            if discovery_port == LEGACY_DISCOVERY_PORT:
+                self.discovery_port = DEFAULT_DISCOVERY_PORT
+                migrated = True
+            else:
+                self.discovery_port = discovery_port
 
         phones = payload.get("phones")
         refreshed: dict[str, PhoneRecord] = {}

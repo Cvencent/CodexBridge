@@ -18,6 +18,8 @@ from typing import Any
 from codexbridge import VERSION
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
+# A turn that stopped updating this long ago is over, not still running.
+RESUMED_ACTIVE_WINDOW_SECONDS = 120
 TRANSIENT_REFRESH_FAILURE_LIMIT = 6
 
 
@@ -468,6 +470,67 @@ def _turn_usage(turn: dict[str, Any]) -> int:
     return total
 
 
+def _try_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _turn_error(turn: dict[str, Any]) -> str:
+    """Return a readable message for a failed turn, if the server reported one."""
+    error = turn.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("error") or ""
+    elif isinstance(error, str):
+        message = error
+    else:
+        message = ""
+    return _safe_line(_flatten_provider_error(str(message)), 400)
+
+
+def _flatten_provider_error(text: str) -> str:
+    """Collapse nested provider error JSON into one readable sentence.
+
+    A custom model provider can wrap its failure several layers deep, for
+    example ``{"error": {"message": "<json string>"}}``. Unwrap those layers so
+    the phone shows the upstream reason instead of raw escaped JSON.
+    """
+    raw = text.strip()
+    if not raw:
+        return ""
+    payload = _try_json(raw)
+    for _ in range(3):
+        if not isinstance(payload, dict):
+            break
+        inner = payload.get("error") if "error" in payload else payload.get("message")
+        if isinstance(inner, str):
+            parsed = _try_json(inner)
+            if parsed is None:
+                raw = inner.strip() or raw
+                payload = None
+                break
+            payload = parsed
+            continue
+        if isinstance(inner, dict):
+            payload = inner
+            continue
+        break
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("msg")
+        if isinstance(message, str) and message.strip():
+            raw = message.strip()
+    # The provider may still append its own JSON body after a plain sentence.
+    head, _, tail = raw.partition("{")
+    if tail:
+        embedded = _try_json("{" + tail)
+        if isinstance(embedded, dict):
+            detail = embedded.get("msg") or embedded.get("message")
+            if isinstance(detail, str) and detail.strip():
+                return (head + detail.strip()).strip()
+    return raw
+
+
 def _plan_counts(turn: dict[str, Any], items: list[dict[str, Any]]) -> tuple[int, int]:
     candidates: list[Any] = [turn.get("plan")]
     candidates.extend(item.get("plan") for item in items if item.get("type") == "plan")
@@ -493,6 +556,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
             "token_count": 0, "token_count_available": False,
             "plan_completed": 0, "plan_total": 0,
             "started_at_epoch": 0, "last_updated_epoch": 0,
+            "error_message": "",
         }
 
     turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
@@ -563,7 +627,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
     recency = _epoch(thread.get("recencyAt"))
     updated = recency or _epoch(thread.get("updatedAt") or latest_turn.get("updatedAt") or
                                 latest_turn.get("completedAt") or latest_turn.get("startedAt"))
-    recently_updating = updated > 0 and 0 <= now_epoch - updated < 15 * 60
+    recently_updating = updated > 0 and 0 <= now_epoch - updated < RESUMED_ACTIVE_WINDOW_SECONDS
     detached_recent = recency > 0 and 0 <= now_epoch - recency < DETACHED_ACTIVE_WINDOW_SECONDS
     completed_at = _epoch(latest_turn.get("completedAt"))
     resumed_visible_activity = (
@@ -586,7 +650,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
     elif turn_status == "completed":
         status = "completed"
     elif turn_status == "interrupted" and (
-            latest_turn.get("completedAt") is None and recently_updating or detached_active):
+            (latest_turn.get("completedAt") is None and recently_updating) or detached_active):
         # A second read-only app-server sees a desktop-owned in-flight turn as
         # interrupted. Newer versions may also expose an empty placeholder
         # turn with completedAt populated while recencyAt continues to move.
@@ -676,6 +740,7 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
         "started_at_epoch": started,
         "last_updated_epoch": updated,
         "completed_at_epoch": completed,
+        "error_message": _turn_error(latest_turn),
     }
 
 
@@ -837,7 +902,7 @@ class CodexAppServerSource:
             return True
         recency = _epoch(item.get("recencyAt"))
         if (str(runtime.get("type", "")).lower() == "notloaded" and recency > 0 and
-                0 <= int(time.time()) - recency < 15 * 60):
+                0 <= int(time.time()) - recency < RESUMED_ACTIVE_WINDOW_SECONDS):
             return True
         turns = [turn for turn in item.get("turns", []) if isinstance(turn, dict)]
         if not turns:
@@ -848,7 +913,7 @@ class CodexAppServerSource:
             return True
         if status == "interrupted" and latest.get("completedAt") is None:
             updated = _epoch(item.get("updatedAt") or latest.get("updatedAt") or latest.get("startedAt"))
-            return updated > 0 and int(time.time()) - updated < 15 * 60
+            return updated > 0 and int(time.time()) - updated < RESUMED_ACTIVE_WINDOW_SECONDS
         return False
 
     @classmethod

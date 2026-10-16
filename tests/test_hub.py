@@ -98,6 +98,16 @@ class HubTest(unittest.TestCase):
         self.assertEqual(self.s2.sent[-1]["type"], "read_state")
         self.assertEqual(self.s2.sent[-1]["read_by"], ["d1"])
 
+    def test_read_ack_suppresses_unread_message_for_other_devices(self):
+        self.hub.publish(
+            MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
+        )
+        self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
+
+        state = self.hub.state_for("d2")
+
+        self.assertEqual(state["messages"], [])
+
     def test_read_state_is_filtered_by_read_ack_capability(self):
         self.hub.publish(
             MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
