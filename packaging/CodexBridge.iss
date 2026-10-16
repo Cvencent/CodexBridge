@@ -1,7 +1,7 @@
-; Build with ISCC /DAppVersion=1.4.3 /DSourceDir=... /DOutputDir=...
+; Build with ISCC /DAppVersion=1.4.4 /DSourceDir=... /DOutputDir=...
 
 #ifndef AppVersion
-  #define AppVersion "1.4.3"
+  #define AppVersion "1.4.4"
 #endif
 #ifndef SourceDir
 #define SourceDir "..\dist"
