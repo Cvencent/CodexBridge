@@ -47,6 +47,8 @@ fun SettingsScreen(
     onToggleTheme: (Boolean) -> Unit,
     onDiscoveryPort: (Int) -> Unit,
     onUnpair: () -> Unit,
+    onTestNotification: () -> Unit,
+    onOpenBackgroundSettings: () -> Unit,
 ) {
     var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
     Scaffold(
@@ -102,6 +104,28 @@ fun SettingsScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("深色主题", modifier = Modifier.weight(1f))
                         Switch(checked = state.darkTheme, onCheckedChange = onToggleTheme)
+                    }
+                }
+            }
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("完成提醒", fontWeight = FontWeight.Medium)
+                    Text(
+                        text = "屏幕熄灭时由后台监听推送提醒。收不到声音时，先点测试提醒确认，" +
+                            "再把 CodexBridge 设为允许后台运行。",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = onTestNotification, modifier = Modifier.weight(1f)) {
+                            Text("测试提醒")
+                        }
+                        OutlinedButton(onClick = onOpenBackgroundSettings, modifier = Modifier.weight(1f)) {
+                            Text("后台运行设置")
+                        }
                     }
                 }
             }

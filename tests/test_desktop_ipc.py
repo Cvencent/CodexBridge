@@ -233,3 +233,75 @@ class DesktopIpcTests(unittest.TestCase):
         finally:
             client.close()
             worker.join(2)
+
+    def test_oversized_frame_is_skipped_instead_of_killing_the_pipe(self):
+        connection, server = socket.socketpair()
+        client = DesktopIpcClient(timeout=1)
+        client.MAX_FRAME_BYTES = 4096
+        client.MAX_SKIPPED_FRAME_BYTES = 200000
+        client.DISCARD_CHUNK_BYTES = 1024
+
+        def read_exact(stream, size):
+            data = b''
+            while len(data) < size:
+                chunk = stream.recv(size - len(data))
+                if not chunk:
+                    raise EOFError
+                data += chunk
+            return data
+
+        def read_message(stream):
+            return json.loads(read_exact(stream, struct.unpack('<I', read_exact(stream, 4))[0]))
+
+        def send(stream, message):
+            body = json.dumps(message).encode()
+            stream.sendall(struct.pack('<I', len(body)) + body)
+
+        def router():
+            with server:
+                init = read_message(server)
+                send(server, {'type': 'response', 'requestId': init['requestId'],
+                              'resultType': 'success', 'result': {'clientId': 'bridge-id'}})
+                request = read_message(server)
+                oversized = json.dumps({
+                    'type': 'broadcast', 'method': 'thread-stream-state-changed',
+                    'params': {'payload': 'x' * 6000},
+                }).encode()
+                server.sendall(struct.pack('<I', len(oversized)) + oversized)
+                send(server, {'type': 'response', 'requestId': request['requestId'],
+                              'resultType': 'success', 'handledByClientId': 'desktop-owner'})
+
+        worker = threading.Thread(target=router)
+        worker.start()
+        try:
+            with patch.object(client, '_connect_endpoint', return_value=connection):
+                client.start()
+            self.assertEqual(client.find_thread_owner('thread-1'), 'desktop-owner')
+            self.assertEqual(client.events.get_nowait(), {'type': 'resync_required'})
+            self.assertTrue(client.connection_status()['desktop_ipc_connected'])
+        finally:
+            client.close()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+
+    def test_frame_beyond_the_skip_limit_is_still_rejected(self):
+        connection, server = socket.socketpair()
+        client = DesktopIpcClient(timeout=1)
+        client.MAX_FRAME_BYTES = 4096
+        client.MAX_SKIPPED_FRAME_BYTES = 8192
+
+        def router():
+            with server:
+                server.recv(4096)
+                server.sendall(struct.pack('<I', 9000))
+
+        worker = threading.Thread(target=router)
+        worker.start()
+        try:
+            with patch.object(client, '_connect_endpoint', return_value=connection):
+                with self.assertRaisesRegex(DesktopIpcError, 'frame'):
+                    client.start()
+        finally:
+            client.close()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())

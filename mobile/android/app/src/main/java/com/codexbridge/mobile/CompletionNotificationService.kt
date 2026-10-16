@@ -9,8 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.RingtoneManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
@@ -27,13 +29,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+private const val LISTEN_CHANNEL = "codexbridge_listen"
+private const val COMPLETION_CHANNEL = "codexbridge_completion_v4"
+private const val LISTEN_NOTIFICATION_ID = 4101
+private const val RETRY_MS = 3000L
+private const val POLL_MS = 5000L
+
 class CompletionNotificationService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
-        createChannels()
+        createChannels(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -43,6 +53,7 @@ class CompletionNotificationService : Service() {
             return START_NOT_STICKY
         }
         startAsForeground()
+        holdConnectionLocks()
         if (job?.isActive != true) {
             job = scope.launch {
                 launch { listenEvents(settings) }
@@ -57,7 +68,58 @@ class CompletionNotificationService : Service() {
     override fun onDestroy() {
         job?.cancel()
         scope.cancel()
+        releaseConnectionLocks()
         super.onDestroy()
+    }
+
+    /**
+     * Doze suspends the network of an idle phone, so with the screen off the
+     * event stream and the poll loop stop delivering completions. A partial
+     * wake lock plus a high performance Wi-Fi lock keep the LAN socket alive
+     * behind the ongoing notification.
+     */
+    private fun holdConnectionLocks() {
+        if (wakeLock == null) {
+            try {
+                val power = getSystemService(PowerManager::class.java)
+                wakeLock = power.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "CodexBridge:completion",
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            } catch (_: Exception) {
+                wakeLock = null
+            }
+        }
+        if (wifiLock == null) {
+            try {
+                val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                wifiLock = wifi.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                    "CodexBridge:completion",
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            } catch (_: Exception) {
+                wifiLock = null
+            }
+        }
+    }
+
+    private fun releaseConnectionLocks() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {
+        }
+        wakeLock = null
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
     }
 
     private fun startAsForeground() {
@@ -156,46 +218,7 @@ class CompletionNotificationService : Service() {
     }
 
     private fun notifyCompletion(threadId: String, failed: Boolean) {
-        val intent = Intent(this, MainActivity::class.java)
-            .putExtra(EXTRA_THREAD_ID, threadId)
-            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        val pending = PendingIntent.getActivity(
-            this,
-            completionId(threadId),
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = NotificationCompat.Builder(this, COMPLETION_CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
-            .setContentTitle(if (failed) "Codex 任务失败" else "Codex 任务已完成")
-            .setContentText(if (failed) "点开查看错误详情" else "点开查看结果")
-            .setContentIntent(pending)
-            .setAutoCancel(true)
-            .setCategory(NotificationCompat.CATEGORY_STATUS)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setVibrate(longArrayOf(0, 250, 150, 250))
-            .build()
-        NotificationManagerCompat.from(this).notify(completionId(threadId), notification)
-        playNotificationSound()
-    }
-
-    /**
-     * Some OEM ROMs cache or override notification channel sound settings.
-     * Play the system notification sound directly so the user always hears it,
-     * regardless of what the channel does.
-     */
-    private fun playNotificationSound() {
-        try {
-            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-            val ringtone = RingtoneManager.getRingtone(this, uri)
-            ringtone.audioAttributes = android.media.AudioAttributes.Builder()
-                .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
-                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-            ringtone.play()
-        } catch (_: Exception) {
-            // Channel sound is the fallback.
-        }
+        postCompletionNotification(this, threadId, failed)
     }
 
     private fun cancelCompletion(threadId: String) {
@@ -203,36 +226,7 @@ class CompletionNotificationService : Service() {
         NotificationManagerCompat.from(this).cancel(completionId(threadId))
     }
 
-    private fun createChannels() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(LISTEN_CHANNEL, "Codex 后台连接", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "保持 Codex 完成后台通知连接"
-            },
-        )
-        // A new channel id is required because Android will not change the sound of
-        // an existing channel after it has been created on the device.
-        manager.createNotificationChannel(
-            NotificationChannel(COMPLETION_CHANNEL, "任务完成提醒", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Codex 任务完成提醒"
-                enableVibration(true)
-                vibrationPattern = longArrayOf(0, 250, 150, 250)
-                setSound(
-                    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
-                    android.media.AudioAttributes.Builder()
-                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
-                        .build(),
-                )
-            },
-        )
-    }
-
     companion object {
-        private const val LISTEN_CHANNEL = "codexbridge_listen"
-        private const val COMPLETION_CHANNEL = "codexbridge_completion_v4"
-        private const val LISTEN_NOTIFICATION_ID = 4101
-        private const val RETRY_MS = 3000L
-        private const val POLL_MS = 5000L
         const val EXTRA_THREAD_ID = "thread_id"
 
         fun start(context: Context) {
@@ -249,7 +243,81 @@ class CompletionNotificationService : Service() {
             start(context)
         }
 
-        private fun completionId(threadId: String): Int =
-            5000 + (Math.floorMod(threadId.hashCode(), 100000))
+        /** Used by the settings screen to check the sound while the screen is off. */
+        fun showTestNotification(context: Context) {
+            createChannels(context)
+            postCompletionNotification(context, "", false)
+        }
     }
+}
+
+private fun completionId(threadId: String): Int =
+    5000 + Math.floorMod(threadId.hashCode(), 100000)
+
+private fun postCompletionNotification(context: Context, threadId: String, failed: Boolean) {
+    val intent = Intent(context, MainActivity::class.java)
+        .putExtra(CompletionNotificationService.EXTRA_THREAD_ID, threadId)
+        .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+    val pending = PendingIntent.getActivity(
+        context,
+        completionId(threadId),
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    val sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+    val builder = NotificationCompat.Builder(context, COMPLETION_CHANNEL)
+        .setSmallIcon(android.R.drawable.stat_notify_chat)
+        .setContentTitle(if (failed) "Codex 任务失败" else "Codex 任务已完成")
+        .setContentText(if (failed) "点开查看错误详情" else "点开查看结果")
+        .setContentIntent(pending)
+        .setAutoCancel(true)
+        .setCategory(NotificationCompat.CATEGORY_STATUS)
+        .setPriority(NotificationCompat.PRIORITY_HIGH)
+        .setVibrate(longArrayOf(0, 250, 150, 250))
+    if (sound != null) builder.setSound(sound)
+    NotificationManagerCompat.from(context).notify(completionId(threadId), builder.build())
+    playNotificationSound(context)
+}
+
+/**
+ * Some OEM ROMs cache or override notification channel sound settings.
+ * Play the system notification sound directly so the user always hears it,
+ * regardless of what the channel does.
+ */
+private fun playNotificationSound(context: Context) {
+    try {
+        val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        val ringtone = RingtoneManager.getRingtone(context, uri)
+        ringtone.audioAttributes = android.media.AudioAttributes.Builder()
+            .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        ringtone.play()
+    } catch (_: Exception) {
+        // Channel sound is the fallback.
+    }
+}
+
+private fun createChannels(context: Context) {
+    val manager = context.getSystemService(NotificationManager::class.java)
+    manager.createNotificationChannel(
+        NotificationChannel(LISTEN_CHANNEL, "Codex 后台连接", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "保持 Codex 完成后台通知连接"
+        },
+    )
+    // A new channel id is required because Android will not change the sound of
+    // an existing channel after it has been created on the device.
+    manager.createNotificationChannel(
+        NotificationChannel(COMPLETION_CHANNEL, "任务完成提醒", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Codex 任务完成提醒"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 250, 150, 250)
+            setSound(
+                RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                    .build(),
+            )
+        },
+    )
 }

@@ -151,7 +151,12 @@ if os.name == 'nt':
 
 
 class DesktopIpcClient:
-    MAX_FRAME_BYTES = 16 * 1024 * 1024
+    # Desktop state frames carry the whole turn history of a thread, so a long
+    # conversation can outgrow any fixed budget. Frames up to MAX_FRAME_BYTES
+    # are parsed, larger ones are drained and answered with a resync request.
+    MAX_FRAME_BYTES = 64 * 1024 * 1024
+    MAX_SKIPPED_FRAME_BYTES = 512 * 1024 * 1024
+    DISCARD_CHUNK_BYTES = 1024 * 1024
 
     def __init__(self, timeout: float = 3.0) -> None:
         self.timeout = timeout
@@ -241,30 +246,47 @@ class DesktopIpcClient:
             data.extend(chunk)
         return bytes(data)
 
+    def _discard(self, size: int, expected_stream: Any) -> None:
+        remaining = size
+        while remaining:
+            count = min(remaining, self.DISCARD_CHUNK_BYTES)
+            self._exact(count, expected_stream)
+            remaining -= count
+
+    def _enqueue_event(self, message: dict[str, Any]) -> None:
+        try:
+            self.events.put_nowait(message)
+        except queue.Full:
+            # Consumers reconcile authoritative state after overflow.
+            while True:
+                try:
+                    self.events.get_nowait()
+                except queue.Empty:
+                    break
+            self.events.put_nowait({'type': 'resync_required'})
+
     def _read(self, stream: Any) -> None:
         try:
             while True:
                 size, = struct.unpack('<I', self._exact(4, stream))
-                if not 0 < size <= self.MAX_FRAME_BYTES:
+                if size == 0 or size > self.MAX_SKIPPED_FRAME_BYTES:
                     # A truncated or interleaved frame must not leave the
                     # reader spinning on the same four bytes forever. Close
                     # and let the service reconnect and resubscribe.
                     raise DesktopIpcError('Invalid IPC frame length')
+                if size > self.MAX_FRAME_BYTES:
+                    # Dropping the connection on a real state snapshot would
+                    # surface as a failed phone reply or a lost completion, so
+                    # drain it and let consumers reconcile from the list.
+                    self._discard(size, stream)
+                    self._enqueue_event({'type': 'resync_required'})
+                    continue
                 message = json.loads(self._exact(size, stream))
                 if not isinstance(message, dict):
                     raise DesktopIpcError('Invalid IPC message')
                 kind = message.get('type')
                 if kind == 'broadcast' and message.get('method') == 'thread-stream-state-changed':
-                    try:
-                        self.events.put_nowait(message)
-                    except queue.Full:
-                        # Consumers reconcile authoritative state after overflow.
-                        while True:
-                            try:
-                                self.events.get_nowait()
-                            except queue.Empty:
-                                break
-                        self.events.put_nowait({'type': 'resync_required'})
+                    self._enqueue_event(message)
                 if kind == 'response':
                     with self._lock:
                         target = self._pending.get(message.get('requestId'))
