@@ -92,6 +92,8 @@ class BridgeHub:
         self.registry = registry
         self.store = store or MessageStore()
         self.read_state = read_state or ReadStateStore(None)
+        self.read_state.add_listener(self.handle_cross_client_read)
+        self.companion_events: Any = None
         self.speech = speech
         self.codex_catalog = codex_catalog
         self.commands = commands
@@ -108,30 +110,49 @@ class BridgeHub:
         with self._lock:
             self.codex_catalog = codex_catalog
 
+    def _record_is_unread(self, record: MessageRecord) -> bool:
+        if self.read_state.is_message_read(record.message_id):
+            return False
+        if (
+            record.thread_id
+            and record.created_at > 0
+            and self.read_state.is_thread_read(
+                record.thread_id, int(record.created_at)
+            )
+        ):
+            return False
+        return True
+
     def counts(self) -> dict[str, int]:
+        """Aggregate running tasks and globally unread terminal results.
 
-        """Aggregate the stored task records into ``codex_state`` counters.
-
-        ``running`` counts tasks the host currently reports as active;
-        ``done``/``failed`` count the most recent terminal results, matching
-        the badges a device renders. Values stay bounded and are recomputed
-        from the store on every request, so no second tally can drift.
+        ``completed_unread`` and ``failed_unread`` are the canonical fields for
+        new clients.  ``done`` and ``failed`` remain as compatibility aliases
+        with the same unread-only meaning.
         """
         running = 0
-        done = 0
-        failed = 0
+        completed_unread = 0
+        failed_unread = 0
         with self._lock:
             records = self.store.records()
         for record in records:
             if record.kind == "task":
                 if record.status in {"working", "waiting_user", "queued"}:
                     running += 1
-            elif record.kind == "result":
-                if record.status == "failed":
-                    failed += 1
-                elif record.status == "completed":
-                    done += 1
-        return {"running": running, "done": done, "failed": failed}
+                continue
+            if record.kind != "result" or not self._record_is_unread(record):
+                continue
+            if record.status == "failed":
+                failed_unread += 1
+            elif record.status == "completed":
+                completed_unread += 1
+        return {
+            "running": running,
+            "completed_unread": completed_unread,
+            "failed_unread": failed_unread,
+            "done": completed_unread,
+            "failed": failed_unread,
+        }
 
     def _send_codex_state(self, device_id: str, event: dict) -> None:
         payload = {"type": "codex_state", **self.counts()}
@@ -157,6 +178,11 @@ class BridgeHub:
                 return
             payload = {"type": "message", **self._message_payload(record)}
             self._broadcast(payload, capability)
+            if record.kind in {"task", "result"}:
+                # The badge counts are aggregate state, not a chat message.
+                # Push them as soon as a task enters or leaves the terminal
+                # set so every connected device updates at the same time.
+                self._broadcast_codex_state()
 
     def attach(self, device_id: str, session: Any) -> None:
         with self._lock:
@@ -599,21 +625,120 @@ class BridgeHub:
             record = self.store.mark_read(message_id, device_id)
             if record is None:
                 return
-            self.read_state.mark_message(record.message_id)
+            # The first global marker sends the fan-out.  Suppress the thread
+            # notification here so one read cannot produce duplicate updates.
+            self.read_state.mark_message(record.message_id, source=device_id)
             if record.thread_id and record.created_at > 0:
-                self.read_state.mark_thread(record.thread_id, int(record.created_at))
-            payload = {
-                "type": "read_state",
-                "message_id": record.message_id,
-                "read_by": sorted(record.read_by),
-                "read_at": time.time(),
-            }
-            for other_id, session in self._sessions.items():
-                if (
-                    other_id != device_id
-                    and "read_ack" in self.capabilities_for(other_id)
-                ):
-                    self._send_to(session, payload)
+                self.read_state.mark_thread(
+                    record.thread_id,
+                    int(record.created_at),
+                    source=device_id,
+                    notify=False,
+                )
+
+    def _broadcast_read_state(self, payload: dict, exclude: str = "") -> None:
+        with self._lock:
+            targets = [
+                session
+                for device_id, session in self._sessions.items()
+                if device_id != exclude
+                and "read_ack" in self.capabilities_for(device_id)
+            ]
+        for session in targets:
+            self._send_to(session, payload)
+
+    def _broadcast_codex_state(self) -> None:
+        payload = {"type": "codex_state", **self.counts()}
+        with self._lock:
+            targets = [
+                session
+                for device_id, session in self._sessions.items()
+                if "status" in self.capabilities_for(device_id)
+            ]
+        for session in targets:
+            self._send_to(session, payload)
+
+    def _retract_companion_badge(self, thread_id: str) -> None:
+        companion = self.companion_events
+        if not thread_id or companion is None or not hasattr(companion, "publish"):
+            return
+        try:
+            companion.publish(
+                {
+                    "type": "thread_status",
+                    "thread_id": thread_id,
+                    "status": "idle",
+                    "active_flags": [],
+                }
+            )
+        except Exception:  # noqa: BLE001 - the read already happened
+            pass
+
+    def _read_by_for(self, message_id: str, source: str) -> list[str]:
+        with self._lock:
+            record = self.store.get(message_id)
+            if record is not None:
+                return sorted(record.read_by)
+        return [source] if source else []
+
+    def _thread_message_ids(self, thread_id: str, completed_at: int) -> list[str]:
+        if not thread_id:
+            return []
+        with self._lock:
+            return [
+                record.message_id
+                for record in self.store.records()
+                if record.thread_id == thread_id
+                and (completed_at <= 0 or int(record.created_at or 0) <= completed_at)
+            ]
+
+    def handle_cross_client_read(self, event: dict) -> None:
+        """Fan a globally shared read marker out to every connected client."""
+        if not isinstance(event, dict):
+            return
+        message_id = str(event.get("message_id") or "")
+        thread_id = str(event.get("thread_id") or "")
+        source = str(event.get("source") or "")
+        if message_id:
+            self._broadcast_read_state(
+                {
+                    "type": "read_state",
+                    "message_id": message_id,
+                    "read_by": self._read_by_for(message_id, source),
+                    "read_at": time.time(),
+                },
+                exclude=source,
+            )
+            self._retract_companion_badge(thread_id)
+            self._broadcast_codex_state()
+            return
+
+        completed_at = int(event.get("completed_at") or 0)
+        for covered_id in self._thread_message_ids(thread_id, completed_at):
+            with self._lock:
+                record = self.store.get(covered_id)
+                read_by = (
+                    sorted(record.read_by)
+                    if record is not None
+                    else ([source] if source else [])
+                )
+            if record is not None:
+                self.read_state.mark_message(
+                    covered_id,
+                    source=source,
+                    notify=False,
+                )
+            self._broadcast_read_state(
+                {
+                    "type": "read_state",
+                    "message_id": covered_id,
+                    "read_by": read_by,
+                    "read_at": time.time(),
+                },
+                exclude=source,
+            )
+        self._retract_companion_badge(thread_id)
+        self._broadcast_codex_state()
 
     def _broadcast(self, payload: dict, capability: str) -> None:
         with self._lock:

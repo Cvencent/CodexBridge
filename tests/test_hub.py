@@ -86,8 +86,14 @@ class HubTest(unittest.TestCase):
         self.hub.publish(
             MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
         )
-        self.assertEqual([message["type"] for message in self.s1.sent], ["message"])
-        self.assertEqual(self.s2.sent, [])
+        self.assertEqual(
+            [message["type"] for message in self.s1.sent if message["type"] == "message"],
+            ["message"],
+        )
+        self.assertEqual(
+            [message["type"] for message in self.s2.sent if message["type"] == "message"],
+            [],
+        )
 
     def test_read_ack_broadcasts_read_state(self):
         self.hub.publish(
@@ -95,8 +101,54 @@ class HubTest(unittest.TestCase):
         )
         self.s1.sent.clear()
         self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
-        self.assertEqual(self.s2.sent[-1]["type"], "read_state")
-        self.assertEqual(self.s2.sent[-1]["read_by"], ["d1"])
+        self.assertEqual(self.s2.sent[-2]["type"], "read_state")
+        self.assertEqual(self.s2.sent[-2]["read_by"], ["d1"])
+        self.assertEqual(self.s2.sent[-1]["type"], "codex_state")
+
+    def test_read_ack_broadcasts_fresh_codex_state_to_every_status_device(self):
+        self.hub.publish(
+            MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
+        )
+        for session in (self.s1, self.s2, self.s3, self.s4):
+            session.sent.clear()
+
+        self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
+
+        for session in (self.s1, self.s2, self.s3, self.s4):
+            self.assertEqual(session.sent[-1]["type"], "codex_state")
+            self.assertEqual(session.sent[-1]["completed_unread"], 0)
+            self.assertEqual(session.sent[-1]["failed_unread"], 0)
+
+    def test_second_read_does_not_decrement_terminal_counts_twice(self):
+        self.hub.publish(
+            MessageRecord("m1", "t1", "result", "completed", "标题", "正文", 0.0)
+        )
+        self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
+        self.hub.handle_device_event("d2", {"type": "read_ack", "message_id": "m1"})
+
+        self.assertEqual(
+            self.hub.counts(),
+            {
+                "running": 0,
+                "completed_unread": 0,
+                "failed_unread": 0,
+                "done": 0,
+                "failed": 0,
+            },
+        )
+
+    def test_phone_thread_read_updates_terminal_counts_on_devices(self):
+        self.hub.publish(
+            MessageRecord(
+                "result:t2:1", "t2", "result", "completed", "标题", "正文", 1.0
+            )
+        )
+        self.s3.sent.clear()
+
+        self.hub.read_state.mark_thread("t2", 1, source="phone")
+
+        self.assertEqual(self.s3.sent[-1]["type"], "codex_state")
+        self.assertEqual(self.s3.sent[-1]["completed_unread"], 0)
 
     def test_read_ack_suppresses_unread_message_for_other_devices(self):
         self.hub.publish(
@@ -115,8 +167,9 @@ class HubTest(unittest.TestCase):
         self.s2.sent.clear()
         self.s3.sent.clear()
         self.hub.handle_device_event("d1", {"type": "read_ack", "message_id": "m1"})
-        self.assertEqual(self.s2.sent[-1]["type"], "read_state")
-        self.assertEqual(self.s3.sent, [])
+        self.assertIn("read_state", [message["type"] for message in self.s2.sent])
+        self.assertNotIn("read_state", [message["type"] for message in self.s3.sent])
+        self.assertEqual(self.s3.sent[-1]["type"], "codex_state")
 
     def test_capability_less_event_is_rejected(self):
         self.hub.handle_device_event("d2", {"type": "voice_command", "text": "hi"})
@@ -168,8 +221,12 @@ class HubTest(unittest.TestCase):
             data={"codex": {"task": {"status": "working"}}},
         )
         self.hub.publish(record)
-        self.assertEqual(self.s1.sent[-1]["data"], record.data)
-        self.assertEqual(self.s2.sent, [])
+        message = [item for item in self.s1.sent if item["type"] == "message"][-1]
+        self.assertEqual(message["data"], record.data)
+        self.assertEqual(
+            [item for item in self.s2.sent if item["type"] == "message"],
+            [],
+        )
 
     def test_body_is_clipped_to_declared_device_budget(self):
         # One protocol, many devices: an ESP32 declares 64 chars and gets a
@@ -179,7 +236,7 @@ class HubTest(unittest.TestCase):
         self.hub.publish(
             MessageRecord("m1", "t1", "result", "completed", "标题", body, 0.0)
         )
-        sent = self.s1.sent[-1]
+        sent = [item for item in self.s1.sent if item["type"] == "message"][-1]
         self.assertLessEqual(len(sent["body"]), 64)
         self.assertTrue(sent["body"].endswith("..."))
 
@@ -261,7 +318,16 @@ class HubTest(unittest.TestCase):
         # d2 has status but not tasks: it gets the state snapshot and no catalog.
         self.assertEqual(
             self.s2.sent,
-            [{"type": "codex_state", "running": 0, "done": 0, "failed": 0}],
+            [
+                {
+                    "type": "codex_state",
+                    "running": 0,
+                    "completed_unread": 0,
+                    "failed_unread": 0,
+                    "done": 0,
+                    "failed": 0,
+                }
+            ],
         )
 
     def test_codex_state_request_returns_task_counters(self):
@@ -280,9 +346,44 @@ class HubTest(unittest.TestCase):
             {
                 "type": "codex_state",
                 "running": 1,
+                "completed_unread": 1,
+                "failed_unread": 1,
                 "done": 1,
                 "failed": 1,
                 "request_id": 7,
+            },
+        )
+
+    def test_new_terminal_result_pushes_fresh_codex_state_to_status_devices(self):
+        for session in (self.s1, self.s2, self.s3, self.s4):
+            session.sent.clear()
+
+        self.hub.publish(
+            MessageRecord(
+                "result:t2:1", "t2", "result", "completed", "结果", "正文", 1.0
+            )
+        )
+
+        self.assertEqual(self.s3.sent[-1]["type"], "codex_state")
+        self.assertEqual(self.s3.sent[-1]["completed_unread"], 1)
+
+    def test_codex_state_counts_exclude_globally_read_terminal_results(self):
+        self.hub.publish(
+            MessageRecord("result:t2:1", "t2", "result", "completed", "结果", "正文", 1.0)
+        )
+        self.hub.publish(
+            MessageRecord("result:t3:2", "t3", "result", "failed", "结果", "正文", 2.0)
+        )
+        self.hub.read_state.mark_message("result:t2:1")
+
+        self.assertEqual(
+            self.hub.counts(),
+            {
+                "running": 0,
+                "completed_unread": 0,
+                "failed_unread": 1,
+                "done": 0,
+                "failed": 1,
             },
         )
 
@@ -293,7 +394,14 @@ class HubTest(unittest.TestCase):
         self.s1.sent.clear()
         self.hub.replay_state("d1")
         self.assertIn(
-            {"type": "codex_state", "running": 1, "done": 0, "failed": 0},
+            {
+                "type": "codex_state",
+                "running": 1,
+                "completed_unread": 0,
+                "failed_unread": 0,
+                "done": 0,
+                "failed": 0,
+            },
             self.s1.sent,
         )
 

@@ -290,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
         read_state=read_state,
     )
     hub.commands = companion_service.commands
+    # A read made on the hardware also retracts the phone notification badge.
+    hub.companion_events = companion_service
     companion = CompanionApi(companion_service, companion_store, logger=print)
     companion_discovery = CompanionDiscovery(
         companion_store,
