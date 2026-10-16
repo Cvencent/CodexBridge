@@ -43,6 +43,31 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(result['error'], 'capability_not_enabled')
 
+    def test_status_reports_intermediate_event_setting(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        self.store.set_show_intermediate_events(True)
+
+        status, payload = self.request(
+            "GET", "/api/companion/status", token=paired["token"]
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["show_intermediate_events"])
+
+    def test_thread_read_uses_store_intermediate_event_setting(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        self.store.set_show_intermediate_events(True)
+
+        status, payload = self.request(
+            "GET", "/api/companion/threads/t1", token=paired["token"]
+        )
+
+        self.assertEqual(status, 200)
+        kinds = [item["kind"] for item in payload["messages"]]
+        self.assertIn("command", kinds)
+
     def test_desktop_disconnect_returns_structured_error(self):
         from unittest.mock import patch
         from codexbridge.codex.desktop_ipc import DesktopIpcError
@@ -71,6 +96,7 @@ class CompanionApiTests(unittest.TestCase):
             cwd=Path(self.temp.name),
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
+            show_intermediate_events=lambda: self.store.show_intermediate_events,
         )
         self.api = CompanionApi(self.service, self.store, host="127.0.0.1", port=0)
         self.api.start()

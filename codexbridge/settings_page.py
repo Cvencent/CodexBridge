@@ -492,6 +492,13 @@ SETTINGS_HTML = r'''<!doctype html>
             </div>
             <div class="general-row">
               <div>
+                <strong>显示中间事件</strong>
+                <p>对手机和 ESP 等已配对设备生效。关闭时只返回对话和最终回答，隐藏思考、命令、文件变更、工具结果和上下文提示。</p>
+              </div>
+              <input id="companion-show-intermediate" class="switch" type="checkbox" role="switch" aria-label="显示中间事件">
+            </div>
+            <div class="general-row">
+              <div>
                 <strong>连接地址</strong>
                 <p id="companion-addresses">正在读取...</p>
               </div>
@@ -1202,6 +1209,7 @@ SETTINGS_HTML = r'''<!doctype html>
         const payload = await requestJson("/api/admin/companion");
         const companion = payload.companion || {};
         toggle.checked = Boolean(companion.enabled);
+        $("#companion-show-intermediate").checked = Boolean(companion.show_intermediate_events);
         const urls = companion.urls || [];
         $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
         $("#companion-port").value = companion.port || "";
@@ -1237,6 +1245,30 @@ SETTINGS_HTML = r'''<!doctype html>
         );
         const urls = companion.urls || [];
         $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
+      } catch (error) {
+        setMessage($("#companion-message"), `保存失败：${error.message}`, "error");
+      } finally {
+        toggle.disabled = false;
+      }
+    }
+
+    async function saveCompanionIntermediateEvents() {
+      const toggle = $("#companion-show-intermediate");
+      toggle.disabled = true;
+      setMessage($("#companion-message"), "正在保存中间事件设置...", "working");
+      try {
+        const payload = await requestJson("/api/admin/companion", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({show_intermediate_events: toggle.checked})
+        });
+        const companion = payload.companion || {};
+        toggle.checked = Boolean(companion.show_intermediate_events);
+        setMessage(
+          $("#companion-message"),
+          toggle.checked ? "已开启中间事件。" : "已关闭中间事件，只显示对话和最终回答。",
+          "success"
+        );
       } catch (error) {
         setMessage($("#companion-message"), `保存失败：${error.message}`, "error");
       } finally {
@@ -1302,6 +1334,7 @@ SETTINGS_HTML = r'''<!doctype html>
     }
 
     $("#companion-enabled").addEventListener("change", saveCompanionEnabled);
+    $("#companion-show-intermediate").addEventListener("change", saveCompanionIntermediateEvents);
     $("#companion-new-code").addEventListener("click", newCompanionCode);
     $("#companion-save-port").addEventListener("click", () => saveCompanionPort("companion"));
     $("#companion-refresh-ports").addEventListener("click", loadCompanion);

@@ -113,6 +113,17 @@ class CompanionStoreTests(unittest.TestCase):
         self.assertEqual(payload["version"], 1)
         self.assertEqual(len(payload["phones"]), 1)
 
+    def test_show_intermediate_events_defaults_off_and_persists(self) -> None:
+        self.assertFalse(self.store.show_intermediate_events)
+        self.assertFalse(self.store.snapshot()["show_intermediate_events"])
+
+        self.store.set_show_intermediate_events(True)
+
+        reloaded = CompanionStore(self.path)
+        reloaded.load()
+        self.assertTrue(reloaded.show_intermediate_events)
+        self.assertTrue(reloaded.snapshot()["show_intermediate_events"])
+
     def test_default_port_is_not_the_reserved_legacy_port(self) -> None:
         self.assertEqual(LEGACY_PORT, 8790)
         self.assertEqual(DEFAULT_PORT, 8568)

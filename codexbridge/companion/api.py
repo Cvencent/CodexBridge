@@ -166,6 +166,7 @@ class CompanionApi:
         addresses = local_addresses()
         return {
             "enabled": bool(snapshot.get("enabled")),
+            "show_intermediate_events": bool(snapshot.get("show_intermediate_events")),
             "port": snapshot.get("port"),
             "discovery_port": snapshot.get("discovery_port"),
             "host": self.host,

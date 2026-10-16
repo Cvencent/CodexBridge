@@ -202,6 +202,7 @@ def _apply_companion_action(
     store,
     status,
     set_enabled=None,
+    set_show_intermediate_events=None,
 ) -> dict:
     action = str(payload.get("action") or "")
     if action == "new_code":
@@ -222,6 +223,14 @@ def _apply_companion_action(
             companion.set_port(port)
         else:
             raise ValueError("port_kind")
+        return {"companion": status()}
+    if "show_intermediate_events" in payload:
+        value = payload.get("show_intermediate_events")
+        if not isinstance(value, bool):
+            raise ValueError("show_intermediate_events")
+        if set_show_intermediate_events is None:
+            raise ValueError("show_intermediate_events")
+        set_show_intermediate_events(value)
         return {"companion": status()}
     if "enabled" in payload:
         value = payload.get("enabled")
@@ -288,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
         codex_cwd,
         codex_command,
         read_state=read_state,
+        show_intermediate_events=lambda: companion_store.show_intermediate_events,
     )
     hub.commands = companion_service.commands
     companion = CompanionApi(companion_service, companion_store, logger=print)
@@ -331,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             store=companion_store,
             status=companion_status,
             set_enabled=companion_set_enabled,
+            set_show_intermediate_events=companion_store.set_show_intermediate_events,
         )
 
     def publish_codex(records: list) -> None:

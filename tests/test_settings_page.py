@@ -25,6 +25,11 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn('fixed: "设备定义"', SETTINGS_HTML)
         self.assertIn("save.addEventListener", SETTINGS_HTML)
 
+    def test_page_can_configure_intermediate_event_visibility(self):
+        self.assertIn("显示中间事件", SETTINGS_HTML)
+        self.assertIn('id="companion-show-intermediate"', SETTINGS_HTML)
+        self.assertIn("show_intermediate_events: toggle.checked", SETTINGS_HTML)
+
     def test_page_has_device_and_speech_sections(self):
         self.assertIn("设备", SETTINGS_HTML)
         self.assertIn("语音识别", SETTINGS_HTML)

@@ -126,6 +126,22 @@ class CodexSourceHolderTest(unittest.TestCase):
 
 
 class CompanionActionTest(unittest.TestCase):
+    def test_show_intermediate_events_action_updates_store(self):
+        calls = []
+        status = {"show_intermediate_events": True}
+
+        result = _apply_companion_action(
+            {"show_intermediate_events": True},
+            companion=None,
+            discovery=None,
+            store=None,
+            status=lambda: status,
+            set_show_intermediate_events=calls.append,
+        )
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(result, {"companion": status})
+
     def test_discovery_port_action_rebinds_udp_and_returns_fresh_status(self):
         class Companion:
             def __init__(self):

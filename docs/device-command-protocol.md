@@ -53,6 +53,11 @@ Subscribe with `{"type":"events_subscribe","after":"EVENT_ID"}` and stop with
 `{"type":"events_unsubscribe"}`. Event envelopes are `device_event` with an
 `event` object; large envelopes use the same chunk mechanism. Events are filtered
 using current enabled capabilities. Disconnect cleans up the subscription.
+Intermediate content visibility is host-global and defaults to off. With
+`show_intermediate_events=false`, commentary, reasoning, command output, file
+changes, tool calls, plans and context notices are filtered on the host before
+they reach TCP devices or HTTP phones; approvals, errors and status events remain.
+`GET /api/companion/status` exposes the current flag for clients that display it.
 HTTP events use `/api/companion/events`, stable event
 IDs and `Last-Event-ID`; `resync_required` means refetch authoritative state.
 

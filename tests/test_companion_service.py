@@ -717,14 +717,32 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertIn(first["status"], {"idle", "completed", "working"})
         self.assertEqual(self.client.requests[0][0], "thread/list")
 
-    def test_read_thread_maps_messages(self) -> None:
+    def test_read_thread_hides_intermediate_events_by_default(self) -> None:
         detail = self.service.read_thread("t1")
         kinds = [item["kind"] for item in detail["messages"]]
-        self.assertEqual(kinds, ["user", "commentary", "agent", "command"])
+        self.assertEqual(kinds, ["user", "agent"])
         self.assertEqual(detail["messages"][0]["text"], "帮我看一下构建结果")
+        self.assertEqual(detail["messages"][1]["text"], "构建通过")
+        self.assertEqual(detail["message_count"], 2)
+        self.assertEqual(detail["thread"]["completed_at"], 1791000100)
+
+    def test_read_thread_includes_intermediate_events_when_enabled(self) -> None:
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            show_intermediate_events=True,
+        )
+        try:
+            detail = service.read_thread("t1")
+        finally:
+            service.stop()
+        kinds = [item["kind"] for item in detail["messages"]]
+        self.assertEqual(kinds, ["user", "commentary", "agent", "command"])
         self.assertEqual(detail["messages"][3]["detail"]["exit_code"], 0)
         self.assertEqual(detail["messages"][3]["detail"]["output"], "BUILD SUCCESSFUL")
-        self.assertEqual(detail["thread"]["completed_at"], 1791000100)
 
     def test_detail_reports_one_status_for_list_and_chat(self) -> None:
         # The phone list renders thread.status while the chat header renders
@@ -1613,6 +1631,110 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertEqual(event["type"], "thread_status")
         self.assertEqual(event["thread_id"], "t1")
         self.assertEqual(event["status"], "idle")
+
+    def test_event_payload_hides_intermediate_events_by_default(self) -> None:
+        command_output = self.service._event_payload({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "command-1",
+                "delta": "BUILD SUCCESSFUL",
+            },
+        })
+        command_item = self.service._event_payload({
+            "method": "item/completed",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "gradle build",
+                    "status": "completed",
+                },
+            },
+        })
+
+        self.assertIsNone(command_output)
+        self.assertIsNone(command_item)
+
+    def test_event_payload_hides_commentary_delta_by_default(self) -> None:
+        started = self.service._event_payload({
+            "method": "item/started",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "commentary-1",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "先检查日志",
+                },
+            },
+        })
+        commentary_delta = self.service._event_payload({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "commentary-1",
+                "delta": "先检查日志",
+            },
+        })
+        final_delta = self.service._event_payload({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "t1",
+                "turnId": "turn-1",
+                "itemId": "final-1",
+                "delta": "构建通过",
+            },
+        })
+
+        self.assertIsNone(started)
+        self.assertIsNone(commentary_delta)
+        self.assertIsNotNone(final_delta)
+        self.assertEqual(final_delta["delta"], "构建通过")
+
+    def test_event_payload_includes_commentary_delta_when_enabled(self) -> None:
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: self.client,
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+            show_intermediate_events=True,
+        )
+        try:
+            started = service._event_payload({
+                "method": "item/started",
+                "params": {
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "commentary-1",
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": "先检查日志",
+                    },
+                },
+            })
+            delta = service._event_payload({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "itemId": "commentary-1",
+                    "delta": "先检查日志",
+                },
+            })
+        finally:
+            service.stop()
+
+        self.assertIsNotNone(started)
+        self.assertIsNotNone(delta)
+        self.assertEqual(delta["delta"], "先检查日志")
 
     def test_notification_pump_forwards_agent_delta(self) -> None:
         self.service.start()

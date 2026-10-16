@@ -865,6 +865,11 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 | `plan` | 计划步骤 |
 | `notice` | 系统提示，例如上下文压缩 |
 
+默认 `show_intermediate_events` 为 `false`。关闭时，线程详情和 SSE 只保留
+`user`、`agent`，以及审批、错误和状态等控制事件；`commentary`、`reasoning`、
+`command`、`fileChange`、`tool`、`plan`、`notice` 和命令输出等中间内容在电脑端过滤，
+不会发送给任何已配对手机或 ESP 设备。开启该全局设置后恢复完整事件输出。
+
 SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
 `turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
 `token_usage`、`thread_status`、`thread_name`、`thread_forked`、`threads_changed`、`resync_required`、
@@ -926,6 +931,6 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
 设备不得依赖桌面的命名管道、私有消息版本或 conversationState 结构。
 
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
-- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
+- `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"show_intermediate_events":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 ```

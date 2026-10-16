@@ -73,6 +73,7 @@ class CompanionStore:
         self.port = DEFAULT_PORT if port == LEGACY_PORT else port
         self.discovery_port = discovery_port
         self.enabled = True
+        self.show_intermediate_events = False
         self.phones: dict[str, PhoneRecord] = {}
         self._code = ""
         self._code_expires_at = 0.0
@@ -103,6 +104,9 @@ class CompanionStore:
         enabled = payload.get("enabled")
         if isinstance(enabled, bool):
             self.enabled = enabled
+        show_intermediate_events = payload.get("show_intermediate_events")
+        if isinstance(show_intermediate_events, bool):
+            self.show_intermediate_events = show_intermediate_events
         port = payload.get("port")
         if isinstance(port, int) and 1 <= port <= 65535:
             if port in {LEGACY_PORT, LEGACY_COMPANION_PORT}:
@@ -201,6 +205,7 @@ class CompanionStore:
             payload = {
                 "version": 1,
                 "enabled": self.enabled,
+                "show_intermediate_events": self.show_intermediate_events,
                 "port": self.port,
                 "discovery_port": self.discovery_port,
                 "phones": [
@@ -249,6 +254,12 @@ class CompanionStore:
             self.enabled = bool(enabled)
             self.save()
 
+    def set_show_intermediate_events(self, enabled: bool) -> None:
+        with self._lock:
+            self._reload_locked()
+            self.show_intermediate_events = bool(enabled)
+            self.save()
+
     def set_port(self, port: int) -> None:
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("port")
@@ -278,6 +289,7 @@ class CompanionStore:
             self._reload_locked()
             return {
                 "enabled": self.enabled,
+                "show_intermediate_events": self.show_intermediate_events,
                 "port": self.port,
                 "discovery_port": self.discovery_port,
                 "phones": [record.public() for record in self.phones.values()],

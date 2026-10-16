@@ -33,6 +33,15 @@ INTERNAL_THREAD_PREFIXES = ("The following is the Codex agent history",)
 MAX_MESSAGE_CHARS = 20000
 MAX_MESSAGE_ITEMS = 400
 MAX_TURNS_IN_DETAIL = 60
+INTERMEDIATE_MESSAGE_KINDS = {
+    "commentary",
+    "reasoning",
+    "command",
+    "fileChange",
+    "tool",
+    "plan",
+    "notice",
+}
 MAX_EVENT_QUEUE = 300
 ACCOUNT_CACHE_SECONDS = 45.0
 # Desktop turns are not visible to this app-server process, so the phone list
@@ -365,6 +374,7 @@ class CompanionService:
         desktop_state_path: Path | None = None,
         sessions_root: Path | None = None,
         read_state: ReadStateStore | None = None,
+        show_intermediate_events: bool | Callable[[], bool] = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
@@ -438,6 +448,12 @@ class CompanionService:
         self._poll_thread: threading.Thread | None = None
         self._untitled_threads: set[str] = set()
         self._read_state = read_state or ReadStateStore(self.data_dir / "read-state.json")
+        self._show_intermediate_events = show_intermediate_events
+        self._hidden_intermediate_items: dict[str, str] = {}
+
+    def _include_intermediate_events(self) -> bool:
+        setting = self._show_intermediate_events
+        return bool(setting() if callable(setting) else setting)
 
     def start(self) -> None:
         self._stop.clear()
@@ -1217,14 +1233,23 @@ class CompanionService:
         method = str(message.get("method") or "")
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if method == "item/agentMessage/delta":
+            item_id = str(params.get("itemId") or "")
+            phase = str(params.get("phase") or "").replace("_", "").lower()
+            if not self._include_intermediate_events():
+                if phase == "commentary" or item_id in self._hidden_intermediate_items:
+                    if item_id:
+                        self._hidden_intermediate_items[item_id] = str(params.get("turnId") or "")
+                    return None
             return {
                 "type": "agent_delta",
                 "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
                 "turn_id": str(params.get("turnId") or ""),
-                "item_id": str(params.get("itemId") or ""),
+                "item_id": item_id,
                 "delta": str(params.get("delta") or params.get("text") or ""),
             }
         if method == "item/commandExecution/outputDelta":
+            if not self._include_intermediate_events():
+                return None
             return {
                 "type": "command_output",
                 "thread_id": self.visible_thread_id(str(params.get("threadId") or "")),
@@ -1238,6 +1263,17 @@ class CompanionService:
                 return None
             mapped = self._map_item(item, None)
             if mapped is None:
+                return None
+            item_id = str(mapped.get("id") or "")
+            intermediate = mapped.get("kind") in INTERMEDIATE_MESSAGE_KINDS
+            if item_id:
+                if intermediate and method == "item/started":
+                    self._hidden_intermediate_items[item_id] = str(params.get("turnId") or "")
+                elif method == "item/completed":
+                    self._hidden_intermediate_items.pop(item_id, None)
+                else:
+                    self._hidden_intermediate_items.pop(item_id, None)
+            if not self._include_intermediate_events() and intermediate:
                 return None
             return {
                 "type": "item_started" if method == "item/started" else "item_completed",
@@ -1256,12 +1292,19 @@ class CompanionService:
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
             status = str(turn.get("status") or "completed")
+            turn_id = str(turn.get("id") or "")
+            if turn_id:
+                for hidden_item in [
+                    item_id for item_id, hidden_turn in self._hidden_intermediate_items.items()
+                    if hidden_turn == turn_id
+                ]:
+                    self._hidden_intermediate_items.pop(hidden_item, None)
             thread_id = self.visible_thread_id(str(params.get("threadId") or ""))
             completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
             return {
                 "type": "turn_completed",
                 "thread_id": thread_id,
-                "turn_id": str(turn.get("id") or ""),
+                "turn_id": turn_id,
                 "status": "completed" if status == "completed" else "failed",
                 "duration_ms": turn.get("durationMs"),
                 "completed_at": completed_at,
@@ -1345,6 +1388,7 @@ class CompanionService:
                     result = task
         return {
             "generated_at_epoch": int(time.time()),
+            "show_intermediate_events": self._include_intermediate_events(),
             "connection": self.connection_status(),
             "account": account,
             "task": tasks[0] if tasks else (threads[0] if threads else {}),
@@ -1618,6 +1662,11 @@ class CompanionService:
         tail_messages = self._read_fork_tail_messages(tail_id, seen_turn_ids)
         if tail_messages:
             messages.extend(tail_messages)
+        if not self._include_intermediate_events():
+            messages = [
+                message for message in messages
+                if message.get("kind") not in INTERMEDIATE_MESSAGE_KINDS
+            ]
         total = len(messages)
         trimmed = messages[-max(1, int(message_limit)):]
         summary = self._summary(thread)
