@@ -69,14 +69,14 @@ def _discovery_loop(
 ) -> None:
     while not stop.is_set():
         try:
-            results = discover(timeout=1.0)
+            results = discover(timeout=0.75)
         except OSError:
             results = []
         manager.sync(results)
-        # Devices sit on the network persistently, so re-scanning every few
-        # seconds only adds radio wake-ups. 15 s still reconnects after a
-        # device reboot well within the session timeout.
-        stop.wait(15.0)
+        # Reconnect a freshly rebooted device quickly, then back off once a
+        # session is established to avoid unnecessary radio wake-ups.
+        cadence = 5.0 if manager.online_count() == 0 else 15.0
+        stop.wait(cadence)
 
 
 class _CodexState:

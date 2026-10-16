@@ -11,10 +11,9 @@ from codexbridge.protocol.capabilities import parse_max_text_chars
 from codexbridge.devices.session import DeviceSession
 from codexbridge.hub import BridgeHub
 
-# The host heartbeat is a liveness ping, not a status channel. Devices pull the
-# state they render (see ``codex_state_request``), so a slow beat keeps the
-# session warm without waking a battery-powered radio every few seconds.
-DEFAULT_HEARTBEAT_SECONDS = 15.0
+# The host heartbeat is a liveness ping, not a status channel. It must arrive
+# before the device's session timeout, so a 5 s beat is intentional.
+DEFAULT_HEARTBEAT_SECONDS = 5.0
 
 
 class DeviceManager:
@@ -42,6 +41,10 @@ class DeviceManager:
             return
         for result in results:
             self._sync_one(result)
+
+    def online_count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
 
     def stop(self) -> None:
         self._stopping.set()

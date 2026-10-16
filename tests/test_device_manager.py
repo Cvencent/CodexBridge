@@ -116,6 +116,13 @@ class DeviceManagerTest(unittest.TestCase):
         self.assertEqual(FakeSession.created.sent[0]["type"], "message")
         self.assertEqual(FakeSession.created.sent[0]["message_id"], "m1")
 
+    def test_heartbeat_arrives_before_device_session_timeout(self):
+        self.assertLess(
+            self.manager.heartbeat_seconds,
+            self.manager.timeout_seconds,
+            "the host must beat before the device closes the session",
+        )
+
     def test_discovery_name_survives_missing_device_info_name(self):
         result = DiscoveryResult(
             host="127.0.0.1",
