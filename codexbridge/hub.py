@@ -70,6 +70,21 @@ BLOCKING_DEVICE_EVENTS = frozenset(
 # every part against this limit would reject legitimate requests.
 WORKER_QUEUE_LIMIT = 24
 
+# A device renders whatever text the host sends; it must never need a table of
+# its own for host error codes. Codes stay machine-readable for logic, the
+# human sentence travels with them, so one protocol works for any client.
+ERROR_TEXT: dict[str, str] = {
+    "busy_retry": "\u7535\u8111\u7aef\u8fd8\u5728\u5904\u7406\u4e0a\u4e00\u6761\u8bf7\u6c42\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5",
+    "capability_not_enabled": "\u8fd9\u4e2a\u529f\u80fd\u6ca1\u6709\u5728\u7535\u8111\u7aef\u5f00\u542f",
+    "codex_catalog_unavailable": "\u7535\u8111\u7aef\u6ca1\u6709\u53ef\u7528\u7684 Codex\uff0c\u8bf7\u786e\u8ba4 Codex \u5df2\u6253\u5f00",
+    "codex_catalog_failed": "\u7535\u8111\u7aef\u8bfb\u53d6 Codex\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5",
+    "codex_unavailable": "\u7535\u8111\u7aef\u7684 Codex \u6682\u65f6\u4e0d\u53ef\u7528",
+    "invalid_request_id": "\u8bf7\u6c42\u7f16\u53f7\u65e0\u6548\uff0c\u8bf7\u91cd\u8bd5",
+    "invalid_command_chunk": "\u6307\u4ee4\u6570\u636e\u635f\u574f\uff0c\u8bf7\u91cd\u8bd5",
+    "invalid_request": "\u8bf7\u6c42\u683c\u5f0f\u4e0d\u6b63\u786e",
+    "invalid_event_cursor": "\u8ba2\u9605\u4f4d\u7f6e\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u8fde\u63a5",
+}
+
 # Byte ceilings for one flat `codex_status_snapshot` line. Together they leave
 # comfortable room inside MAX_LINE_BYTES for the field names themselves.
 SNAPSHOT_ID_BYTES = 64
@@ -330,7 +345,12 @@ class BridgeHub:
             if depth >= WORKER_QUEUE_LIMIT:
                 self._send(
                     device_id,
-                    {"type": "error", "code": "busy_retry", "request_id": (event or {}).get("request_id")},
+                    {
+                        "type": "error",
+                        "code": "busy_retry",
+                        "text": ERROR_TEXT["busy_retry"],
+                        "request_id": (event or {}).get("request_id"),
+                    },
                 )
                 return
             self._depth[device_id] = depth + 1
@@ -845,7 +865,10 @@ class BridgeHub:
             )
 
     def _send_error(self, device_id: str, code: str) -> None:
-        self._send(device_id, {"type": "error", "code": code})
+        self._send(
+            device_id,
+            {"type": "error", "code": code, "text": ERROR_TEXT.get(code, code)},
+        )
 
     def _send(self, device_id: str, message: dict) -> None:
         with self._lock:
