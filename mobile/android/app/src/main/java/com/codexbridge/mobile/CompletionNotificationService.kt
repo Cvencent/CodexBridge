@@ -16,6 +16,8 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.codexbridge.mobile.data.ApiClient
 import com.codexbridge.mobile.data.SettingsStore
+import com.codexbridge.mobile.data.shouldReconcileCompletion
+import com.codexbridge.mobile.data.notificationResumeSince
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,6 +29,7 @@ import kotlinx.coroutines.launch
 class CompletionNotificationService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
+    private var restoreNotificationJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -39,6 +42,11 @@ class CompletionNotificationService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_RESTORE_LISTENING) {
+            restoreNotificationJob?.cancel()
+            startAsForeground()
+            return START_STICKY
+        }
         startAsForeground()
         if (job?.isActive != true) {
             job = scope.launch { listen(settings) }
@@ -50,6 +58,7 @@ class CompletionNotificationService : Service() {
 
     override fun onDestroy() {
         job?.cancel()
+        restoreNotificationJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
@@ -70,6 +79,10 @@ class CompletionNotificationService : Service() {
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
+        postForegroundNotification(notification)
+    }
+
+    private fun postForegroundNotification(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ServiceCompat.startForeground(
                 this,
@@ -83,14 +96,39 @@ class CompletionNotificationService : Service() {
     }
 
     private suspend fun listen(settings: SettingsStore) {
+        val listeningSince = notificationResumeSince(settings.notificationWatermark, System.currentTimeMillis() / 1000)
+        if (settings.notificationWatermark == 0L) settings.notificationWatermark = listeningSince
         while (job?.isActive != false) {
             try {
                 val client = ApiClient(settings.baseUrl, settings.token)
                 client.events().collect { event ->
+                    if (event.type == "hello" || event.type == "resync_required") {
+                        val syncStarted = System.currentTimeMillis() / 1000
+                        var complete = true
+                        runCatching { client.threads() }.onSuccess { response ->
+                            for (thread in response.threads) {
+                                if (!shouldReconcileCompletion(thread.status, thread.completed_at, listeningSince)) continue
+                                runCatching { client.thread(thread.thread_id) }.onSuccess { detail ->
+                                    val key = detail.task.turn_id.ifBlank {
+                                        detail.thread.completed_at.takeIf { it > 0 }?.toString().orEmpty()
+                                    }
+                                    deliverCompletion(settings, thread.thread_id, key)
+                                }.onFailure { complete = false }
+                            }
+                        }.onFailure { complete = false }
+                        if (complete) settings.notificationWatermark = syncStarted
+                    }
                     if (event.type != "turn_completed" || event.status == "failed") return@collect
-                    if (event.thread_id.isBlank() || event.turn_id.isBlank()) return@collect
-                    if (!settings.markNotificationSent(event.thread_id, event.turn_id)) return@collect
-                    notifyCompletion(event.thread_id, event.turn_id)
+                    val key = event.turn_id.ifBlank {
+                        runCatching { client.thread(event.thread_id) }
+                            .getOrNull()
+                            ?.thread
+                            ?.completed_at
+                            ?.takeIf { it > 0 }
+                            ?.toString()
+                            .orEmpty()
+                    }
+                    deliverCompletion(settings, event.thread_id, key)
                 }
                 delay(RETRY_MS)
             } catch (_: Exception) {
@@ -99,7 +137,14 @@ class CompletionNotificationService : Service() {
         }
     }
 
-    private fun notifyCompletion(threadId: String, turnId: String) {
+    private fun deliverCompletion(settings: SettingsStore, threadId: String, turnId: String) {
+        if (threadId.isBlank() || turnId.isBlank()) return
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        if (!settings.markNotificationSent(threadId, turnId)) return
+        notifyCompletion(threadId)
+    }
+
+    private fun notifyCompletion(threadId: String) {
         val intent = Intent(this, MainActivity::class.java)
             .putExtra(EXTRA_THREAD_ID, threadId)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -114,11 +159,17 @@ class CompletionNotificationService : Service() {
             .setContentTitle("Codex 任务已完成")
             .setContentText("点开查看结果")
             .setContentIntent(pending)
-            .setAutoCancel(true)
+            .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setDefaults(Notification.DEFAULT_SOUND or Notification.DEFAULT_VIBRATE)
             .build()
-        NotificationManagerCompat.from(this).notify(completionId(threadId, turnId), notification)
+        postForegroundNotification(notification)
+        restoreNotificationJob?.cancel()
+        restoreNotificationJob = scope.launch {
+            delay(COMPLETION_NOTIFICATION_MS)
+            startAsForeground()
+        }
     }
 
     private fun createChannels() {
@@ -129,15 +180,22 @@ class CompletionNotificationService : Service() {
             },
         )
         manager.createNotificationChannel(
-            NotificationChannel(COMPLETION_CHANNEL, "任务完成", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            NotificationChannel(COMPLETION_CHANNEL, "任务完成", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Codex 任务完成提醒"
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 250, 120, 250)
+                setSound(android.provider.Settings.System.DEFAULT_NOTIFICATION_URI,
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION).build())
             },
         )
     }
 
     companion object {
         private const val LISTEN_CHANNEL = "codexbridge_listen"
-        private const val COMPLETION_CHANNEL = "codexbridge_completion"
+        private const val COMPLETION_CHANNEL = "codexbridge_completion_alerts"
+        private const val ACTION_RESTORE_LISTENING = "com.codexbridge.mobile.action.RESTORE_LISTENING"
+        private const val COMPLETION_NOTIFICATION_MS = 60_000L
         private const val LISTEN_NOTIFICATION_ID = 4101
         private const val RETRY_MS = 3000L
         const val EXTRA_THREAD_ID = "thread_id"
@@ -151,7 +209,10 @@ class CompletionNotificationService : Service() {
             context.stopService(Intent(context, CompletionNotificationService::class.java))
         }
 
-        private fun completionId(threadId: String, turnId: String): Int =
-            5000 + (threadId + turnId).hashCode() % 100000
+        fun restoreListening(context: Context) {
+            val intent = Intent(context, CompletionNotificationService::class.java)
+                .setAction(ACTION_RESTORE_LISTENING)
+            ContextCompat.startForegroundService(context, intent)
+        }
     }
 }

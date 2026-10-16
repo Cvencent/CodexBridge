@@ -17,6 +17,14 @@ from codexbridge.companion.store import (
 
 
 class CompanionStoreTests(unittest.TestCase):
+    def test_phone_negotiates_optional_capabilities_and_persists_them(self):
+        paired = self.store.claim(self.store.pairing_code()['code'], 'phone')
+        phone_id = paired['phone_id']
+        self.assertEqual(self.store.negotiate(phone_id, ['status', 'tasks', 'unknown']), ['status', 'tasks'])
+        loaded = CompanionStore(self.path)
+        loaded.load()
+        self.assertEqual(loaded.phones[phone_id].capabilities(), {'status', 'tasks'})
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "companion.json"
@@ -124,6 +132,12 @@ class CompanionStoreTests(unittest.TestCase):
     def test_set_port_rejects_the_reserved_legacy_port(self) -> None:
         with self.assertRaisesRegex(ValueError, "port_reserved"):
             self.store.set_port(LEGACY_PORT)
+
+    def test_malformed_saved_capabilities_fail_closed_without_crashing(self):
+        for enabled in [None, 'status', [{'tasks': True}], 3]:
+            record = self.store._record_from({'phone_id': 'p', 'token_hash': 'a' * 64,
+                                             'enabled': enabled})
+            self.assertEqual(record.capabilities(), set())
 
 
 if __name__ == "__main__":

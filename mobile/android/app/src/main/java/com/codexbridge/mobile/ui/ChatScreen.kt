@@ -64,6 +64,12 @@ import com.codexbridge.mobile.UiState
 import com.codexbridge.mobile.data.ApprovalRequest
 import com.codexbridge.mobile.data.MessageItem
 import java.util.Locale
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -71,12 +77,20 @@ fun ChatScreen(
     state: UiState,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
+    onConsumeRestoreInput: () -> Unit = {},
     onStop: () -> Unit,
     onPickModel: (String) -> Unit,
     onResolveApproval: (Int, String) -> Unit,
+    onRespondApproval: (Int, JsonObject) -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
+    LaunchedEffect(state.restoreInput) {
+        if (state.restoreInput.isNotBlank()) {
+            input = state.restoreInput
+            onConsumeRestoreInput()
+        }
+    }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val threadKey = state.activeThread?.thread_id.orEmpty()
@@ -186,7 +200,7 @@ fun ChatScreen(
                         MessageRow(item = item, streaming = state.streaming[item.id].orEmpty())
                     }
                     items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
-                        ApprovalCard(approval = approval, onDecision = onResolveApproval)
+                        ApprovalCard(approval = approval, onDecision = onResolveApproval, onResponse = onRespondApproval)
                     }
                 }
                 if (showJumpToBottom) {
@@ -561,8 +575,11 @@ private fun NoticeLine(text: String) {
 }
 
 @Composable
-private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) -> Unit) {
+private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) -> Unit,
+                         onResponse: (Int, JsonObject) -> Unit) {
     val detail = approval.raw
+    var answers by remember(approval.request_id) { mutableStateOf(mapOf<String, String>()) }
+    var structured by remember(approval.request_id) { mutableStateOf("{}") }
     val diff = detail.diff.ifBlank { detail.patch }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -608,12 +625,18 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
                         Text(text = question.question, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                     }
                     if (question.options.isNotEmpty()) {
-                        Text(
-                            text = question.options.joinToString(" / "),
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        question.options.forEach { option ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                androidx.compose.material3.RadioButton(
+                                    selected = answers[question.id] == option,
+                                    onClick = { answers = answers + (question.id to option) })
+                                Text(option, modifier = Modifier.weight(1f))
+                            }
+                        }
                     }
+                    OutlinedTextField(value = answers[question.id].orEmpty(),
+                        onValueChange = { answers = answers + (question.id to it) },
+                        label = { Text("回答") }, modifier = Modifier.fillMaxWidth())
                 }
             }
             if (approval.reason.isNotBlank()) {
@@ -633,7 +656,31 @@ private fun ApprovalCard(approval: ApprovalRequest, onDecision: (Int, String) ->
             ) {
                 Text(text = detail.message, fontSize = 13.sp)
             }
-            Row(
+            if (approval.kind == "permissions" || approval.kind == "mcp") {
+                OutlinedTextField(value = structured, onValueChange = { structured = it },
+                    label = { Text(if (approval.kind == "permissions") "授权范围 JSON" else "表单内容 JSON") },
+                    modifier = Modifier.fillMaxWidth(), minLines = 3)
+            }
+            if (approval.kind in setOf("input", "permissions", "mcp")) {
+                val parsed = runCatching { Json.parseToJsonElement(structured) as? JsonObject }.getOrNull()
+                Button(onClick = {
+                    val response = buildJsonObject {
+                        when (approval.kind) {
+                            "input" -> put("answers", buildJsonObject {
+                                answers.forEach { (id, answer) -> put(id, buildJsonObject {
+                                    put("answers", JsonArray(listOf(JsonPrimitive(answer))))
+                                }) }
+                            })
+                            "permissions" -> { put("permissions", parsed!!); put("scope", "turn") }
+                            "mcp" -> { put("action", "accept"); put("content", parsed!!) }
+                        }
+                    }
+                    onResponse(approval.request_id, response)
+                }, enabled = if (approval.kind == "input")
+                    detail.questions.all { !answers[it.id].isNullOrBlank() } else parsed != null) {
+                    Text("提交")
+                }
+            } else Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {

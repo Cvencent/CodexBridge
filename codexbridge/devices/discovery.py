@@ -58,14 +58,45 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
     )
 
 
+def _broadcast_targets(sock: socket.socket) -> tuple[str, ...]:
+    """Return the limited broadcast plus each interface's subnet broadcast.
+
+    A limited broadcast to 255.255.255.255 is filtered by some hosts (ESP-IDF
+    lwIP among them): the reply never leaves the device on that path. Sending
+    the same request to the subnet broadcast as well is the portable fix and
+    keeps discovery generic across device classes.
+    """
+    targets: list[str] = ["255.255.255.255"]
+    try:
+        import ipaddress
+
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = info[4][0]
+            if address.startswith("127."):
+                continue
+            try:
+                network = ipaddress.ip_network(address + "/24", strict=False)
+            except ValueError:
+                continue
+            candidate = str(network.broadcast_address)
+            if candidate not in targets:
+                targets.append(candidate)
+    except OSError:
+        pass
+    return tuple(targets)
+
+
 def discover(
     timeout: float = 3.0,
-    targets: Iterable[str] = ("255.255.255.255",),
+    targets: Iterable[str] | None = None,
 ) -> list[DiscoveryResult]:
     if timeout < 0:
         raise ValueError("timeout must not be negative")
 
-    target_hosts = tuple(targets)
+    target_hosts = tuple(targets) if targets is not None else ()
+    if targets is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            target_hosts = _broadcast_targets(probe)
     if not target_hosts:
         return []
 

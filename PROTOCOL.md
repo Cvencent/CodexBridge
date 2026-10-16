@@ -111,11 +111,14 @@ CODEXBRIDGE_DISCOVER
 
 | 参数 | 当前值 | 说明 |
 | --- | --- | --- |
-| 心跳间隔 | `5` 秒 | CodexBridge 重复发送 `bridge_ready` |
+| 心跳间隔 | `15` 秒 | CodexBridge 重复发送 `bridge_ready`（可配置，仅作存活探测） |
 | 连接超时 | `15` 秒 | TCP 建连与等待握手应答的超时 |
 | 令牌最短长度 | `16` 字符 | 少于 16 字符的令牌会被拒绝 |
 
 设备可在 `15` 秒未收到 CodexBridge 任何消息时判定连接失效并重新等待连接。
+
+心跳只用于确认链路存活；设备需要展示的 Codex 状态由设备主动拉取（见第 9 章
+`codex_state_request`），因此心跳周期不承担状态同步职责，可以被放宽。
 
 ## 5. 鉴权握手
 
@@ -150,6 +153,7 @@ CODEXBRIDGE_DISCOVER
 | `name` | string | 否 | 显示名称 |
 | `firmware` | string | 否 | 固件版本，当前只透传记录，不参与握手判断 |
 | `capabilities` | string[] | 是 | 设备固件实际支持的能力 |
+| `max_text_chars` | integer | 否 | 设备能渲染的正文字符上限；缺省或 `null` 表示不限 |
 
 如果令牌错误、回包不是 `bridge_auth_ok`，或 `device_id` 与预期不一致，
 CodexBridge 结束本次会话，不进入在线状态。
@@ -162,13 +166,13 @@ CodexBridge 结束本次会话，不进入在线状态。
 {
   "type": "bridge_ready",
   "bridge": "CodexBridge",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "capabilities": ["read_ack", "status", "text"]
 }
 ```
 
 `capabilities` 是本次会话握手时计算出的生效能力，即设备 `supported` 与用户
-`enabled` 的交集。首次 `bridge_ready` 完成能力授予；之后每 5 秒重复发送
+`enabled` 的交集。首次 `bridge_ready` 完成能力授予；之后按心跳间隔重复发送
 `bridge_ready` 作为心跳，并继续携带本次会话已授予的能力。运行时权限变化通过
 `capabilities_update` 推送。
 
@@ -231,13 +235,19 @@ read_ack
 
 | 型号 | 默认能力 |
 | --- | --- |
-| `FoloOS-AI-Passport` | `status`, `text`, `read_ack` |
+| `FoloOS-AI-Passport` | `status`, `text`, `read_ack`, `tasks`, `results`, `audio`, `voice`, `approval` |
 | `dotii` | `status`, `text`, `tasks`, `results`, `read_ack`, `quota` |
 | 未知型号 | `status`, `text`, `read_ack` |
 
 设备首次出现时，当前默认计算为 `default_for(model) ∩ (supported ∪ MINIMAL)`，因此最小能力集中的能力不会被设备漏报直接抹掉。
 `supported` 来自 `bridge_auth_ok.capabilities`，`enabled` 是本机用户允许的
 能力，二者都必须是已知能力。
+
+设备每次握手都会重新声明 `supported`。只要本机用户没有手动改过该设备的能力开关
+（注册表中的 `customized` 为假），`enabled` 就随声明重新推导：
+固件新增了 `audio` 之类的 capability 后，设备一连上就能用，不需要在本机再点一次；
+设备撤掉某个 capability 时，`enabled` 同步收缩。用户一旦手动勾选过，本机选择优先，
+主机的默认值不再覆盖它。
 
 ### 7.3 生效能力
 
@@ -252,7 +262,33 @@ CodexBridge 只向设备下发生效能力对应的数据，也只接受生效�
 {"type":"error","code":"capability_not_enabled"}
 ```
 
-### 7.4 运行时更新
+### 7.4 通用正文预算（text budget）
+
+不同设备的内存与屏幕差异极大，协议**不为任何设备硬编码截断长度**，而是由
+设备自己声明能渲染多少正文，CodexBridge 按声明裁剪。这样一套协议同时服务
+ESP32 与桌面/手机客户端。
+
+设备在 `bridge_auth_ok` 中携带可选字段 `max_text_chars`：
+
+```json
+{"type":"bridge_auth_ok","device_id":"aipassport-1","max_text_chars":512}
+```
+
+| 取值 | 含义 |
+| --- | --- |
+| 正整数 | 每条 `message` 的 `body` 最多保留该字符数，超出以 `...` 结尾 |
+| 缺省 / `null` / `0` / 负数 | 不限，CodexBridge 发送完整正文（仍按 768 字节单行上限分片） |
+
+取值会被夹到 `16..100000` 区间。CodexBridge 只在 `type == "message"` 的记录上
+应用预算，其它消息类型不受影响。
+
+本机可在管理页为每台设备覆盖该值（`POST /api/admin/devices/capabilities` 的
+可选字段 `max_text_chars`）：传正整数覆盖设备声明，传 `null` 恢复不限，
+缺省字段表示保留设备声明值。覆盖值随设备记录持久化。
+
+裁剪发生在正文分片之前，因此设备收到的分片总长仍受第 4 节的单行上限约束。
+
+### 7.5 运行时更新
 
 本机管理页面保存能力后，CodexBridge 向在线设备推送：
 
@@ -271,7 +307,7 @@ CodexBridge 只向设备下发生效能力对应的数据，也只接受生效�
 
 ### 8.2 `capabilities_update`
 
-能力更新。字段见第 7.4 节。
+能力更新。字段见第 7.5 节。
 
 ### 8.3 `message`
 
@@ -426,8 +462,9 @@ CodexBridge 会将该设备写入消息的 `read_by`，并向其他支持 `read_
 
 要求能力：`tasks`。
 
-当前代码只校验该事件所需能力，并把未授权事件转为
-`capability_not_enabled`；已授权事件不会产生额外的协议应答。
+兼容旧设备的 `tasks` 能力，转为 `turn.interrupt`，返回 `command_result`。
+新设备应使用通用命令及 `control` 能力。可提供稳定 `request_id` 去重；
+旧设备不提供时由 Bridge 生成，不保证跨重发去重。
 
 ### 9.3 `approval_decision`
 
@@ -437,8 +474,10 @@ CodexBridge 会将该设备写入消息的 `read_by`，并向其他支持 `read_
 
 要求能力：`approval`。
 
-通用协议层当前只做事件识别与能力校验；已授权事件不会产生额外的通用协议应答。
-`request_id` 和 `decision` 的具体取值由设备业务侧与 Codex 侧约定。
+转为 `approval.resolve` 并返回 `command_result`。`approval_id` 为 Bridge
+审批整数 ID；旧设备也可在 `request_id` 中传此整数 ID。
+`approve`/`deny` 兼容映射到 `accept`/`decline`；其余支持 `acceptForSession`、
+`cancel`。工具提问、权限与 MCP 应使用通用 `approval.respond` 结构化响应。
 
 ### 9.4 `voice_command`
 
@@ -530,15 +569,42 @@ ID，不是 Codex 的原始 UUID。
 约束。选择成功由设备发送 `codex_selection_confirm` 确认，放弃浏览时发送
 `codex_catalog_cancel`；两者都不要求 CodexBridge 返回额外应答。
 
-当前 Bridge 不通过 `codex_thread_new` 创建任务，事件返回：
-
-```json
-{"type":"error","text":"请先在电脑 Codex 新建任务，再回设备选择"}
-```
+`codex_thread_new` 由 Bridge 调用 `thread/start` 真实新建任务，可携带可选的
+`model`；成功后返回 `codex_selected` 直接进入该任务，并重新下发线程目录，
+使新建任务出现在列表中。失败时返回可读错误。
 
 未授权事件返回 `capability_not_enabled`。
 
-### 9.7 能力对应表
+### 9.7 `codex_state_request`
+
+设备按需拉取当前 Codex 任务计数，用于在设备界面（例如首页）展示“工作中 /
+待办”状态。该事件要求能力 `status`；设备可以携带可选的 `request_id`，应答会
+原样回显，便于设备过滤过期响应。
+
+```json
+{"type":"codex_state_request","request_id":7}
+```
+
+CodexBridge 应答：
+
+```json
+{"type":"codex_state","running":1,"done":2,"failed":0,"request_id":7}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `type` | string | 是 | 固定为 `codex_state` |
+| `running` | integer | 是 | 当前处于进行中状态的任务数 |
+| `done` | integer | 是 | 已完成的最近结果数 |
+| `failed` | integer | 是 | 失败的结果数 |
+| `request_id` | integer | 否 | 仅当请求携带时回显 |
+
+计数由 CodexBridge 从统一消息存储实时聚合，不需要设备维护第二套统计。
+设备应自行控制拉取频率（例如前台 15 秒、息屏 60 秒），避免频繁唤醒射频。
+设备上线时 CodexBridge 额外主动下发一次快照，避免刚重连时界面空白。
+未授权事件返回 `capability_not_enabled`。
+
+### 9.8 能力对应表
 
 | 事件 | 所需能力 |
 | --- | --- |
@@ -554,6 +620,7 @@ ID，不是 Codex 的原始 UUID。
 | `codex_project_select` | `tasks` |
 | `codex_thread_select` | `tasks` |
 | `codex_thread_new` | `tasks` |
+| `codex_state_request` | `status` |
 
 未知事件类型由 CodexBridge 忽略，不会因此断开会话。
 
@@ -588,8 +655,10 @@ Codex 状态、任务和结果在 CodexBridge 内部统一为 `MessageRecord`，
 `message_id`，通过 `seq` 和 `total` 重组。`seq` 从 `0` 开始。设备应至少保留
 每个消息当前分片的拼接缓存，并在完成后按消息 ID 替换已有内容。
 
-标题超过 160 字节时截断并追加 `...`。如果消息编码后仍然超过单行上限，发送方会
-继续降低正文分片大小，保证每行不超过协议上限。
+标题超过 160 字节时截断并追加 `...`。分片大小按整条记录的真实开销计算：
+序号等元数据与可选 `data` 会挤占单行预算，因此正文分片上限是 `480` 字节与
+剩余行预算中的较小值。如果编码后仍然超过单行上限，发送方会继续降低正文分片
+大小；预算不足时先丢弃可选的 `data` 而不是丢弃整条消息。
 
 ## 11. 已读同步
 
@@ -726,7 +795,7 @@ PC -> 设备: CODEXBRIDGE_DISCOVER
 设备 -> PC: {"device":"dotii","device_id":"a1","name":"Desk","port":8765,"capabilities":["status","text","read_ack"]}
 PC -> 设备: {"type":"bridge_auth","token":"..."}
 设备 -> PC: {"type":"bridge_auth_ok","device_id":"a1","model":"dotii","name":"Desk","firmware":"1.0.0","capabilities":["status","text","read_ack"]}
-PC -> 设备: {"type":"bridge_ready","bridge":"CodexBridge","version":"1.3.3","capabilities":["read_ack","status","text"]}
+PC -> 设备: {"type":"bridge_ready","bridge":"CodexBridge","version":"1.4.0","capabilities":["read_ack","status","text"]}
 PC -> 设备: {"type":"message","message_id":"task:t1","thread_id":"t1","kind":"task","status":"working","title":"Codex 任务","body":"正在处理","created_at":1234567890.0,"seq":0,"total":1}
 设备 -> PC: {"type":"read_ack","message_id":"task:t1"}
 PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read_at":1234567890.0}
@@ -743,7 +812,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.3.11","port":8791,"discovery_port":8766,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"1.4.0","port":8791,"discovery_port":8766,"requires_pairing":true}
 ```
 
 默认连接端口为 `8791`，默认发现端口为 `8766`，并在管理页面显示每个端口的健康状态。
@@ -795,9 +864,40 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_started`、`turn_completed`、
 `turn_interrupted`、`item_started`、`item_completed`、`agent_delta`、`command_output`、
 `token_usage`、`thread_status`、`thread_name`、`rate_limits`、`approval_request`、
-`approval_resolved`、`error`。手机端必须忽略未知 `type`。审批请求超过 `600` 秒未处理会在电脑端失效。
+`approval_resolved`、`threads_changed`、`resync_required`、`error`。手机端必须忽略未知 `type`。审批请求超过 `600` 秒未处理会在电脑端失效。
+
+Bridge 每 2 秒校准最近线程的外部变更，变化时发送 `threads_changed`（携带
+`thread_id`），并对观测期间发生的完成补发 `turn_completed`。首次扫描不会重放
+历史完成。客户端必须按 `thread_id` 与 `turn_id` 去重，并在 SSE 断开后重连。
+Windows 没有可用的桌面共享 App Server socket，Bridge 因此对桌面已知任务使用
+`owner_routed`：先通过桌面内部 IPC 找到当前 owner，再把 start、steer、interrupt
+和审批定向发给它，并订阅该 thread 的状态快照。这个模式是逐任务定向，不是全局
+共享执行；`connection.desktop_realtime_shared` 仍为 `false`。
+消息里显式携带的 `model`/`effort` 会先通过桌面 IPC 写入该线程的设置再发起 turn：桌面 follower turn 默认继承线程设置，只把模型放进 turn 请求会被桌面忽略。
+桌面 IPC 不可用或握手期间 owner 尚未建立时，写操作返回 `desktop_unavailable`
+或 `desktop_handoff_pending`，不会静默退回独立 App Server 执行，避免同一 thread
+被两个 writer 同时写入。
+
+手机新建任务先用 `threadSource=user` 创建，并用中性占位名 `新任务` 提交 rollout，
+立即释放 writer，再让桌面打开 `codex://threads/<id>`，确认桌面成为 owner 后才返回成功。
+首条用户消息成功后，Bridge 会生成简洁标题，通过 `thread/name/set` 持久化，
+发布 `thread_name` 与 `threads_changed`，并使桌面的 `['tasks']`、
+`['list-pinned-threads']`、`['archived-threads','local']` 查询失效。这样桌面端会
+正常加载并立即刷新，不会生成旧的 `CodexBridge` 占位会话。桌面 IPC 是 Bridge 内部适配层，不属于
+ESP/设备协议；设备只使用后文的通用命令协议。
 
 ### 17.4 本机管理
+
+事件恢复：SSE `id` 与 JSON 的 `event_id` 为同一不透明游标，不得按数字比较。
+客户端重连通过 `Last-Event-ID` 请求头或 `after` 参数提交最后已接收游标。
+Bridge 在进程内保留最近 1000 条事件，原子地重放游标后的事件并接入实时流。
+Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_required`，客户端必须
+重新读取列表、当前任务和审批快照。事件携带 `server_time`（epoch 秒）。
+首次连接不重放历史事件；此机制不保证手机离线期间的系统通知送达。
+手机与未来设备客户端应按事件 ID 去重，并按任务/轮次 ID 合并状态。
+
+桌面跨客户端 IPC 是 Bridge 内部适配协议，不是设备接入协议。
+设备不得依赖桌面的命名管道、私有消息版本或 conversationState 结构。
 
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
 - `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8791}` 和 `{"action":"set_port","kind":"discovery","port":8766}`。

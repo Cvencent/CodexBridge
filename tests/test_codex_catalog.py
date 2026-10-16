@@ -13,6 +13,41 @@ class FakeAppServer:
 
     def request(self, method, params=None):
         self.calls.append((method, params or {}))
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-new",
+                    "name": "新任务",
+                    "preview": "新任务",
+                    "path": "",
+                    "cwd": str(Path(tempfile.gettempdir()) / "repo-a"),
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "model/list":
+            return {
+                "data": [
+                    {
+                        "id": "gpt-5.1-codex",
+                        "model": "gpt-5.1-codex",
+                        "displayName": "GPT-5.1 Codex",
+                        "isDefault": True,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [{"effort": "medium"}],
+                    },
+                    {
+                        "id": "gpt-5.1",
+                        "model": "gpt-5.1",
+                        "displayName": "GPT-5.1",
+                        "isDefault": False,
+                        "defaultReasoningEffort": "high",
+                        "supportedReasoningEfforts": [{"effort": "high"}],
+                    },
+                    {"id": "hidden-one", "model": "hidden-one", "hidden": True},
+                ]
+            }
+        if method == "turn/start":
+            return {"turn": {"id": "turn-1", "status": "working"}}
         if method == "thread/list":
             return {
                 "data": [
@@ -156,6 +191,91 @@ class CodexCatalogTest(unittest.TestCase):
         self.assertEqual(items[0]["title"], "项目 8")
         self.assertEqual(items[-1]["title"], "回到第1页")
 
+
+    def test_thread_new_starts_a_real_thread_and_selects_it(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0", "request_id": 1}
+        )
+
+        created = service.handle_device_event(
+            "device-1", {"type": "codex_thread_new", "request_id": 2}
+        )
+
+        self.assertTrue(
+            any(("thread/start",) == call[0:1] for call in self.app.calls),
+            self.app.calls,
+        )
+        selected = [message for message in created if message["type"] == "codex_selected"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["title"], "新任务")
+
+        # The new thread is addressable afterwards: the device can push a turn.
+        again = service.handle_device_event(
+            "device-1", {"type": "codex_thread_select", "id": "t0", "request_id": 3}
+        )
+        self.assertEqual(again[0]["type"], "codex_selected")
+
+    def test_thread_new_keeps_existing_threads_selectable(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0", "request_id": 1}
+        )
+
+        created = service.handle_device_event(
+            "device-1", {"type": "codex_thread_new", "request_id": 2}
+        )
+
+        items = [
+            message for message in created if message["type"] == "codex_catalog_item"
+        ]
+        self.assertTrue(items, f"expected a refreshed thread list: {created}")
+        titles = [item["title"] for item in items]
+        self.assertIn("新任务", titles)
+        self.assertIn("修复登录", titles)
+
+        # Both the new and the pre-existing thread stay addressable.
+        for key in ("t0", "t1", "t2"):
+            reply = service.handle_device_event(
+                "device-1",
+                {"type": "codex_thread_select", "id": key, "request_id": 10},
+            )
+            self.assertEqual(reply[0]["type"], "codex_selected", f"key {key}")
+
+    def test_thread_new_failure_reports_a_readable_error(self):
+        self._write_desktop_state()
+        service = self._service()
+
+        def failing(method, params=None):
+            raise RuntimeError("app-server down")
+
+        service._request = failing
+        created = service.handle_device_event(
+            "device-1", {"type": "codex_thread_new", "request_id": 1}
+        )
+        self.assertEqual(created[0]["type"], "error")
+        self.assertIn("新建任务失败", created[0]["text"])
+
+    def test_thread_new_passes_selected_model(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0", "request_id": 1}
+        )
+        self.app.calls.clear()
+        service.handle_device_event(
+            "device-1",
+            {"type": "codex_thread_new", "model": "gpt-5.1-codex", "request_id": 2},
+        )
+        start_call = [call for call in self.app.calls if call[0] == "thread/start"]
+        self.assertEqual(len(start_call), 1)
+        self.assertEqual(start_call[0][1].get("model"), "gpt-5.1-codex")
+
     def test_project_and_thread_selection_return_device_messages(self):
         self._write_desktop_state()
         service = self._service()
@@ -188,6 +308,97 @@ class CodexCatalogTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_model_catalog_uses_short_ids_and_marks_default(self):
+        service = self._service()
+        catalog = service.handle_device_event(
+            "device-1",
+            {"type": "codex_catalog_request", "scope": "models", "request_id": 1},
+        )
+        self.assertEqual(catalog[0], {"type": "codex_catalog_begin", "scope": "models"})
+        items = [m for m in catalog if m["type"] == "codex_catalog_item"]
+        self.assertEqual([m["id"] for m in items], ["m0", "m1"])
+        self.assertEqual(items[0]["title"], "GPT-5.1 Codex（默认）")
+        self.assertNotIn("hidden-one", json.dumps(catalog, ensure_ascii=False))
+        self.assertEqual(catalog[-1], {"type": "codex_catalog_end", "scope": "models"})
+
+    def test_model_selection_is_remembered_for_new_threads(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event(
+            "device-1",
+            {"type": "codex_catalog_request", "scope": "models", "request_id": 1},
+        )
+        chosen = service.handle_device_event(
+            "device-1", {"type": "codex_model_select", "id": "m1", "request_id": 2}
+        )
+        self.assertEqual(chosen[0]["type"], "codex_model_selected")
+        self.assertEqual(chosen[0]["model"], "gpt-5.1")
+
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0", "request_id": 3}
+        )
+        self.app.calls.clear()
+        service.handle_device_event(
+            "device-1", {"type": "codex_thread_new", "request_id": 4}
+        )
+        starts = [c for c in self.app.calls if c[0] == "thread/start"]
+        self.assertEqual(starts[0][1].get("model"), "gpt-5.1")
+
+    def test_model_select_without_catalog_refreshes_the_list(self):
+        service = self._service()
+        reply = service.handle_device_event(
+            "device-1", {"type": "codex_model_select", "id": "m0", "request_id": 9}
+        )
+        self.assertEqual(reply[0]["type"], "codex_catalog_begin")
+
+    def test_voice_command_starts_a_turn_on_the_selected_thread(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0", "request_id": 1}
+        )
+        service.handle_device_event(
+            "device-1", {"type": "codex_thread_select", "id": "t0", "request_id": 2}
+        )
+        self.app.calls.clear()
+        reply = service.handle_voice_command("device-1", "帮我把测试跑完")
+        self.assertEqual(reply, [{"type": "task_queued", "text": "指令已发送到电脑端"}])
+        turn = [c for c in self.app.calls if c[0] == "turn/start"]
+        self.assertEqual(len(turn), 1)
+        self.assertEqual(turn[0][1]["threadId"], "thread-1")
+        self.assertEqual(turn[0][1]["input"][0]["text"], "帮我把测试跑完")
+
+    def test_voice_command_without_thread_creates_one(self):
+        service = self._service()
+        reply = service.handle_voice_command("device-1", "新建一个任务")
+        self.assertEqual(reply[0]["type"], "task_queued")
+        methods = [c[0] for c in self.app.calls]
+        self.assertEqual(methods, ["thread/start", "turn/start"])
+
+    def test_voice_command_steers_when_a_turn_is_running(self):
+        service = self._service()
+
+        def request(method, params=None):
+            if method == "turn/start":
+                raise RuntimeError("thread has an active turn")
+            return {"thread": {"id": "thread-x"}}
+
+        service._request = request
+        reply = service.handle_voice_command("device-1", "补一句话")
+        self.assertEqual(reply[0]["type"], "task_queued")
+
+    def test_voice_command_reports_failures_readably(self):
+        service = self._service()
+        self.assertEqual(service.handle_voice_command("device-1", "  ")[0]["type"], "error")
+
+        def failing(method, params=None):
+            raise RuntimeError("app-server down")
+
+        service._request = failing
+        self.assertEqual(service.handle_voice_command("device-1", "在吗")[0]["type"], "error")
 
 
 if __name__ == "__main__":

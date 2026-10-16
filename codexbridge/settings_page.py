@@ -121,6 +121,22 @@ SETTINGS_HTML = r'''<!doctype html>
     .panel-header p { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
     .panel-body { padding: 20px; }
     .device-list { display: grid; gap: 0; }
+    .budget-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .budget-input {
+      width: 120px;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.6);
+      color: inherit;
+      font: inherit;
+    }
     .device-card {
       min-width: 0;
       background: transparent;
@@ -721,6 +737,32 @@ SETTINGS_HTML = r'''<!doctype html>
         content.appendChild(grid);
       }
 
+      const budgetTitle = document.createElement("h4");
+      budgetTitle.className = "subsection-title";
+      budgetTitle.textContent = "返回文本量";
+      content.appendChild(budgetTitle);
+
+      const budgetRow = document.createElement("div");
+      budgetRow.className = "budget-row";
+      const budgetLabel = document.createElement("label");
+      budgetLabel.className = "check-row";
+      budgetLabel.setAttribute("for", `budget-${device.device_id}`);
+      budgetLabel.textContent = "每条正文最多字符数（留空表示不限，按设备声明）";
+      const budgetInput = document.createElement("input");
+      budgetInput.type = "number";
+      budgetInput.min = "16";
+      budgetInput.max = "100000";
+      budgetInput.step = "1";
+      budgetInput.id = `budget-${device.device_id}`;
+      budgetInput.className = "budget-input";
+      budgetInput.setAttribute("data-budget", "1");
+      const declared = device.max_text_chars;
+      budgetInput.value = typeof declared === "number" ? String(declared) : "";
+      budgetInput.placeholder = typeof declared === "number" ? String(declared) : "不限";
+      budgetRow.appendChild(budgetLabel);
+      budgetRow.appendChild(budgetInput);
+      content.appendChild(budgetRow);
+
       const actions = document.createElement("div");
       actions.className = "device-actions";
       const save = document.createElement("button");
@@ -780,14 +822,25 @@ SETTINGS_HTML = r'''<!doctype html>
 
     async function saveCapabilities(device, card, button) {
       const enabled = $$('input[type="checkbox"]', card).filter((input) => input.checked).map((input) => input.value);
+      const budgetInput = $('input[data-budget="1"]', card);
+      const rawBudget = budgetInput ? budgetInput.value.trim() : "";
+      const body = {device_id: device.device_id, enabled};
+      // Empty means unlimited; a value overrides the device-declared budget.
+      body.max_text_chars = rawBudget === "" ? null : Number(rawBudget);
       setBusy(button, true, "保存中...");
       try {
-        await requestJson("/api/admin/devices/capabilities", {
+        const result = await requestJson("/api/admin/devices/capabilities", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({device_id: device.device_id, enabled})
+          body: JSON.stringify(body)
         });
         device.enabled = enabled;
+        if (budgetInput && typeof result.max_text_chars !== "undefined") {
+          device.max_text_chars = result.max_text_chars;
+          budgetInput.placeholder = typeof result.max_text_chars === "number"
+            ? String(result.max_text_chars)
+            : "不限";
+        }
         button.textContent = "已保存";
         window.setTimeout(() => { button.textContent = "保存能力"; }, 1400);
       } catch (error) {

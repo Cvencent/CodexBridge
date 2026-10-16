@@ -306,12 +306,27 @@ class _RecognitionJob:
 class OpenAICompatibleSpeechRecognizer:
     engine = "openai-compatible"
 
+    # A live round-trip is the only way to know the endpoint really transcribes:
+    # a gateway can answer /models with 24 chat models and still 404 every audio
+    # request. The check is cached so the tray, settings page and every
+    # recognition never pay for it repeatedly.
+    PROBE_TTL_SECONDS = 300.0
+    PROBE_TIMEOUT_SECONDS = 10
+
     def __init__(self, config_loader=load_speech_config) -> None:
         self._config_loader = config_loader
         self.last_error = ""
+        self._probe: tuple[bool, str] | None = None
+        self._probe_at = 0.0
+        self._probe_lock = threading.Lock()
 
     def _config(self) -> dict:
         return _normalize_config(self._config_loader())
+
+    def invalidate_probe(self) -> None:
+        with self._probe_lock:
+            self._probe = None
+            self._probe_at = 0.0
 
     @property
     def recognition_timeout_seconds(self) -> float:
@@ -328,12 +343,14 @@ class OpenAICompatibleSpeechRecognizer:
             f" · {config['model']}",
         )
 
-    def _request(self, wav_path: Path):
+    def _request(self, wav_path: Path, timeout: float | None = None):
         config = self._config()
         endpoint = config["endpoint"]
         valid, reason = validate_speech_endpoint(endpoint)
         if not valid:
             raise RuntimeError(reason)
+        if timeout is not None:
+            config["timeout_seconds"] = timeout
         source_path = Path(wav_path)
         if not source_path.is_file():
             raise RuntimeError(f"录音文件不存在：{source_path}")
@@ -390,7 +407,7 @@ class OpenAICompatibleSpeechRecognizer:
                 wav_file.setframerate(16000)
                 wav_file.writeframes(b"\x00\x00" * 8000)
             try:
-                self._request(path)
+                self._request(path, timeout=self.PROBE_TIMEOUT_SECONDS)
             except Exception as error:  # noqa: BLE001 - report probe failure
                 detail = str(error)
                 if not (

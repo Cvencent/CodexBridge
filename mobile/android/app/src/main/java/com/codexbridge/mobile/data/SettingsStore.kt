@@ -67,8 +67,12 @@ class SettingsStore(context: Context) {
     val isPaired: Boolean
         get() = baseUrl.isNotBlank() && token.isNotBlank()
 
+    var notificationWatermark: Long
+        get() = prefs.getLong("notification_watermark", 0L)
+        set(value) = prefs.edit().putLong("notification_watermark", value).apply()
+
     fun clearPairing() {
-        val editor = prefs.edit().remove("token").remove("phone_id")
+        val editor = prefs.edit().remove("token").remove("phone_id").remove("notification_watermark")
         prefs.all.keys
             .filter { it.startsWith("completion_seen_") || it.startsWith("notified_") }
             .forEach(editor::remove)

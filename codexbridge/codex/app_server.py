@@ -7,12 +7,15 @@ import json
 import os
 import queue
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from codexbridge import VERSION
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
 TRANSIENT_REFRESH_FAILURE_LIMIT = 6
@@ -160,10 +163,15 @@ def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[s
 
 
 class AppServerClient:
-    def __init__(self, command: list[str], cwd: Path, timeout: float = 15.0) -> None:
+    def __init__(self, command: list[str], cwd: Path, timeout: float = 15.0,
+                 prefer_shared: bool = False) -> None:
         self.command = command
         self.cwd = cwd
         self.timeout = timeout
+        self.prefer_shared = prefer_shared
+        self.shared = False
+        self.transport = "unstarted"
+        self.transport_reason = "not_started"
         self.process: subprocess.Popen[str] | None = None
         self._next_id = 1
         self._request_lock = threading.Lock()
@@ -177,12 +185,35 @@ class AppServerClient:
         self.server_requests: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=200)
         self._closed = threading.Event()
 
+    @staticmethod
+    def _desktop_socket() -> Path | None:
+        root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        path = root / "app-server-control" / "app-server-control.sock"
+        if not path.exists() or not hasattr(socket, "AF_UNIX"):
+            return None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                probe.connect(str(path))
+            return path
+        except OSError:
+            return None
+
     def start(self) -> None:
         if self.process is not None:
             return
+        endpoint = self._desktop_socket() if self.prefer_shared else None
+        self.shared = endpoint is not None
+        self.transport = "proxy" if self.shared else "stdio"
+        self.transport_reason = ("shared_endpoint" if self.shared else ("shared_endpoint_unavailable" if self.prefer_shared else "not_requested"))
+        args = ([*self.command, "app-server", "proxy", "--sock", str(endpoint)]
+                if endpoint is not None else
+                [*self.command, "app-server", "--listen", "stdio://"])
+        if self.prefer_shared and not self.shared:
+            print("Codex 桌面共享连接不可用，使用独立 app-server；桌面实时同步暂不可用。")
         try:
             self.process = subprocess.Popen(
-                [*self.command, "app-server", "--listen", "stdio://"],
+                args,
                 cwd=self.cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -199,12 +230,23 @@ class AppServerClient:
         threading.Thread(target=self._read_stderr, name="codex-app-server-errors", daemon=True).start()
         self.request("initialize", {
             "clientInfo": {
-                "name": "codex_bridge",
+                # The desktop hydrates persisted tasks by client identity.
+                # Keep the public title as CodexBridge while using the
+                # interactive desktop protocol identity for rollout metadata.
+                "name": "Codex Desktop",
                 "title": "CodexBridge",
-                "version": "1.3.4",
+                "version": VERSION,
             }
         })
         self.notify("initialized", {})
+
+    def connection_status(self) -> dict[str, Any]:
+        return {
+            "desktop_realtime_shared": bool(self.shared),
+            "desktop_sync_mode": "shared" if self.shared else "polling",
+            "transport": self.transport,
+            "reason": self.transport_reason,
+        }
 
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
@@ -662,19 +704,32 @@ class CodexAppServerSource:
         self._account_refresh_failures = 0
         self._thread_refresh_failures = 0
         self._has_account_snapshot = False
+        self._chatgpt_account = False
         self._has_thread_snapshot = False
         self._unreadable_thread_ids: set[str] = set()
 
     def start(self) -> None:
         self.client.start()
+        # Task and thread state work under any account type (including an
+        # API-key login). Only quota and usage need a ChatGPT session, so a
+        # non-ChatGPT account degrades to task-only instead of aborting the
+        # whole collector.
+        self._chatgpt_account = self._probe_chatgpt_account()
+        if self._chatgpt_account:
+            self.refresh_account(force=True)
+            self._has_account_snapshot = True
+        else:
+            self.account = account_snapshot({}, {})
+
+    def _probe_chatgpt_account(self) -> bool:
         account = self.client.request("account/read", {"refreshToken": False})
         account_info = account.get("account") if isinstance(account, dict) else None
-        if not isinstance(account_info, dict) or account_info.get("type") != "chatgpt":
-            raise AppServerError("App Server 未登录 ChatGPT；请先在 Codex CLI 中登录同一账户")
-        self.refresh_account(force=True)
-        self._has_account_snapshot = True
+        return isinstance(account_info, dict) and account_info.get("type") == "chatgpt"
 
     def refresh_account(self, force: bool = False) -> None:
+        # Quota reads require a ChatGPT session; skip silently otherwise.
+        if not self._chatgpt_account:
+            return
         if not force and time.monotonic() - self.last_account_refresh < 60:
             return
         rate = self.client.request("account/rateLimits/read")
@@ -845,5 +900,4 @@ class CodexAppServerSource:
 
     def close(self) -> None:
         self.client.close()
-
 

@@ -17,6 +17,8 @@ from codexbridge.codex.app_server import AppServerError
 from codexbridge.companion.service import CompanionService
 from codexbridge.companion.store import DEFAULT_PORT, LEGACY_PORT, CompanionStore
 from codexbridge.ports import validate_companion_port
+from codexbridge.protocol.commands import CommandError
+from codexbridge.codex.desktop_ipc import DesktopIpcError
 
 MAX_BODY_BYTES = 64 * 1024
 SSE_HEARTBEAT_SECONDS = 15.0
@@ -278,16 +280,29 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/companion/events":
-            if self._authorize(query) is None:
+            device = self._authorize(query)
+            if device is None:
                 return
-            self._stream_events(query)
+            self._stream_events(query, device)
             return
-        if self._authorize(query) is None:
+        device = self._authorize(query)
+        if device is None:
+            return
+        required = ('status' if path == '/api/companion/status' else
+                    'tasks' if path not in {'/api/companion/protocol'} else None)
+        if required and required not in device.capabilities():
+            self._error(403, 'capability_not_enabled')
             return
         parts = [unquote(part) for part in path.strip("/").split("/") if part]
         try:
+            if path == '/api/companion/protocol':
+                self._send_json(200, {'ok': True, **self.app.service.commands.catalog()})
+                return
             if path == "/api/companion/status":
-                self._send_json(200, {"ok": True, **self.app.service.snapshot()})
+                result = self.app.service.snapshot()
+                if 'approval' not in device.capabilities():
+                    result['pending_approvals'] = []
+                self._send_json(200, {"ok": True, **result})
                 return
             if path == "/api/companion/threads":
                 limit = int((query.get("limit") or ["40"])[0])
@@ -307,6 +322,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[:3] == ["api", "companion", "threads"]:
                 detail = self.app.service.read_thread(parts[3])
+                if 'approval' not in device.capabilities():
+                    detail['pending_approvals'] = []
                 self._send_json(200, {"ok": True, **detail})
                 return
         except ValueError:
@@ -328,7 +345,13 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         if path == "/api/companion/pair":
             self._pair(query)
             return
-        if self._authorize(query) is None:
+        device = self._authorize(query)
+        if device is None:
+            return
+        required = ('control' if path.startswith('/api/companion/threads') else
+                    'approval' if path.startswith('/api/companion/approvals') else None)
+        if required and required not in device.capabilities():
+            self._error(403, 'capability_not_enabled')
             return
         try:
             payload = self._body()
@@ -336,6 +359,15 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             self._error(400, "invalid_body")
             return
         try:
+            if path == '/api/companion/capabilities':
+                enabled = self.app.store.negotiate(device.phone_id, payload.get('supported'))
+                self._send_json(200, {'ok': True, 'enabled': enabled})
+                return
+            if path == '/api/companion/commands':
+                result = self.app.service.commands.execute(
+                    device.phone_id, device.capabilities(), payload)
+                self._send_json(200, result)
+                return
             if path == "/api/companion/threads":
                 result = self.app.service.start_thread(
                     str(payload.get("cwd") or ""),
@@ -368,6 +400,13 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 resolved = self.app.service.resolve_approval(request_id, str(payload.get("decision") or ""))
                 self._send_json(200, {"ok": True, "resolved": resolved})
                 return
+        except CommandError as error:
+            code = str(error)
+            self._error(409 if code in {'request_id_conflict', 'outcome_unknown'} else 400, code)
+            return
+        except DesktopIpcError as error:
+            self._error(503, 'desktop_unavailable', str(error))
+            return
         except ValueError as error:
             self._error(400, str(error) or "invalid_request")
             return
@@ -431,16 +470,16 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             raise ValueError("json")
         return payload
 
-    def _stream_events(self, query: dict[str, list[str]]) -> None:
+    def _stream_events(self, query: dict[str, list[str]], device=None) -> None:
         thread_filter = (query.get("thread_id") or [""])[0]
-        target = self.app.service.subscribe()
+        after = self.headers.get('Last-Event-ID') or (query.get('after') or [''])[0]
+        target = self.app.service.subscribe(after)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        counter = 0
         deadline = time.monotonic() + SSE_MAX_SECONDS
         try:
             hello = {"type": "hello", "version": VERSION, "server_time": time.time()}
@@ -456,11 +495,20 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     continue
                 thread_id = str(payload.get("thread_id") or "")
+                if device is not None:
+                    current = self.app.store.authorize(self._token(query))
+                    if current is None or not self.app.store.enabled:
+                        break
+                    kind = payload.get('type', '')
+                    required = ('approval' if kind.startswith('approval_') else
+                                'status' if kind.startswith('turn_') or kind == 'resync_required' else 'tasks')
+                    if required not in current.capabilities():
+                        continue
                 if thread_filter and thread_id and thread_id != thread_filter:
                     continue
-                counter += 1
                 data = json.dumps(payload, ensure_ascii=False)
-                self.wfile.write(f"id: {counter}\ndata: {data}\n\n".encode("utf-8"))
+                event_id = payload.get('event_id', '')
+                self.wfile.write(f"id: {event_id}\ndata: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
             pass

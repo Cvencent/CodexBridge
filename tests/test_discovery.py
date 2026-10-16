@@ -5,6 +5,7 @@ import unittest
 from codexbridge.devices.discovery import (
     DISCOVERY_PORT,
     DISCOVERY_REQUEST,
+    _broadcast_targets,
     discover,
     parse_reply,
 )
@@ -30,6 +31,17 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_garbage_is_ignored(self):
         self.assertIsNone(parse_reply(b"not json", "10.0.0.7"))
+
+    def test_default_targets_include_subnet_broadcast(self):
+        # Some hosts (ESP-IDF lwIP) drop the limited 255.255.255.255 request,
+        # so discovery must also probe the interface subnet broadcast.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            targets = _broadcast_targets(probe)
+
+        self.assertIn("255.255.255.255", targets)
+        self.assertTrue(
+            any(target.endswith(".255") and target != "255.255.255.255" for target in targets)
+        )
 
     def test_loopback_round_trip(self):
         stop = threading.Event()

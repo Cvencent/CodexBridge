@@ -56,7 +56,10 @@ def _discovery_loop(
         except OSError:
             results = []
         manager.sync(results)
-        stop.wait(5.0)
+        # Devices sit on the network persistently, so re-scanning every few
+        # seconds only adds radio wake-ups. 15 s still reconnects after a
+        # device reboot well within the session timeout.
+        stop.wait(15.0)
 
 
 class _CodexState:
@@ -261,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     companion_store = CompanionStore(data_dir / "companion.json")
     companion_store.load()
     companion_service = CompanionService(data_dir, codex_cwd, codex_command)
+    hub.commands = companion_service.commands
     companion = CompanionApi(companion_service, companion_store, logger=print)
     companion_discovery = CompanionDiscovery(
         companion_store,
@@ -363,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     def poll_speech() -> None:
         while not stop.wait(0.25):
             hub.poll_speech()
+            hub.poll_events()
 
     speech_thread = threading.Thread(target=poll_speech, daemon=True)
     speech_thread.start()
@@ -386,6 +391,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         codex_stop.set()
         stop.set()
+        # Let queued Codex work finish before the sessions go away, otherwise a
+        # shutdown mid-request leaves devices with a half-delivered catalog.
+        hub.wait_idle(timeout=2.0)
         manager.stop()
         speech.close()
         companion_discovery.stop()

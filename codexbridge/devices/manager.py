@@ -7,8 +7,14 @@ from typing import Any
 
 from codexbridge.devices.discovery import DiscoveryResult
 from codexbridge.devices.registry import DeviceRegistry
+from codexbridge.protocol.capabilities import parse_max_text_chars
 from codexbridge.devices.session import DeviceSession
 from codexbridge.hub import BridgeHub
+
+# The host heartbeat is a liveness ping, not a status channel. Devices pull the
+# state they render (see ``codex_state_request``), so a slow beat keeps the
+# session warm without waking a battery-powered radio every few seconds.
+DEFAULT_HEARTBEAT_SECONDS = 15.0
 
 
 class DeviceManager:
@@ -18,7 +24,7 @@ class DeviceManager:
         hub: BridgeHub,
         *,
         session_factory: Any = DeviceSession,
-        heartbeat_seconds: float = 5.0,
+        heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
         timeout_seconds: float = 15.0,
     ):
         self.registry = registry
@@ -125,12 +131,18 @@ class DeviceManager:
         model = info.get("model")
         name = info.get("name")
         capabilities = info.get("capabilities")
+        # A device may declare how much body text it can render. Honour the
+        # declaration so one protocol serves an ESP32 and a desktop alike.
+        declared_budget = parse_max_text_chars(info.get("max_text_chars"))
         self.registry.upsert(
             device_id,
             model=model if isinstance(model, str) and model else record.model,
             name=name if isinstance(name, str) and name else record.name,
             supported=capabilities if isinstance(capabilities, list) else None,
         )
+        updated_record = self.registry.get(device_id)
+        if updated_record is not None and declared_budget is not None:
+            updated_record.max_text_chars = declared_budget
         updated = self.registry.get(device_id)
         updated.last_seen = time.time()
         self.registry.save()
@@ -142,7 +154,10 @@ class DeviceManager:
             record.last_seen = time.time()
             self.registry.save()
         self.hub.attach(device_id, session)
-        self.hub.replay_state(device_id)
+        # The attach-time replay primes the Codex catalog, which is a blocking
+        # RPC. On this thread it would also delay the session's own read loop,
+        # so hand it to the hub's per-device worker instead.
+        self.hub.replay_state_async(device_id)
 
     def _offline(self, device_id: str, session: Any) -> None:
         self.hub.detach(device_id)

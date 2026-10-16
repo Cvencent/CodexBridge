@@ -50,7 +50,10 @@ class MainActivity : ComponentActivity() {
 
     private fun openThreadFromIntent(intent: android.content.Intent?) {
         val threadId = intent?.getStringExtra(CompletionNotificationService.EXTRA_THREAD_ID).orEmpty()
-        if (threadId.isNotBlank()) viewModel.openThread(threadId)
+        if (threadId.isNotBlank()) {
+            viewModel.openThread(threadId)
+            CompletionNotificationService.restoreListening(this)
+        }
     }
 
     private fun requestNotificationPermission() {
@@ -112,9 +115,11 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 state = state,
                 onBack = viewModel::closeThread,
                 onSend = viewModel::send,
+                onConsumeRestoreInput = viewModel::consumeRestoreInput,
                 onStop = viewModel::stop,
                 onPickModel = { slug -> viewModel.selectModel(slug) },
                 onResolveApproval = viewModel::resolveApproval,
+                onRespondApproval = viewModel::respondApproval,
             )
             AppScreen.Settings -> SettingsScreen(
                 state = state,

@@ -75,7 +75,48 @@ def _truncate_utf8(text: str, limit: int) -> str:
     return "".join(kept) + TRUNCATION_SUFFIX
 
 
+TAIL_MARKER = "..."
+
+
+def clip_text(text: str, max_text_chars: int | None) -> str:
+    """Clip a body to a device-declared character budget.
+
+    ``None`` means the device accepts unlimited content, so the text is
+    returned unchanged. Otherwise the text is cut on a character boundary
+    and marked with an ellipsis so the device can show truncation.
+    """
+    if not isinstance(text, str):
+        return text
+    if max_text_chars is None:
+        return text
+    if max_text_chars <= 0:
+        return ""
+    if len(text) <= max_text_chars:
+        return text
+    keep = max_text_chars - len(TAIL_MARKER)
+    if keep <= 0:
+        return TAIL_MARKER[:max_text_chars]
+    return text[:keep] + TAIL_MARKER
+
+
 def wire_messages(message: dict[str, Any]) -> list[bytes]:
+    if message.get('type') in {'command_result', 'protocol_catalog', 'device_event'}:
+        try:
+            return [encode(message)]
+        except ValueError:
+            serialized = json.dumps(message, ensure_ascii=False, separators=(',', ':'))
+            limit = 240
+            while True:
+                chunks = split_text(serialized, limit)
+                try:
+                    return [encode({'type': 'command_chunk',
+                                    'request_id': message.get('request_id', ''),
+                                    'seq': index, 'total': len(chunks), 'data': chunk})
+                            for index, chunk in enumerate(chunks)]
+                except ValueError:
+                    if limit == 1:
+                        raise
+                    limit = max(1, limit // 2)
     if message.get("type") != "message":
         return [encode(message)]
 
@@ -88,9 +129,42 @@ def wire_messages(message: dict[str, Any]) -> list[bytes]:
     if not isinstance(body, str):
         raise TypeError("message body must be a string")
 
-    limit = TEXT_CHUNK_BYTES
+    # The line budget covers the whole encoded record, not just the body.
+    # Sequential metadata plus optional `data` can already fill most of the
+    # 768-byte line, so derive the chunk size from the real overhead.
+    overhead = len(
+        json.dumps(
+            {key: value for key, value in prepared.items() if key != "body"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    # Reserve room for the seq/total fields themselves.
+    available = int(MAX_LINE_BYTES) - 1 - overhead - 32
+    limit = min(TEXT_CHUNK_BYTES, available)
+    if limit < 1:
+        # Metadata alone cannot fit one line; drop optional context rather
+        # than losing the message entirely.
+        prepared.pop("data", None)
+        overhead = len(
+            json.dumps(
+                {key: value for key, value in prepared.items() if key != "body"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        available = int(MAX_LINE_BYTES) - 1 - overhead - 32
+        limit = min(TEXT_CHUNK_BYTES, available)
+    if limit < 1:
+        limit = 1
     while True:
-        chunks = split_text(body, limit)
+        try:
+            chunks = split_text(body, limit)
+        except ValueError:
+            # A single character cannot fit; fall back to one chunk so the
+            # device still receives a (possibly clipped) record.
+            chunks = [body[:1]]
+            break
         total = len(chunks)
         try:
             return [

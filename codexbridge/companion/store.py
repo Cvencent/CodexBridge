@@ -9,7 +9,7 @@ import json
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_PORT = 8791
@@ -20,6 +20,7 @@ PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
 PHONE_TOKEN_PREFIX = "cbp_"
 MAX_PHONES = 16
+PHONE_CAPABILITIES = {'status', 'tasks', 'control', 'approval'}
 
 
 def _hash_token(token: str) -> str:
@@ -42,6 +43,10 @@ class PhoneRecord:
     token_hash: str
     created_at: float
     last_seen: float = 0.0
+    enabled: set[str] = field(default_factory=lambda: set(PHONE_CAPABILITIES))
+
+    def capabilities(self) -> set[str]:
+        return self.enabled & PHONE_CAPABILITIES
 
     def public(self) -> dict:
         return {
@@ -49,6 +54,7 @@ class PhoneRecord:
             "name": self.name,
             "created_at": self.created_at,
             "last_seen": self.last_seen,
+            "enabled": sorted(self.capabilities()),
         }
 
 
@@ -170,12 +176,16 @@ class CompanionStore:
         name = value.get("name")
         created = value.get("created_at")
         last_seen = value.get("last_seen")
+        enabled = value.get('enabled', list(PHONE_CAPABILITIES))
+        if not isinstance(enabled, list) or any(not isinstance(item, str) for item in enabled):
+            enabled = []
         return PhoneRecord(
             phone_id=phone_id,
             name=name if isinstance(name, str) else "",
             token_hash=token_hash,
             created_at=float(created) if isinstance(created, (int, float)) else 0.0,
             last_seen=float(last_seen) if isinstance(last_seen, (int, float)) else 0.0,
+            enabled=set(enabled) & PHONE_CAPABILITIES,
         )
 
     def save(self) -> None:
@@ -194,6 +204,7 @@ class CompanionStore:
                         "token_hash": record.token_hash,
                         "created_at": record.created_at,
                         "last_seen": record.last_seen,
+                        "enabled": sorted(record.capabilities()),
                     }
                     for record in self.phones.values()
                 ],
@@ -214,6 +225,18 @@ class CompanionStore:
             return
 
     # -------------------------------------------------------------- settings
+    def negotiate(self, phone_id: str, supported: list[str]) -> list[str]:
+        if not isinstance(supported, list) or any(not isinstance(item, str) for item in supported):
+            raise ValueError('capabilities')
+        with self._lock:
+            self._reload_locked()
+            record = self.phones.get(phone_id)
+            if record is None:
+                raise ValueError('phone_id')
+            record.enabled = set(supported) & PHONE_CAPABILITIES
+            self.save()
+            return sorted(record.capabilities())
+
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._reload_locked()

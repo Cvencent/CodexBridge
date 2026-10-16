@@ -12,12 +12,12 @@
 
 ## 快速开始
 
-1. 电脑端启动包含伴侣接口的 CodexBridge（`1.3.11` 或更新版本，见 CodexBridge 仓库的 `release/CodexBridge-1.3.11-win64-portable.zip`）。
+1. 电脑端启动包含通用设备协议的 CodexBridge `1.4.0`。
 2. 打开电脑端的设置页 `http://127.0.0.1:8788/settings`，在“手机连接”里：
    - 打开“启用手机连接”；
    - 记录显示的局域网地址（形如 `192.168.x.x:8791`）；
    - 点击“生成配对码”，得到 6 位数字（10 分钟内有效，仅可使用一次）。
-3. 手机安装 APK（`release/CodexBridgeMobile-0.2.5-release.apk`），打开应用：
+3. 手机安装 APK（`release/CodexBridgeMobile-0.3.0-release.apk`），打开应用：
    - 确认“扫描端口”与电脑端“手机发现”端口一致（默认 `8766`），点“扫描”自动发现电脑；也可以手动填写电脑地址（如 `192.168.1.10:8791`，不带端口时默认补 `8791`）；
    - 输入 6 位配对码，点“连接电脑”。
 4. 连接成功后即可看到任务列表；点开任意任务可继续对话，右上角可切换模型。
@@ -31,6 +31,13 @@
 - 账号信息：套餐、5 小时与本周额度、token 用量
 - 设置：电脑地址、版本、手机 ID、扫描端口、深色主题、解除配对
 - 状态栏通知：电脑端任务完成后提醒，点击通知直接进入对应任务
+
+连接期间任务列表每 3 秒校准一次，SSE 中断后自动重连。完成提醒使用声音及震动
+通知通道，需要允许 Android 通知权限；系统勿扰、静音、通知通道设置和厂商后台
+限制仍可能阻止提醒。手机与电脑不在同一局域网、电脑休眠或 Bridge 关闭时，
+此局域网连接不能提供实时通知。
+Android 15 对 dataSync 前台服务有累计运行时限；长时间后台监听仍受系统限制，
+目前没有跨公网推送服务。服务重启后会按持久化同步水位补查完成任务。
 
 ## 构建
 
@@ -60,5 +67,6 @@ release/                     构建好的 APK
 ## 接口对照
 
 手机端仅使用 CodexBridge 伴侣接口（`/api/companion/*`）：`ping`、`pair`、`status`、`threads`、
-`threads/<id>`、`threads/<id>/messages`、`threads/<id>/interrupt`、`approvals/<id>`、`models`、
-`projects`、`events`（SSE）。协议细节见 CodexBridge 仓库的 `PROTOCOL.md` 第 17 节。
+`threads/<id>`、`models`、`projects`、`events`（SSE）。写操作统一经 `commands`，
+`protocol` 提供命令目录，`capabilities` 协商设备能力；ESP 可按能力接入相同命令。
+协议细节见 `docs/device-command-protocol.md`。

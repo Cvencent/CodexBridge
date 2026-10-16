@@ -84,6 +84,54 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.registry.get("d1").enabled, {"status"})
 
+    def test_capabilities_update_sets_text_budget(self):
+        body = json.dumps(
+            {"device_id": "d1", "enabled": ["status"], "max_text_chars": 200}
+        ).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/capabilities",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["max_text_chars"], 200)
+        self.assertEqual(self.registry.get("d1").max_text_chars, 200)
+
+    def test_text_budget_null_restores_unlimited(self):
+        self.registry.get("d1").max_text_chars = 200
+        body = json.dumps(
+            {"device_id": "d1", "enabled": ["status"], "max_text_chars": None}
+        ).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/capabilities",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload["max_text_chars"])
+
+    def test_omitted_text_budget_keeps_device_declaration(self):
+        self.registry.get("d1").max_text_chars = 512
+        body = json.dumps({"device_id": "d1", "enabled": ["status"]}).encode()
+        handle_request(
+            "POST",
+            "/api/admin/devices/capabilities",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(self.registry.get("d1").max_text_chars, 512)
+
     def test_remove_notifies_device_manager(self):
         removed = []
         body = json.dumps({"device_id": "d1"}).encode()

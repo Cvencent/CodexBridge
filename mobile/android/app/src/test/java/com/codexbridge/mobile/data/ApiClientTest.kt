@@ -6,6 +6,19 @@ import org.junit.Test
 
 class ApiClientTest {
     @Test
+    fun commandResultPreservesPayloadAndSuccess() {
+        assertEquals("{\"thread_id\":\"t1\",\"ok\":true}",
+            ApiClient.commandPayload("""{"ok":true,"result":{"thread_id":"t1"}}"""))
+    }
+
+    @Test
+    fun commandFailureDoesNotBecomeSuccess() {
+        assertThrows(ApiException::class.java) {
+            ApiClient.commandPayload("""{"ok":false,"error":"outcome_unknown"}""")
+        }
+    }
+
+    @Test
     fun addsSchemeAndDefaultPortForBareHost() {
         assertEquals("http://192.168.1.5:8791", ApiClient.normalizeBase("192.168.1.5"))
     }

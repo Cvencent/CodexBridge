@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from codexbridge import VERSION
 from codexbridge.companion.store import DEFAULT_PORT
 from codexbridge.devices.registry import DeviceRegistry
+from codexbridge.protocol.capabilities import parse_max_text_chars
 from codexbridge.hub import BridgeHub
 from codexbridge.settings_page import SETTINGS_HTML
 from codexbridge.speech_source import (
@@ -192,12 +193,19 @@ def handle_request(
             if not isinstance(enabled, list):
                 return 400, {"ok": False, "error": "enabled_required"}
             registry.set_enabled(device_id, enabled)
+            # Optional per-device override of the declared text budget.
+            # Omitted means "keep the device declaration"; null restores
+            # unlimited. This is one protocol field, not a per-device branch.
+            if "max_text_chars" in payload:
+                budget = parse_max_text_chars(payload.get("max_text_chars"))
+                registry.get(device_id).max_text_chars = budget
             registry.save()
             hub.push_capabilities(device_id)
             return 200, {
                 "ok": True,
                 "device_id": device_id,
                 "enabled": sorted(registry.get(device_id).enabled),
+                "max_text_chars": registry.get(device_id).max_text_chars,
             }
     except KeyError:
         return 404, {"ok": False, "error": "device_not_found"}
@@ -253,6 +261,7 @@ def _public_device(record, online: bool = False) -> dict:
         "enabled": sorted(record.enabled),
         "last_seen": record.last_seen,
         "online": online,
+        "max_text_chars": record.max_text_chars,
     }
 
 

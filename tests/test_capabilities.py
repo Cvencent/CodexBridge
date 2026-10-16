@@ -13,8 +13,13 @@ class CapabilityTest(unittest.TestCase):
     def test_unknown_model_gets_minimal(self):
         self.assertEqual(default_for("unknown-model"), set(MINIMAL))
 
-    def test_ai_passport_default_is_minimal(self):
-        self.assertEqual(default_for("FoloOS-AI-Passport"), set(MINIMAL))
+    def test_ai_passport_default_covers_its_screen_and_mic(self):
+        # The passport records voice and renders task lists/results, so those
+        # must be on by default; an ESP32 still only claims MINIMAL extras.
+        self.assertEqual(
+            default_for("FoloOS-AI-Passport"),
+            set(MINIMAL) | {"tasks", "results", "audio", "voice", "approval"},
+        )
 
     def test_quota_is_known_and_dotii_default(self):
         self.assertEqual(normalize(["quota", "nope"]), {"quota"})

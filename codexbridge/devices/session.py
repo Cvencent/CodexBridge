@@ -22,9 +22,10 @@ class DeviceSession:
         on_device_info: Callable[[dict], Iterable[str]] | None = None,
         on_online: Callable[[], None] | None = None,
         on_offline: Callable[[], None] | None = None,
-        heartbeat_seconds: float = 5.0,
+        heartbeat_seconds: float = 15.0,
         timeout_seconds: float = 15.0,
     ):
+
         if len(token) < 16:
             raise ValueError("token must be at least 16 characters")
         if not device_id:

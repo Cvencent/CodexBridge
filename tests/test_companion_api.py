@@ -17,6 +17,44 @@ from tests.test_companion_service import FakeClient, thread_detail, thread_row
 
 
 class CompanionApiTests(unittest.TestCase):
+    def test_sse_does_not_keep_old_capabilities_after_negotiation(self):
+        code = self.store.pairing_code()['code']
+        _, paired = self.request('POST', '/api/companion/pair', {'code': code})
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+        connection.request('GET', '/api/companion/events', headers={'Authorization': 'Bearer ' + paired['token']})
+        response = connection.getresponse()
+        while response.fp.readline().strip():
+            pass
+        self.store.negotiate(paired['phone_id'], ['status'])
+        self.service.publish({'type': 'approval_request', 'command': 'secret'})
+        self.service.publish({'type': 'turn_completed', 'turn_id': 'done'})
+        response.fp.readline()
+        payload = json.loads(response.fp.readline().decode()[6:])
+        connection.close()
+        self.assertEqual(payload['type'], 'turn_completed')
+
+    def test_negotiated_read_only_phone_cannot_use_legacy_write(self):
+        code = self.store.pairing_code()['code']
+        _, paired = self.request('POST', '/api/companion/pair', {'code': code})
+        token = paired['token']
+        status, _ = self.request('POST', '/api/companion/capabilities', {'supported': ['status', 'tasks']}, token=token)
+        self.assertEqual(status, 200)
+        status, result = self.request('POST', '/api/companion/threads/t1/messages', {'text': 'hi'}, token=token)
+        self.assertEqual(status, 403)
+        self.assertEqual(result['error'], 'capability_not_enabled')
+
+    def test_desktop_disconnect_returns_structured_error(self):
+        from unittest.mock import patch
+        from codexbridge.codex.desktop_ipc import DesktopIpcError
+        code = self.store.pairing_code()['code']
+        _, paired = self.request('POST', '/api/companion/pair', {'code': code})
+        with patch.object(self.service, 'start_turn', side_effect=DesktopIpcError('disconnected')):
+            status, result = self.request('POST', '/api/companion/commands', {
+                'request_id': 'desktop-error', 'method': 'turn.start',
+                'params': {'thread_id': 't1', 'text': 'hi'}}, token=paired['token'])
+        self.assertEqual(status, 503)
+        self.assertEqual(result['error'], 'desktop_unavailable')
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.client = FakeClient()
@@ -67,6 +105,21 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["service"], "codexbridge-companion")
+
+    def test_general_command_api_and_deduplicated_control(self):
+        code = self.store.pairing_code()['code']
+        _, paired = self.request('POST', '/api/companion/pair', {'code': code})
+        token = paired['token']
+        status, catalog = self.request('GET', '/api/companion/protocol', token=token)
+        self.assertEqual(status, 200)
+        self.assertIn('turn.start', [row['method'] for row in catalog['methods']])
+        request = {'request_id': 'mobile-1', 'method': 'turn.start',
+                   'params': {'thread_id': 't1', 'text': 'continue'}}
+        status, first = self.request('POST', '/api/companion/commands', request, token=token)
+        self.assertEqual(status, 200, first)
+        _, second = self.request('POST', '/api/companion/commands', request, token=token)
+        self.assertEqual(first, second)
+        self.assertEqual(sum(method == 'turn/start' for method, _ in self.client.requests), 1)
 
     def test_status_requires_token(self) -> None:
         status, payload = self.request("GET", "/api/companion/status")

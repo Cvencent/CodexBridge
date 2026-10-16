@@ -1,14 +1,20 @@
 package com.codexbridge.mobile.data
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -92,6 +98,21 @@ class ApiClient(
             ),
         )
 
+    private suspend fun command(method: String, params: JsonObject): String {
+        val requestId = java.util.UUID.randomUUID().toString()
+        return commandPayload(postText("/api/companion/commands", buildJsonObject {
+            put("request_id", requestId)
+            put("method", method)
+            put("params", params)
+        }))
+    }
+
+    suspend fun negotiateCapabilities() {
+        postText("/api/companion/capabilities", buildJsonObject {
+            put("supported", JsonArray(listOf("status", "tasks", "control", "approval").map { JsonPrimitive(it) }))
+        })
+    }
+
     suspend fun ping(): PingResponse =
         json.decodeFromString(PingResponse.serializer(), getText("/api/companion/ping"))
 
@@ -124,8 +145,8 @@ class ApiClient(
     suspend fun createThread(cwd: String, model: String): CreateThreadResponse =
         json.decodeFromString(
             CreateThreadResponse.serializer(),
-            postText(
-                "/api/companion/threads",
+            command(
+                "thread.start",
                 buildJsonObject {
                     put("cwd", cwd)
                     put("model", model)
@@ -142,13 +163,15 @@ class ApiClient(
     ): SendResponse =
         json.decodeFromString(
             SendResponse.serializer(),
-            postText(
-                "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/messages",
+            command(
+                if (steer) "turn.steer" else "turn.start",
                 buildJsonObject {
+                    put("thread_id", threadId)
                     put("text", text)
-                    put("model", model)
-                    put("effort", effort)
-                    put("mode", if (steer) "steer" else "start")
+                    if (!steer) {
+                        put("model", model)
+                        put("effort", effort)
+                    }
                 },
             ),
         )
@@ -156,22 +179,40 @@ class ApiClient(
     suspend fun interrupt(threadId: String, turnId: String = ""): SendResponse =
         json.decodeFromString(
             SendResponse.serializer(),
-            postText(
-                "/api/companion/threads/" + java.net.URLEncoder.encode(threadId, "UTF-8") + "/interrupt",
-                buildJsonObject { put("turn_id", turnId) },
+            command(
+                "turn.interrupt",
+                buildJsonObject { put("thread_id", threadId); put("turn_id", turnId) },
             ),
         )
 
     suspend fun resolveApproval(requestId: Int, decision: String): ActionResponse =
         json.decodeFromString(
             ActionResponse.serializer(),
-            postText(
-                "/api/companion/approvals/$requestId",
-                buildJsonObject { put("decision", decision) },
+            command(
+                "approval.resolve",
+                buildJsonObject { put("approval_id", requestId); put("decision", decision) },
             ),
         )
 
-    fun events(threadId: String? = null): Flow<StreamEvent> = callbackFlow {
+    suspend fun respondApproval(requestId: Int, response: JsonObject): ActionResponse =
+        json.decodeFromString(ActionResponse.serializer(), command("approval.respond", buildJsonObject {
+            put("approval_id", requestId)
+            put("response", response)
+        }))
+
+    fun events(threadId: String? = null): Flow<StreamEvent> = kotlinx.coroutines.flow.flow {
+        var cursor: String? = null
+        while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+            eventConnection(threadId, cursor) { cursor = it }.collect { emit(it) }
+            kotlinx.coroutines.delay(3000)
+        }
+    }
+
+    private fun eventConnection(
+        threadId: String?,
+        cursor: String?,
+        onCursor: (String) -> Unit,
+    ): Flow<StreamEvent> = callbackFlow {
         val path = buildString {
             append("/api/companion/events")
             if (!threadId.isNullOrBlank()) {
@@ -182,6 +223,7 @@ class ApiClient(
         val request = Request.Builder()
             .url(url(path))
             .header("Accept", "text/event-stream")
+            .apply { if (!cursor.isNullOrBlank()) header("Last-Event-ID", cursor) }
             .apply { if (!token.isNullOrBlank()) header("Authorization", "Bearer $token") }
             .build()
         val listener = object : EventSourceListener() {
@@ -189,7 +231,12 @@ class ApiClient(
                 if (data.isBlank()) return
                 val parsed = runCatching { json.decodeFromString(StreamEvent.serializer(), data) }.getOrNull()
                 if (parsed != null) {
-                    trySend(parsed)
+                    if (trySend(parsed).isSuccess) {
+                        if (!id.isNullOrBlank()) onCursor(id)
+                    } else {
+                        eventSource.cancel()
+                        close()
+                    }
                 }
             }
 
@@ -207,6 +254,17 @@ class ApiClient(
     }
 
     companion object {
+        internal fun commandPayload(text: String): String {
+            val envelope = Json.parseToJsonElement(text).jsonObject
+            if (envelope["ok"]?.jsonPrimitive?.booleanOrNull != true) {
+                val code = envelope["error"]?.jsonPrimitive?.content ?: "invalid_command_result"
+                throw ApiException("请求未确认（$code）", code)
+            }
+            val result = envelope["result"] as? JsonObject
+                ?: throw ApiException("无效的命令响应", "invalid_command_result")
+            return JsonObject(result + ("ok" to kotlinx.serialization.json.JsonPrimitive(true))).toString()
+        }
+
         const val DEFAULT_PORT = 8791
         const val DEFAULT_DISCOVERY_PORT = 8766
         private const val LEGACY_DEFAULT_PORT = 8790
