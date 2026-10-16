@@ -68,6 +68,22 @@ class ReadStateStoreTests(unittest.TestCase):
         self.assertTrue(store.is_message_read("result:thread-1:2000"))
         self.assertEqual(events, [])
 
+    def test_same_bound_listener_is_registered_only_once(self) -> None:
+        store = ReadStateStore(None)
+        events = []
+
+        class Sink:
+            def handle(self, event) -> None:
+                events.append(event)
+
+        sink = Sink()
+        store.add_listener(sink.handle)
+        store.add_listener(sink.handle)
+
+        store.mark_message("result:thread-1:2000", source="phone")
+
+        self.assertEqual(1, len(events))
+
 
 if __name__ == "__main__":
     unittest.main()

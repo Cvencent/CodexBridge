@@ -341,8 +341,13 @@ class HubTest(unittest.TestCase):
             MessageRecord("result:t3:2", "t3", "result", "failed", "结果", "正文", 2.0)
         )
         self.hub.handle_device_event("d1", {"type": "codex_state_request", "request_id": 7})
+        counters = [
+            message
+            for message in self.s1.sent
+            if message.get("type") == "codex_state"
+        ]
         self.assertEqual(
-            self.s1.sent[-1],
+            counters[-1],
             {
                 "type": "codex_state",
                 "running": 1,
@@ -353,6 +358,14 @@ class HubTest(unittest.TestCase):
                 "request_id": 7,
             },
         )
+        snapshots = [
+            message
+            for message in self.s1.sent
+            if message.get("type") == "codex_status_snapshot"
+        ]
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual("t1", snapshots[0]["thread_id"])
+        self.assertEqual(7, snapshots[0]["request_id"])
 
     def test_new_terminal_result_pushes_fresh_codex_state_to_status_devices(self):
         for session in (self.s1, self.s2, self.s3, self.s4):

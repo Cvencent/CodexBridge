@@ -12,6 +12,7 @@ from codexbridge.messages_store import (
     KIND_CAPABILITY,
     MessageRecord,
     MessageStore,
+    is_fresh,
     is_in_flight,
 )
 from codexbridge.protocol.capabilities import effective
@@ -139,16 +140,23 @@ class BridgeHub:
 
         ``completed_unread`` and ``failed_unread`` are the canonical fields for
         new clients.  ``done`` and ``failed`` remain as compatibility aliases
-        with the same unread-only meaning.
+        with the same unread-only meaning. Only records the collector is still
+        refreshing count as running, so a stopped collector cannot leave the
+        badge lit forever.
         """
         running = 0
         completed_unread = 0
         failed_unread = 0
+        now = time.time()
         with self._lock:
             records = self.store.records()
         for record in records:
             if record.kind == "task":
-                if record.status in {"working", "waiting_user", "queued"}:
+                if (
+                    record.status in {"working", "waiting_user", "queued"}
+                    and is_in_flight(record)
+                    and is_fresh(record, now)
+                ):
                     running += 1
                 continue
             if record.kind != "result" or not self._record_is_unread(record):
@@ -558,7 +566,7 @@ class BridgeHub:
                     # Live state is not a notification anyone can consume: the
                     # phone reading "task is working" must not stop a device
                     # that reconnects later from learning the task is alive.
-                    is_in_flight(record)
+                    (is_in_flight(record) and is_fresh(record))
                     or not self.read_state.is_message_read(record.message_id)
                 )
                 and not (
