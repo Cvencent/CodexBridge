@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from codexbridge import VERSION
+from codexbridge.console import emit
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
 # A turn that stopped updating this long ago is over, not still running.
@@ -212,7 +213,7 @@ class AppServerClient:
                 if endpoint is not None else
                 [*self.command, "app-server", "--listen", "stdio://"])
         if self.prefer_shared and not self.shared:
-            print("Codex 桌面共享连接不可用，使用独立 app-server；桌面实时同步暂不可用。")
+            emit("Codex 桌面共享连接不可用，使用独立 app-server；桌面实时同步暂不可用。")
         try:
             self.process = subprocess.Popen(
                 args,
@@ -278,7 +279,7 @@ class AppServerClient:
         for line in self.process.stderr:
             cleaned = line.strip()
             if cleaned:
-                print(f"[App Server] {cleaned}")
+                emit(f"[App Server] {cleaned}")
 
     def _send(self, message: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None or self.process.poll() is not None:
@@ -847,7 +848,7 @@ class CodexAppServerSource:
                 unreadable += 1
                 thread_id = str(selected.get("id") or "")
                 if thread_id not in unreadable_ids:
-                    print(f"Codex 任务读取失败，已跳过该任务：{error}")
+                    emit(f"Codex 任务读取失败，已跳过该任务：{error}")
                 unreadable_ids.add(thread_id)
                 continue
             thread = detail.get("thread") if isinstance(detail, dict) else None
@@ -888,7 +889,7 @@ class CodexAppServerSource:
         elif unreadable:
             # Do not erase the last valid task view when every selected
             # historical thread is temporarily unreadable.
-            print("Codex 没有可读取的任务，保留上一次成功的任务快照")
+            emit("Codex 没有可读取的任务，保留上一次成功的任务快照")
 
     @staticmethod
     def _is_active_hint(item: Any) -> bool:
@@ -954,7 +955,7 @@ class CodexAppServerSource:
                 if (not bool(getattr(self, cache_name, False)) or
                         failures >= TRANSIENT_REFRESH_FAILURE_LIMIT):
                     raise
-                print(f"Codex {label}暂时无法刷新，继续使用上次成功数据：{error}")
+                emit(f"Codex {label}暂时无法刷新，继续使用上次成功数据：{error}")
         return {
             "generated_at_epoch": int(time.time()),
             "account": self.account,

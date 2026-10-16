@@ -103,6 +103,11 @@ class DeviceManagerTest(unittest.TestCase):
         )
         self.assertEqual(self.registry.get("d1").name, "Desk")
         self.assertIs(self.hub._sessions["d1"], FakeSession.created)
+        # The attach-time replay runs on the hub worker, so wait for it to land
+        # instead of assuming it beat the discovery thread.
+        deadline = time.time() + 2.0
+        while not FakeSession.created.sent and time.time() < deadline:
+            time.sleep(0.01)
         self.assertEqual(FakeSession.created.sent[0]["type"], "message")
         self.assertEqual(FakeSession.created.sent[0]["message_id"], "m1")
 

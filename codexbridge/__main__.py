@@ -23,6 +23,7 @@ from codexbridge.companion import (
     CompanionService,
     CompanionStore,
 )
+from codexbridge.console import emit
 from codexbridge.ports import (
     ADMIN_PORT,
     build_port_statuses,
@@ -345,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
             companion_discovery.start()
             print(f"CodexBridge companion API: {companion.url}", flush=True)
         except Exception as error:  # noqa: BLE001
-            print(f"CodexBridge companion API 启动失败：{error}", flush=True)
+            emit(f"CodexBridge companion API 启动失败：{error}", flush=True)
     stop = threading.Event()
     codex_stop = threading.Event()
     codex_thread = threading.Thread(
