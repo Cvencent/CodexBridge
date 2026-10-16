@@ -8,9 +8,14 @@ import uuid
 from typing import Any
 
 from codexbridge.devices.registry import DeviceRegistry
-from codexbridge.messages_store import KIND_CAPABILITY, MessageRecord, MessageStore
+from codexbridge.messages_store import (
+    KIND_CAPABILITY,
+    MessageRecord,
+    MessageStore,
+    is_in_flight,
+)
 from codexbridge.protocol.capabilities import effective
-from codexbridge.protocol.messages import clip_text, decode, wire_messages
+from codexbridge.protocol.messages import clip_text, clip_utf8, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
 
@@ -63,6 +68,12 @@ BLOCKING_DEVICE_EVENTS = frozenset(
 # in-flight multi-part command is cheap until its last part arrives, and counting
 # every part against this limit would reject legitimate requests.
 WORKER_QUEUE_LIMIT = 24
+
+# Byte ceilings for one flat `codex_status_snapshot` line. Together they leave
+# comfortable room inside MAX_LINE_BYTES for the field names themselves.
+SNAPSHOT_ID_BYTES = 64
+SNAPSHOT_STATUS_BYTES = 24
+SNAPSHOT_ACTION_BYTES = 240
 
 # Device events whose answer comes from the Codex catalog service. Their
 # "no catalog service" error is cheap enough to return synchronously.
@@ -160,6 +171,11 @@ class BridgeHub:
         if "request_id" in event:
             payload["request_id"] = request_id
         self._send(device_id, payload)
+        snapshot = self._status_snapshot(device_id)
+        if snapshot is not None and "request_id" in event:
+            snapshot["request_id"] = request_id
+        if snapshot is not None:
+            self._send(device_id, snapshot)
 
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
@@ -538,11 +554,20 @@ class BridgeHub:
             pending = [
                 record
                 for record in self.store.pending_for(device_id, capabilities)
-                if not self.read_state.is_message_read(record.message_id)
+                if (
+                    # Live state is not a notification anyone can consume: the
+                    # phone reading "task is working" must not stop a device
+                    # that reconnects later from learning the task is alive.
+                    is_in_flight(record)
+                    or not self.read_state.is_message_read(record.message_id)
+                )
                 and not (
-                    record.thread_id
+                    not is_in_flight(record)
+                    and record.thread_id
                     and record.created_at > 0
-                    and self.read_state.is_thread_read(record.thread_id, int(record.created_at))
+                    and self.read_state.is_thread_read(
+                        record.thread_id, int(record.created_at)
+                    )
                 )
             ]
             visible = self.store.pending_for(
@@ -757,6 +782,50 @@ class BridgeHub:
             session = self._sessions.get(device_id)
         if session is not None:
             self._send_to(session, self._apply_budget(message, self.budget_for(device_id)))
+
+    def _status_snapshot(self, device_id: str) -> dict | None:
+        """One bounded line describing what Codex is doing right now.
+
+        A device whose screen stopped making progress pulls this instead of
+        waiting for a push that content dedupe will never send. The payload is
+        a single flat record -- thread id, status, current action, turn id and
+        plan counters -- clipped to the device's declared text budget, so the
+        same call works for an ESP32 and for a desktop client.
+        """
+        with self._lock:
+            live = self.store.live_status()
+        if live is None:
+            return None
+        task = live.data.get("task") if isinstance(live.data, dict) else None
+        task = task if isinstance(task, dict) else {}
+        # The device owns the character budget; SNAPSHOT_*_BYTES are the room a
+        # single flat record has left inside the 768-byte line. Nothing here is
+        # specific to a model of hardware.
+        budget = self.budget_for(device_id)
+
+        def number(value: Any) -> int:
+            try:
+                return max(0, min(1_000_000, int(value)))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "type": "codex_status_snapshot",
+            "thread_id": clip_utf8(str(live.thread_id or ""),
+                                   max_bytes=SNAPSHOT_ID_BYTES),
+            "status": clip_utf8(str(live.status or ""),
+                                max_bytes=SNAPSHOT_STATUS_BYTES),
+            "current_action": clip_utf8(
+                str(task.get("current_action") or live.body or ""),
+                max_chars=budget,
+                max_bytes=SNAPSHOT_ACTION_BYTES,
+            ),
+            "turn_id": clip_utf8(str(task.get("turn_id") or ""),
+                                 max_bytes=SNAPSHOT_ID_BYTES),
+            "plan_completed": number(task.get("plan_completed")),
+            "plan_total": number(task.get("plan_total")),
+            "created_at": int(live.created_at or 0),
+        }
 
     def budget_for(self, device_id: str) -> int | None:
         with self._lock:

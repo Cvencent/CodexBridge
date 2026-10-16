@@ -225,6 +225,21 @@ class DeviceRegistry:
         with self._lock:
             return self._devices.pop(device_id, None) is not None
 
+    def set_max_text_chars(self, device_id: str, max_text_chars: int | None) -> int | None:
+        """Persist the per-device body budget.
+
+        The device declares its own budget at handshake; this is the local
+        override. ``None`` means unlimited, and the value is normalised the same
+        way the handshake value is so both paths agree.
+        """
+        with self._lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                raise KeyError(device_id)
+            record.max_text_chars = parse_max_text_chars(max_text_chars)
+            self.save()
+            return record.max_text_chars
+
     def set_enabled(self, device_id: str, enabled: Iterable[str]) -> None:
         with self._lock:
             record = self._devices.get(device_id)

@@ -606,6 +606,37 @@ CodexBridge 应答：
 设备上线时 CodexBridge 额外主动下发一次快照，避免刚重连时界面空白。
 未授权事件返回 `capability_not_enabled`。
 
+同一个请求还带回应前一条 `codex_status_snapshot`，描述 Codex 此刻正在做什么：
+
+```json
+{
+  "type": "codex_status_snapshot",
+  "thread_id": "01a1...",
+  "status": "working",
+  "current_action": "Running tests",
+  "turn_id": "t-1",
+  "plan_completed": 1,
+  "plan_total": 4,
+  "created_at": 1770000000,
+  "request_id": 7
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `thread_id` | string | 当前线程，最长 64 字节 |
+| `status` | string | `working`、`waiting_user`、`queued`、`starting` 之一 |
+| `current_action` | string | 当前动作；长度按第 7.4 节的设备正文预算裁剪 |
+| `turn_id` | string | 当前轮次，最长 40 字节；设备可用它判断"有没有新进展" |
+| `plan_completed` / `plan_total` | integer | 计划进度，缺省为 `0` |
+| `created_at` | integer | 该状态记录的 Unix 秒 |
+| `request_id` | 与请求同 | 仅当请求携带时回显 |
+
+这条记录只在存在进行中状态时发送；没有进行中任务时只回 `codex_state`。
+设备应在界面卡住没有新消息时用它做低频自检：正文推送按内容指纹去重，
+同一句进展不会重发，因此设备必须能够主动询问，否则界面会一直停在旧状态。
+设备侧的处理规则与 `kind == "status"` 的 `message` 完全一致，不需要新代码分支。
+
 ### 9.8 能力对应表
 
 | 事件 | 所需能力 |
@@ -691,6 +722,23 @@ CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发�
 记录的 `read_state`。任一设备上报 `read_ack` 后，CodexBridge 同时更新全局已读标记，
 因此其他在线设备会收到 `read_state`，稍后重连的设备也不会再收到该消息。这保证同一
 消息在多台设备之间保持一致，不依赖设备本地缓存。
+
+### 11.4 跨客户端已读（手机与设备互相同步）
+
+手机伴侣与设备会话共用同一个已读存储，因此一次"打开"会让所有客户端同时撤回提醒：
+
+- 设备上报 `read_ack`：其他在线设备收到 `read_state`，手机侧对应线程收到
+  `thread_status` 的 `idle` 事件，完成提醒随之撤回。
+- 手机读取线程（`POST /api/companion/threads/<id>/read` 或打开线程详情）：
+  该线程下所有设备可见的消息按 `message_id` 补记已读，在线设备立刻收到
+  `read_state`，重连的设备也不再重放这些消息。
+
+进行中的状态（`kind` 为 `status` 或 `task`，`status` 为 `working`、
+`waiting_user`、`queued`、`starting`）不属于"已消费的通知"：即使手机已经读过，
+它仍然会重放给新连接的设备，也仍然能被 `codex_state_request` 拉到。否则设备会
+因为别人读过而再也看不到"任务还在跑"。
+
+已读广播只发给声明 `read_ack` 能力的设备；上报者自己不会收到自己造成的广播。
 
 ## 12. 错误与边界
 

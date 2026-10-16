@@ -99,6 +99,36 @@ def clip_text(text: str, max_text_chars: int | None) -> str:
     return text[:keep] + TAIL_MARKER
 
 
+def clip_utf8(text: str, max_chars: int | None = None,
+              max_bytes: int | None = None) -> str:
+    """Cut text on a character boundary, first by count then by encoded size.
+
+    A device declares how many characters it can render (``max_text_chars``);
+    the host additionally has to stay inside one wire line. Applying both, in
+    that order, keeps a bounded field generic: no per-device number lives here.
+    """
+    if not isinstance(text, str):
+        return ""
+    result = clip_text(text, max_chars) if max_chars else text
+    if max_bytes is None:
+        return result
+    if len(result.encode("utf-8")) <= max_bytes:
+        return result
+    suffix_bytes = len(TRUNCATION_SUFFIX.encode("utf-8"))
+    if max_bytes < suffix_bytes:
+        return ""
+    budget = max_bytes - suffix_bytes
+    kept: list[str] = []
+    size = 0
+    for character in result:
+        character_size = len(character.encode("utf-8"))
+        if size + character_size > budget:
+            break
+        kept.append(character)
+        size += character_size
+    return "".join(kept) + TRUNCATION_SUFFIX
+
+
 def wire_messages(message: dict[str, Any]) -> list[bytes]:
     if message.get('type') in {'command_result', 'protocol_catalog', 'device_event'}:
         try:
