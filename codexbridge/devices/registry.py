@@ -5,12 +5,19 @@ import os
 import secrets
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from codexbridge.protocol.capabilities import MINIMAL, default_for, normalize
+from codexbridge.protocol.capabilities import (
+    MINIMAL,
+    UNLIMITED,
+    default_for,
+    normalize,
+    parse_max_text_chars,
+)
 
 TOKEN_BYTES = 24
 
@@ -24,6 +31,13 @@ class DeviceRecord:
     supported: set[str] = field(default_factory=set)
     enabled: set[str] = field(default_factory=set)
     last_seen: float | None = None
+    # None means the device accepts unlimited text; set by the device's own
+    # handshake or by the local per-device override.
+    max_text_chars: int | None = UNLIMITED
+    # True once the local user has toggled capabilities by hand. Until then
+    # the enabled set is derived from the model defaults, so a firmware that
+    # grows new capabilities starts using them without a manual re-enable.
+    customized: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +48,8 @@ class DeviceRecord:
             "supported": sorted(self.supported),
             "enabled": sorted(self.enabled),
             "last_seen": self.last_seen,
+            "max_text_chars": self.max_text_chars,
+            "customized": self.customized,
         }
 
     @classmethod
@@ -48,6 +64,7 @@ class DeviceRecord:
             else None
         )
         supported = normalize(value.get("supported") or [])
+        max_text_chars = parse_max_text_chars(value.get("max_text_chars"))
         return cls(
             device_id=str(value.get("device_id") or device_id),
             model=model,
@@ -60,7 +77,28 @@ class DeviceRecord:
                 else default_for(model) & (supported | set(MINIMAL))
             ),
             last_seen=last_seen,
+            max_text_chars=max_text_chars,
+            customized=bool(value.get("customized", False)),
         )
+
+
+_REPLACE_ATTEMPTS = 8
+
+
+def _replace_with_retry(source: str, destination: Path) -> None:
+    """Atomically replace a file, tolerating transient Windows denials.
+
+    Windows can answer os.replace with WinError 5 while an indexer or virus
+    scanner briefly holds either path, so retry instead of failing the save.
+    """
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
 
 
 class DeviceRegistry:
@@ -120,7 +158,7 @@ class DeviceRegistry:
                     json.dump(payload, temporary, ensure_ascii=False, separators=(",", ":"))
                     temporary.flush()
                     os.fsync(temporary.fileno())
-                os.replace(temporary_name, self.path)
+                _replace_with_retry(temporary_name, self.path)
             finally:
                 if temporary_name and os.path.exists(temporary_name):
                     os.unlink(temporary_name)
@@ -166,6 +204,13 @@ class DeviceRegistry:
                 record.token = token
             if supported is not None:
                 record.supported = normalize(supported)
+                if not record.customized:
+                    # Re-derive from the (possibly upgraded) declaration. A
+                    # device that starts advertising `audio` should not need a
+                    # host-side checkbox change to begin using it.
+                    record.enabled = default_for(record.model) & (
+                        record.supported | set(MINIMAL)
+                    )
             if (
                 previous_model == "unknown"
                 and model != "unknown"
@@ -186,6 +231,7 @@ class DeviceRegistry:
             if record is None:
                 raise KeyError(device_id)
             record.enabled = normalize(enabled)
+            record.customized = True
 
     def mint_token(self, device_id: str) -> str:
         with self._lock:

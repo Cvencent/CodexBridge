@@ -1,8 +1,10 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from codexbridge.devices.registry import DeviceRegistry
 
@@ -26,6 +28,18 @@ class RegistryTest(unittest.TestCase):
         self.registry.upsert("d1", model="dotii")
         self.registry.set_enabled("d1", ["status", "nope"])
         self.assertEqual(self.registry.get("d1").enabled, {"status"})
+
+    def test_declared_text_budget_round_trips(self):
+        self.registry.upsert("d1", model="FoloOS-AI-Passport")
+        self.registry.get("d1").max_text_chars = 512
+        self.registry.save()
+        reloaded = DeviceRegistry(self.path)
+        reloaded.load()
+        self.assertEqual(reloaded.get("d1").max_text_chars, 512)
+
+    def test_unlimited_budget_defaults_to_none(self):
+        self.registry.upsert("d1", model="dotii")
+        self.assertIsNone(self.registry.get("d1").max_text_chars)
 
     def test_mint_token_is_long_and_stable(self):
         first = self.registry.mint_token("d1")
@@ -77,3 +91,65 @@ class RegistryTest(unittest.TestCase):
             thread.join()
 
         self.assertEqual(errors, [])
+
+    def test_save_retries_transient_replace_denial(self):
+        self.registry.upsert("d1", model="dotii", supported=["status"])
+        real_replace = os.replace
+        calls = []
+
+        def flaky_replace(source, destination):
+            calls.append(1)
+            if len(calls) == 1:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(source, destination)
+
+        with patch("codexbridge.devices.registry.os.replace", side_effect=flaky_replace):
+            self.registry.save()
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(self.path.exists())
+
+
+class CapabilityMigrationTest(unittest.TestCase):
+    """A device that grows new abilities must not need host-side rework."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.registry = DeviceRegistry(Path(self.tmp.name) / "devices.json")
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_new_device_capability_is_enabled_when_not_customized(self):
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack"])
+        self.assertNotIn("audio", self.registry.get("p1").enabled)
+        # Firmware grows a microphone and re-declares it on the next handshake.
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack", "audio", "voice"])
+        enabled = self.registry.get("p1").enabled
+        self.assertIn("audio", enabled)
+        self.assertIn("voice", enabled)
+
+    def test_dropped_capability_is_removed_from_enabled(self):
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack", "audio"])
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack"])
+        self.assertNotIn("audio", self.registry.get("p1").enabled)
+
+    def test_manual_choice_survives_a_redeclaration(self):
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack", "audio", "voice"])
+        self.registry.set_enabled("p1", ["status", "text"])
+        self.assertTrue(self.registry.get("p1").customized)
+        self.registry.upsert("p1", model="FoloOS-AI-Passport",
+                             supported=["status", "text", "read_ack", "audio", "voice"])
+        # The user turned voice off on purpose; the host must not flip it back.
+        self.assertEqual(self.registry.get("p1").enabled, {"status", "text"})
+
+    def test_customized_flag_round_trips(self):
+        self.registry.upsert("p1", model="FoloOS-AI-Passport")
+        self.registry.set_enabled("p1", ["status"])
+        self.registry.save()
+        reloaded = DeviceRegistry(self.registry.path)
+        reloaded.load()
+        self.assertTrue(reloaded.get("p1").customized)
