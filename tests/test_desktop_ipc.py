@@ -257,6 +257,8 @@ class DesktopIpcTests(unittest.TestCase):
             body = json.dumps(message).encode()
             stream.sendall(struct.pack('<I', len(body)) + body)
 
+        release = threading.Event()
+
         def router():
             with server:
                 init = read_message(server)
@@ -270,6 +272,7 @@ class DesktopIpcTests(unittest.TestCase):
                 server.sendall(struct.pack('<I', len(oversized)) + oversized)
                 send(server, {'type': 'response', 'requestId': request['requestId'],
                               'resultType': 'success', 'handledByClientId': 'desktop-owner'})
+                release.wait(5.0)
 
         worker = threading.Thread(target=router)
         worker.start()
@@ -280,6 +283,7 @@ class DesktopIpcTests(unittest.TestCase):
             self.assertEqual(client.events.get_nowait(), {'type': 'resync_required'})
             self.assertTrue(client.connection_status()['desktop_ipc_connected'])
         finally:
+            release.set()
             client.close()
             worker.join(2)
         self.assertFalse(worker.is_alive())
