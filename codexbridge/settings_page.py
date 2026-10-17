@@ -100,10 +100,11 @@ SETTINGS_HTML = r'''<!doctype html>
       align-items: start;
     }
     .general-panel { grid-column: 1; grid-row: 1; }
-    .speech-panel { grid-column: 1; grid-row: 2; }
+    .companion-panel { grid-column: 1; grid-row: 2; }
+    .speech-panel { grid-column: 1; grid-row: 3; }
     .devices-panel {
       grid-column: 2;
-      grid-row: 1 / span 2;
+      grid-row: 1 / span 3;
       align-self: stretch;
     }
     .panel {
@@ -121,6 +122,28 @@ SETTINGS_HTML = r'''<!doctype html>
     .panel-header p { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
     .panel-body { padding: 20px; }
     .device-list { display: grid; gap: 0; }
+    .device-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .filter-button {
+      min-height: 38px;
+      padding: 7px 12px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    .filter-button:hover { color: var(--text); border-color: var(--border-strong); }
+    .filter-button.is-active {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
     .budget-row {
       display: flex;
       flex-direction: column;
@@ -166,6 +189,21 @@ SETTINGS_HTML = r'''<!doctype html>
       background: var(--success-soft);
     }
     .device-state.offline { color: var(--muted); background: #edf0f2; }
+    .device-state.pending { color: var(--warning); background: var(--warning-soft); }
+    .device-state.rejected,
+    .device-state.revoked { color: var(--danger); background: var(--danger-soft); }
+    .device-kind {
+      display: inline-block;
+      margin-right: 6px;
+      padding: 1px 6px;
+      color: var(--muted);
+      background: var(--surface-muted);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      vertical-align: 1px;
+    }
     .device-content { padding: 14px 0 0; }
     .subsection-title {
       margin: 0 0 9px;
@@ -365,10 +403,6 @@ SETTINGS_HTML = r'''<!doctype html>
     .general-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
     .pair-code { margin: 14px 0 6px; padding: 14px 16px; border-radius: 12px; background: #101828; color: #f8fafc; font-size: 30px; font-weight: 700; letter-spacing: 6px; text-align: center; }
     .pair-code small { display: block; margin-top: 6px; font-size: 12px; font-weight: 400; letter-spacing: 0; color: #cbd5e1; }
-    .phone-list { display: grid; gap: 8px; margin-top: 8px; }
-    .phone-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; }
-    .phone-row strong { display: block; font-size: 14px; }
-    .phone-row p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
     .port-list { display: grid; gap: 8px; margin-top: 8px; }
     .port-row {
       display: grid;
@@ -406,8 +440,9 @@ SETTINGS_HTML = r'''<!doctype html>
         grid-template-columns: minmax(0, 1fr);
       }
       .general-panel { grid-column: 1; grid-row: auto; order: 1; }
-      .devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 2; }
-      .speech-panel { grid-column: 1; grid-row: auto; order: 3; }
+      .companion-panel { grid-column: 1; grid-row: auto; order: 2; }
+      .devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 3; }
+      .speech-panel { grid-column: 1; grid-row: auto; order: 4; }
     }
     @media (max-width: 560px) {
       .topbar-inner, main { width: min(100% - 24px, 1120px); }
@@ -443,7 +478,7 @@ SETTINGS_HTML = r'''<!doctype html>
   <main id="main-content">
     <div class="page-heading">
       <h1>设备与语音设置</h1>
-      <p>这里统一管理接入设备、功能权限和语音识别来源。设置只对当前这台电脑生效。</p>
+      <p>连接与发现集中处理手机与硬件接入，设备中心统一查看状态、权限和注册动作。</p>
     </div>
 
     <div class="layout">
@@ -478,8 +513,8 @@ SETTINGS_HTML = r'''<!doctype html>
 
       <section class="panel companion-panel" aria-labelledby="companion-title">
         <div class="panel-header">
-          <h2 id="companion-title">手机连接</h2>
-          <p>在手机上安装 CodexBridge 手机端，用配对码连接这台电脑。</p>
+          <h2 id="companion-title">连接与发现</h2>
+          <p>手机用配对码接入，硬件在同一局域网内主动注册并由这里批准。</p>
         </div>
         <div class="panel-body">
           <div class="general-list">
@@ -527,20 +562,22 @@ SETTINGS_HTML = r'''<!doctype html>
           <div id="companion-port-list" class="port-list" aria-live="polite">
             <div class="empty-state">正在读取...</div>
           </div>
-          <div class="subsection-title">已配对手机</div>
-          <div id="companion-phones" class="phone-list" aria-live="polite">
-            <div class="empty-state">正在读取...</div>
-          </div>
           <div id="companion-message" class="form-message" role="status" aria-live="polite"></div>
         </div>
       </section>
 
       <section class="panel devices-panel" aria-labelledby="devices-title">
         <div class="panel-header">
-          <h2 id="devices-title">设备</h2>
-          <p>设备只有在开启对应能力后，才会收到该类消息。</p>
+          <h2 id="devices-title">设备中心</h2>
+          <p>手机和硬件使用同一份设备记录；待批准硬件先在这里确认。</p>
         </div>
         <div class="panel-body">
+          <div class="device-filters" role="tablist" aria-label="设备筛选">
+            <button class="filter-button is-active" type="button" data-device-filter="all" aria-selected="true">全部</button>
+            <button class="filter-button" type="button" data-device-filter="phone" aria-selected="false">手机</button>
+            <button class="filter-button" type="button" data-device-filter="hardware" aria-selected="false">硬件</button>
+            <button class="filter-button" type="button" data-device-filter="pending" aria-selected="false">待批准</button>
+          </div>
           <div id="device-list" class="device-list" aria-live="polite">
             <div class="empty-state">正在读取设备...</div>
           </div>
@@ -701,12 +738,26 @@ SETTINGS_HTML = r'''<!doctype html>
       titleText.appendChild(heading);
       const meta = document.createElement("div");
       meta.className = "device-meta";
-      meta.textContent = `${device.model || "未知型号"} · ${device.device_id}`;
+      const kind = document.createElement("span");
+      kind.className = "device-kind";
+      kind.textContent = device.kind === "phone" ? "手机" : "硬件";
+      meta.appendChild(kind);
+      appendText(meta, `${device.model || "未知型号"} · ${device.device_id}`);
+      if (device.last_address) appendText(meta, ` · ${device.last_address}`);
       titleText.appendChild(meta);
       title.appendChild(titleText);
       const state = document.createElement("span");
-      state.className = device.online ? "device-state" : "device-state offline";
-      state.textContent = device.online ? "在线" : "离线";
+      const registrationState = device.registration_state || "approved";
+      if (registrationState === "pending") {
+        state.className = "device-state pending";
+        state.textContent = "待批准";
+      } else if (registrationState === "rejected" || registrationState === "revoked") {
+        state.className = `device-state ${registrationState}`;
+        state.textContent = registrationState === "rejected" ? "已拒绝" : "已撤销";
+      } else {
+        state.className = device.online ? "device-state" : "device-state offline";
+        state.textContent = device.online ? "在线" : "离线";
+      }
       title.appendChild(state);
       card.appendChild(title);
 
@@ -718,6 +769,7 @@ SETTINGS_HTML = r'''<!doctype html>
       content.appendChild(capabilityTitle);
 
       const supported = Array.isArray(device.supported) ? device.supported : [];
+      const editableHardware = device.kind === "hardware" && registrationState === "approved";
       if (supported.length === 0) {
         const empty = document.createElement("div");
         empty.className = "empty-state";
@@ -734,6 +786,7 @@ SETTINGS_HTML = r'''<!doctype html>
           input.type = "checkbox";
           input.value = feature;
           input.checked = enabled.has(feature);
+          input.disabled = !editableHardware;
           input.setAttribute("data-feature", feature);
           const text = document.createElement("span");
           text.textContent = featureNames[feature] || feature;
@@ -766,42 +819,77 @@ SETTINGS_HTML = r'''<!doctype html>
       const declared = device.max_text_chars;
       budgetInput.value = typeof declared === "number" ? String(declared) : "";
       budgetInput.placeholder = typeof declared === "number" ? String(declared) : "不限";
+      budgetInput.disabled = !editableHardware;
       budgetRow.appendChild(budgetLabel);
       budgetRow.appendChild(budgetInput);
       content.appendChild(budgetRow);
 
       const actions = document.createElement("div");
       actions.className = "device-actions";
-      const save = document.createElement("button");
-      save.type = "button";
-      save.className = "button button-primary";
-      save.textContent = "保存能力";
-      save.addEventListener("click", () => saveCapabilities(device, card, save));
-      actions.appendChild(save);
-
-      const pairing = document.createElement("button");
-      pairing.type = "button";
-      pairing.className = "button";
-      pairing.textContent = "生成配对令牌";
-      pairing.addEventListener("click", () => loadPairing(device, result));
-      actions.appendChild(pairing);
-
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "button button-danger";
-      remove.textContent = "移除设备";
-      remove.addEventListener("click", () => removeDevice(device, remove));
-      actions.appendChild(remove);
-      content.appendChild(actions);
-
       const result = document.createElement("div");
       result.className = "pairing-result";
-      result.textContent = "尚未请求配对令牌。";
       result.setAttribute("aria-live", "polite");
+
+      if (registrationState === "pending") {
+        result.textContent = "等待本机批准。";
+        const approve = document.createElement("button");
+        approve.type = "button";
+        approve.className = "button button-primary";
+        approve.textContent = "批准";
+        approve.addEventListener("click", () => registrationAction(device, "approve", approve));
+        actions.appendChild(approve);
+
+        const reject = document.createElement("button");
+        reject.type = "button";
+        reject.className = "button button-danger";
+        reject.textContent = "拒绝";
+        reject.addEventListener("click", () => registrationAction(device, "reject", reject));
+        actions.appendChild(reject);
+      } else if (device.kind === "phone") {
+        result.textContent = `配对方式：${device.registration_method === "pairing_code" ? "配对码" : "本机批准"}`;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "button button-danger";
+        remove.textContent = "解除手机";
+        remove.addEventListener("click", () => removePhone(device, remove));
+        actions.appendChild(remove);
+      } else if (registrationState === "approved") {
+        result.textContent = device.has_token ? "设备凭据已登记。" : "设备缺少令牌，需要重新批准。";
+        const save = document.createElement("button");
+        save.type = "button";
+        save.className = "button button-primary";
+        save.textContent = "保存能力";
+        save.addEventListener("click", () => saveCapabilities(device, card, save));
+        actions.appendChild(save);
+
+        const revoke = document.createElement("button");
+        revoke.type = "button";
+        revoke.className = "button button-danger";
+        revoke.textContent = "撤销";
+        revoke.addEventListener("click", () => registrationAction(device, "revoke", revoke));
+        actions.appendChild(revoke);
+      } else {
+        result.textContent = registrationState === "rejected" ? "已拒绝，等待设备重新注册。" : "已撤销，等待设备重新注册。";
+        const approve = document.createElement("button");
+        approve.type = "button";
+        approve.className = "button";
+        approve.textContent = "重新批准";
+        approve.addEventListener("click", () => registrationAction(device, "approve", approve));
+        actions.appendChild(approve);
+      }
+      content.appendChild(actions);
       content.appendChild(result);
 
       card.appendChild(content);
       return card;
+    }
+
+    let deviceFilter = "all";
+
+    function deviceMatchesFilter(device, filter) {
+      if (filter === "all") return true;
+      if (filter === "pending") return device.registration_state === "pending";
+      return device.kind === filter;
     }
 
     async function loadDevices() {
@@ -810,14 +898,17 @@ SETTINGS_HTML = r'''<!doctype html>
         const payload = await requestJson("/api/admin/devices");
         list.textContent = "";
         const devices = Array.isArray(payload.devices) ? payload.devices : [];
-        if (devices.length === 0) {
+        const visible = devices.filter((device) => deviceMatchesFilter(device, deviceFilter));
+        if (visible.length === 0) {
           const empty = document.createElement("div");
           empty.className = "empty-state";
-          empty.textContent = "还没有发现设备。请先让设备进入配对模式，然后保持在同一局域网。";
+          empty.textContent = deviceFilter === "pending"
+            ? "没有等待批准的硬件。"
+            : "没有符合当前筛选的设备。";
           list.appendChild(empty);
           return;
         }
-        devices.forEach((device) => list.appendChild(createDeviceCard(device)));
+        visible.forEach((device) => list.appendChild(createDeviceCard(device)));
       } catch (error) {
         list.textContent = "";
         const empty = document.createElement("div");
@@ -826,6 +917,18 @@ SETTINGS_HTML = r'''<!doctype html>
         list.appendChild(empty);
       }
     }
+
+    $$("[data-device-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        deviceFilter = button.dataset.deviceFilter || "all";
+        $$("[data-device-filter]").forEach((candidate) => {
+          const active = candidate === button;
+          candidate.classList.toggle("is-active", active);
+          candidate.setAttribute("aria-selected", active ? "true" : "false");
+        });
+        loadDevices();
+      });
+    });
 
     async function saveCapabilities(device, card, button) {
       const enabled = $$('input[type="checkbox"]', card).filter((input) => input.checked).map((input) => input.value);
@@ -857,36 +960,43 @@ SETTINGS_HTML = r'''<!doctype html>
       }
     }
 
-    async function loadPairing(device, result) {
-      result.dataset.state = "working";
-      result.textContent = "正在生成配对令牌...";
+    async function removePhone(device, button) {
+      if (!window.confirm(`解除手机“${device.name || device.device_id}”？`)) return;
+      setBusy(button, true, "解除中...");
       try {
-        const payload = await requestJson(`/api/admin/pairing?device_id=${encodeURIComponent(device.device_id)}`);
-        result.textContent = `配对端口 ${payload.port}`;
-        const token = document.createElement("code");
-        token.className = "token";
-        token.textContent = payload.token;
-        result.appendChild(token);
-        result.dataset.state = "success";
+        await requestJson("/api/admin/companion", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({action: "remove_phone", phone_id: device.device_id})
+        });
+        await Promise.all([loadDevices(), loadCompanion()]);
       } catch (error) {
-        result.textContent = `生成失败：${error.message}`;
-        result.dataset.state = "error";
+        window.alert(`解除失败：${error.message}`);
+        setBusy(button, false, "解除中...");
       }
     }
 
-    async function removeDevice(device, button) {
-      if (!window.confirm(`移除设备“${device.name || device.device_id}”？`)) return;
-      setBusy(button, true, "移除中...");
+    async function registrationAction(device, action, button) {
+      const labels = {approve: "批准", reject: "拒绝", revoke: "撤销"};
+      const paths = {
+        approve: "/api/admin/devices/approve",
+        reject: "/api/admin/devices/reject",
+        revoke: "/api/admin/devices/revoke"
+      };
+      const path = paths[action];
+      if (!path) throw new Error("registration_action_invalid");
+      if (action === "revoke" && !window.confirm(`撤销设备“${device.name || device.device_id}”？`)) return;
+      setBusy(button, true, `${labels[action]}中...`);
       try {
-        await requestJson("/api/admin/devices/remove", {
+        await requestJson(path, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({device_id: device.device_id})
         });
         await loadDevices();
       } catch (error) {
-        window.alert(`移除失败：${error.message}`);
-        setBusy(button, false, "移除中...");
+        window.alert(`${labels[action]}失败：${error.message}`);
+        setBusy(button, false, `${labels[action]}中...`);
       }
     }
 
@@ -1090,51 +1200,6 @@ SETTINGS_HTML = r'''<!doctype html>
       return Number.isNaN(date.getTime()) ? "从未连接" : `最近连接 ${date.toLocaleString()}`;
     }
 
-    function renderCompanionPhones(phones) {
-      const list = $("#companion-phones");
-      list.textContent = "";
-      if (!phones.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty-state";
-        empty.textContent = "还没有配对手机。";
-        list.appendChild(empty);
-        return;
-      }
-      phones.forEach((phone) => {
-        const row = document.createElement("div");
-        row.className = "phone-row";
-        const info = document.createElement("div");
-        const title = document.createElement("strong");
-        title.textContent = phone.name || "未命名手机";
-        const meta = document.createElement("p");
-        meta.textContent = `${phone.phone_id} · ${companionTime(phone.last_seen)}`;
-        info.appendChild(title);
-        info.appendChild(meta);
-        const remove = document.createElement("button");
-        remove.className = "button";
-        remove.type = "button";
-        remove.textContent = "解除";
-        remove.addEventListener("click", async () => {
-          remove.disabled = true;
-          try {
-            await requestJson("/api/admin/companion", {
-              method: "POST",
-              headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({action: "remove_phone", phone_id: phone.phone_id})
-            });
-            setMessage($("#companion-message"), "已解除该手机。", "success");
-            loadCompanion();
-          } catch (error) {
-            setMessage($("#companion-message"), `解除失败：${error.message}`, "error");
-            remove.disabled = false;
-          }
-        });
-        row.appendChild(info);
-        row.appendChild(remove);
-        list.appendChild(row);
-      });
-    }
-
     function portStateText(state) {
       return ({
         running: "正常",
@@ -1214,7 +1279,6 @@ SETTINGS_HTML = r'''<!doctype html>
         $("#companion-addresses").textContent = urls.length ? urls.join(" · ") : "未检测到局域网地址";
         $("#companion-port").value = companion.port || "";
         renderCompanionPorts(companion.ports || []);
-        renderCompanionPhones(companion.phones || []);
         if (!companion.enabled) {
           setMessage($("#companion-message"), "手机连接已关闭。");
         } else if (!$("#companion-message").dataset.state) {

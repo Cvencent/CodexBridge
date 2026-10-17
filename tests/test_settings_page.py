@@ -36,16 +36,37 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("API Key", SETTINGS_HTML)
         self.assertIn("/api/admin/settings/speech", SETTINGS_HTML)
 
+    def test_page_has_one_unified_device_center(self):
+        self.assertEqual(SETTINGS_HTML.count('id="device-list"'), 1)
+        self.assertEqual(SETTINGS_HTML.count('id="companion-phones"'), 0)
+        self.assertIn("连接与发现", SETTINGS_HTML)
+        self.assertIn("设备中心", SETTINGS_HTML)
+        self.assertIn("data-device-filter=\"all\"", SETTINGS_HTML)
+        self.assertIn("data-device-filter=\"phone\"", SETTINGS_HTML)
+        self.assertIn("data-device-filter=\"hardware\"", SETTINGS_HTML)
+        self.assertIn("data-device-filter=\"pending\"", SETTINGS_HTML)
+
+    def test_device_center_has_registration_actions(self):
+        self.assertIn("/api/admin/devices/approve", SETTINGS_HTML)
+        self.assertIn("/api/admin/devices/reject", SETTINGS_HTML)
+        self.assertIn("/api/admin/devices/revoke", SETTINGS_HTML)
+        self.assertIn("批准", SETTINGS_HTML)
+        self.assertIn("拒绝", SETTINGS_HTML)
+        self.assertIn("撤销", SETTINGS_HTML)
+        self.assertIn("registration_state", SETTINGS_HTML)
+
     def test_page_uses_stable_desktop_layout(self):
         self.assertIn("grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);", SETTINGS_HTML)
         self.assertIn(".general-panel { grid-column: 1; grid-row: 1; }", SETTINGS_HTML)
-        self.assertIn(".speech-panel { grid-column: 1; grid-row: 2; }", SETTINGS_HTML)
+        self.assertIn(".companion-panel { grid-column: 1; grid-row: 2; }", SETTINGS_HTML)
+        self.assertIn(".speech-panel { grid-column: 1; grid-row: 3; }", SETTINGS_HTML)
         self.assertIn(".devices-panel {", SETTINGS_HTML)
         self.assertIn("grid-column: 2;", SETTINGS_HTML)
-        self.assertIn("grid-row: 1 / span 2;", SETTINGS_HTML)
+        self.assertIn("grid-row: 1 / span 3;", SETTINGS_HTML)
 
     def test_page_collapses_to_one_column_on_narrow_screens(self):
         self.assertIn(".general-panel { grid-column: 1; grid-row: auto; order: 1; }", SETTINGS_HTML)
-        self.assertIn(".devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 2; }", SETTINGS_HTML)
-        self.assertIn(".speech-panel { grid-column: 1; grid-row: auto; order: 3; }", SETTINGS_HTML)
+        self.assertIn(".companion-panel { grid-column: 1; grid-row: auto; order: 2; }", SETTINGS_HTML)
+        self.assertIn(".devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 3; }", SETTINGS_HTML)
+        self.assertIn(".speech-panel { grid-column: 1; grid-row: auto; order: 4; }", SETTINGS_HTML)
         self.assertIn(".general-list, .source-options { grid-template-columns: 1fr; }", SETTINGS_HTML)
