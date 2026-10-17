@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -64,6 +65,7 @@ import androidx.compose.ui.unit.sp
 import com.codexbridge.mobile.UiState
 import com.codexbridge.mobile.data.ApprovalRequest
 import com.codexbridge.mobile.data.MessageItem
+import com.codexbridge.mobile.data.QueueItem
 import java.util.Locale
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -83,9 +85,15 @@ fun ChatScreen(
     onPickModel: (String) -> Unit,
     onResolveApproval: (Int, String) -> Unit,
     onRespondApproval: (Int, JsonObject) -> Unit,
+    onSteerQueue: (QueueItem) -> Unit = {},
+    onEditQueue: (QueueItem, String) -> Unit = { _, _ -> },
+    onDeleteQueue: (QueueItem) -> Unit = {},
 ) {
     var input by remember { mutableStateOf("") }
     var showModels by remember { mutableStateOf(false) }
+    var editingQueue by remember { mutableStateOf<QueueItem?>(null) }
+    var editingText by remember { mutableStateOf("") }
+    var deletingQueue by remember { mutableStateOf<QueueItem?>(null) }
     LaunchedEffect(state.restoreInput) {
         if (state.restoreInput.isNotBlank()) {
             input = state.restoreInput
@@ -246,6 +254,18 @@ fun ChatScreen(
                     }
                 }
             }
+            if (state.queue.isNotEmpty()) {
+                QueuePanel(
+                    items = state.queue,
+                    working = state.working,
+                    onSteer = onSteerQueue,
+                    onEdit = { item ->
+                        editingQueue = item
+                        editingText = item.text
+                    },
+                    onDelete = { item -> deletingQueue = item },
+                )
+            }
             if (state.working) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
@@ -274,7 +294,7 @@ fun ChatScreen(
                     value = input,
                     onValueChange = { input = it },
                     placeholder = {
-                        Text(if (state.working) "发送将追加到当前任务" else "给 Codex 发消息…", maxLines = 1)
+                        Text("发送后加入队列", maxLines = 1)
                     },
                     maxLines = 5,
                     shape = RoundedCornerShape(16.dp),
@@ -289,19 +309,61 @@ fun ChatScreen(
                             onSend(text)
                         }
                     },
-                    enabled = input.isNotBlank(),
+                    enabled = input.isNotBlank() && !state.sending,
                     modifier = Modifier
                         .size(48.dp)
                         .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
                 ) {
-                    Icon(
-                        Icons.Filled.Send,
-                        contentDescription = "发送",
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                    )
+                    if (state.sending) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Send,
+                            contentDescription = "发送",
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                        )
+                    }
                 }
             }
         }
+    }
+
+    deletingQueue?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deletingQueue = null },
+            title = { Text("删除队列项") },
+            text = { Text(target.text, maxLines = 4, overflow = TextOverflow.Ellipsis) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        deletingQueue = null
+                        onDeleteQueue(target)
+                    },
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletingQueue = null }) { Text("取消") }
+            },
+        )
+    }
+
+    if (editingQueue != null) {
+        EditQueueDialog(
+            text = editingText,
+            onTextChange = { editingText = it },
+            onSave = {
+                val target = editingQueue
+                if (target != null && editingText.trim().isNotEmpty()) {
+                    onEditQueue(target, editingText.trim())
+                }
+                editingQueue = null
+            },
+            onDismiss = { editingQueue = null },
+        )
     }
 
     if (showModels) {
@@ -315,6 +377,78 @@ fun ChatScreen(
             onDismiss = { showModels = false },
         )
     }
+}
+
+@Composable
+private fun QueuePanel(
+    items: List<QueueItem>,
+    working: Boolean,
+    onSteer: (QueueItem) -> Unit,
+    onEdit: (QueueItem) -> Unit,
+    onDelete: (QueueItem) -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = "待发送队列 · ${items.size}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            items.forEach { item ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(item.text, fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (working && item.status == "pending" && item.revision > 0) {
+                            TextButton(onClick = { onSteer(item) }) { Text("引导") }
+                        }
+                        if (item.status == "pending" || item.status == "failed") {
+                            TextButton(onClick = { onEdit(item) }) { Text("编辑") }
+                            TextButton(onClick = { onDelete(item) }) { Text("删除") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EditQueueDialog(
+    text: String,
+    onTextChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("编辑队列项") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = onTextChange,
+                label = { Text("内容") },
+                minLines = 3,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onSave, enabled = text.trim().isNotEmpty()) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 @Composable

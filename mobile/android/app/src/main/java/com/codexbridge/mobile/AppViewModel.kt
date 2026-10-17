@@ -14,6 +14,9 @@ import com.codexbridge.mobile.data.MessageDetail
 import com.codexbridge.mobile.data.MessageItem
 import com.codexbridge.mobile.data.ModelInfo
 import com.codexbridge.mobile.data.ProjectInfo
+import com.codexbridge.mobile.data.QueueItem
+import com.codexbridge.mobile.data.applyQueueSnapshot
+import com.codexbridge.mobile.data.applyQueueUpdate
 import com.codexbridge.mobile.data.SettingsStore
 import com.codexbridge.mobile.data.StreamEvent
 import com.codexbridge.mobile.data.TaskSnapshot
@@ -74,6 +77,8 @@ data class UiState(
     val darkTheme: Boolean = true,
     val messageCount: Int = 0,
     val truncated: Boolean = false,
+    val queue: List<QueueItem> = emptyList(),
+    val sending: Boolean = false,
     val restoreInput: String = "",
     val discovered: List<DiscoveredBridge> = emptyList(),
     val discovering: Boolean = false,
@@ -411,6 +416,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 messages = emptyList(),
                 streaming = emptyMap(),
                 approvals = emptyList(),
+                queue = emptyList(),
                 busy = true,
                 task = seededTask,
                 working = seededTask.isWorking || visibleSummary.status in ACTIVE_TASK_STATUSES,
@@ -439,6 +445,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         working = status in ACTIVE_TASK_STATUSES,
                         messageCount = detail.message_count,
                         truncated = detail.truncated,
+                        queue = applyQueueSnapshot(
+                            state.queue,
+                            threadId,
+                            detail.queue,
+                        ),
                         busy = false,
                     )
                 }
@@ -461,6 +472,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 activeThread = null,
                 messages = emptyList(),
                 streaming = emptyMap(),
+                queue = emptyList(),
+                sending = false,
             )
         }
         refreshThreadsNow()
@@ -502,6 +515,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             approvals = detail.pending_approvals,
                             working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
                             messageCount = detail.message_count,
+                            queue = applyQueueSnapshot(state.queue, threadId, detail.queue),
                         )
                     }
                 }
@@ -515,78 +529,97 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val content = text.trim()
         if (content.isEmpty()) return
         settings.clearPendingCompletion(threadId)
-        val local = MessageItem(
-            id = "local-" + UUID.randomUUID().toString(),
-            kind = "user",
-            text = content,
-            created_at = System.currentTimeMillis() / 1000,
-        )
-        _state.update {
-            it.copy(
-                messages = it.messages + local,
-                working = true,
-                error = null,
-            )
-        }
+        _state.update { it.copy(error = null, sending = true) }
         viewModelScope.launch {
             try {
-                // An existing conversation that already has a turn in flight
-                // should be appended to with steer; only a fresh task, or a
-                // steer the bridge cannot honour, falls back to starting a turn.
-                val wantsSteer = _state.value.task.isWorking || _state.value.working
-                if (wantsSteer) {
-                    try {
-                        client.sendMessage(
-                            threadId = threadId,
-                            text = content,
-                            model = _state.value.selectedModel,
-                            effort = _state.value.selectedEffort,
-                            steer = true,
-                        )
-                    } catch (steerError: Exception) {
-                        client.sendMessage(
-                            threadId = threadId,
-                            text = content,
-                            model = _state.value.selectedModel,
-                            effort = _state.value.selectedEffort,
-                            steer = false,
-                        )
-                    }
-                } else {
-                    client.sendMessage(
-                        threadId = threadId,
-                        text = content,
-                        model = _state.value.selectedModel,
-                        effort = _state.value.selectedEffort,
-                        steer = false,
+                client.enqueueMessage(
+                    threadId = threadId,
+                    text = content,
+                    model = _state.value.selectedModel,
+                    effort = _state.value.selectedEffort,
+                )
+                refreshQueue(threadId)
+                // The bridge owns dispatch. A fresh thread starts immediately;
+                // a busy thread stays pending until its turn completes.
+                runCatching { client.thread(threadId) }.onSuccess { detail ->
+                    val status = coherentTaskStatus(
+                        _state.value.activeThread?.status.orEmpty(),
+                        detail.task.status,
                     )
-                }
-                // The bridge now owns the turn; let the detail poll report the
-                // real state instead of assuming it locally.
-                viewModelScope.launch {
-                    runCatching { client.thread(threadId) }.onSuccess { detail ->
-                        val status = coherentTaskStatus(
-                            _state.value.activeThread?.status.orEmpty(),
-                            detail.task.status,
+                    _state.update { state ->
+                        state.copy(
+                            task = detail.task.copy(status = status),
+                            working = status in ACTIVE_TASK_STATUSES,
                         )
-                        _state.update { state ->
-                            state.copy(
-                                task = detail.task.copy(status = status),
-                                working = status in ACTIVE_TASK_STATUSES,
-                            )
-                        }
                     }
                 }
             } catch (error: Exception) {
-                _state.update {
-                    it.copy(
-                        messages = it.messages.filterNot { item -> item.id == local.id },
-                        working = false,
-                        restoreInput = content,
-                    )
-                }
+                _state.update { it.copy(restoreInput = content, sending = false) }
                 handleError(error)
             }
+        }
+    }
+
+    fun steerQueue(item: QueueItem) {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        viewModelScope.launch {
+            runCatching { client.steerQueue(item.queue_id, item.revision) }
+                .onSuccess { refreshQueue(threadId) }
+                .onFailure { handleError(it) }
+        }
+    }
+
+    fun editQueue(item: QueueItem, text: String) {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        val content = text.trim()
+        if (content.isEmpty()) return
+        viewModelScope.launch {
+            runCatching {
+                client.editQueue(
+                    queueId = item.queue_id,
+                    text = content,
+                    expectedRevision = item.revision,
+                    model = _state.value.selectedModel,
+                    effort = _state.value.selectedEffort,
+                )
+            }
+                .onSuccess { refreshQueue(threadId) }
+                .onFailure { handleError(it) }
+        }
+    }
+
+    fun deleteQueue(item: QueueItem) {
+        val client = api ?: return
+        val threadId = _state.value.activeThread?.thread_id ?: return
+        viewModelScope.launch {
+            runCatching { client.deleteQueue(item.queue_id, item.revision) }
+                .onSuccess { refreshQueue(threadId) }
+                .onFailure { handleError(it) }
+        }
+    }
+
+    private fun refreshQueue(threadId: String) {
+        val client = api ?: return
+        viewModelScope.launch {
+            runCatching { client.queue(threadId) }
+                .onSuccess { response ->
+                    _state.update { state ->
+                        state.copy(
+                            queue = applyQueueSnapshot(
+                                state.queue,
+                                threadId,
+                                response.queue,
+                            ),
+                            sending = false,
+                        )
+                    }
+                }
+                .onFailure {
+                    _state.update { state -> state.copy(sending = false) }
+                    handleError(it)
+                }
         }
     }
 
@@ -850,6 +883,84 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val title = event.title
                 if (title.isNotBlank()) {
                     _state.update { it.copy(activeThread = it.activeThread?.copy(title = title)) }
+                }
+            }
+            "queue_snapshot" -> {
+                val threadId = event.thread_id.ifBlank {
+                    _state.value.activeThread?.thread_id.orEmpty()
+                }
+                if (threadId.isNotBlank()) {
+                    _state.update { state ->
+                        state.copy(
+                            queue = applyQueueSnapshot(state.queue, threadId, event.queue)
+                        )
+                    }
+                }
+            }
+            "queue_item_added",
+            "queue_item_updated",
+            "queue_item_removed" -> {
+                val item = event.queueItem
+                val threadId = item?.thread_id
+                    ?: event.thread_id.ifBlank { _state.value.activeThread?.thread_id.orEmpty() }
+                if (item != null && threadId.isNotBlank()) {
+                    _state.update { state ->
+                        state.copy(
+                            queue = applyQueueUpdate(
+                                state.queue,
+                                threadId,
+                                item.copy(thread_id = threadId),
+                                removed = event.type == "queue_item_removed",
+                            )
+                        )
+                    }
+                } else if (threadId.isNotBlank()) {
+                    refreshQueue(threadId)
+                }
+            }
+            "queue_paused" -> {
+                val threadId = event.thread_id.ifBlank {
+                    _state.value.activeThread?.thread_id.orEmpty()
+                }
+                if (threadId.isNotBlank()) {
+                    if (event.message.isNotBlank()) {
+                        _state.update { it.copy(error = event.message) }
+                    }
+                    refreshQueue(threadId)
+                }
+            }
+            "resync_required" -> {
+                // The desktop side reconnected, so the local view is only a
+                // guess until the authoritative snapshot lands.
+                val threadId = _state.value.activeThread?.thread_id.orEmpty()
+                if (threadId.isNotBlank()) {
+                    refreshQueue(threadId)
+                    viewModelScope.launch {
+                        val active = api ?: return@launch
+                        runCatching { active.thread(threadId) }.onSuccess { detail ->
+                            val reconciled = reconcileThreadDetail(
+                                detail,
+                                _state.value.activeThread?.status.orEmpty(),
+                            )
+                            _state.update { state ->
+                                state.copy(
+                                    activeThread = if (state.activeThread?.thread_id == threadId) {
+                                        reconciled.thread
+                                    } else {
+                                        state.activeThread
+                                    },
+                                    messages = detail.messages,
+                                    task = reconciled.task,
+                                    approvals = detail.pending_approvals,
+                                    working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
+                                    messageCount = detail.message_count,
+                                    queue = applyQueueSnapshot(state.queue, threadId, detail.queue),
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    refreshThreadsNow()
                 }
             }
             "approval_request" -> {

@@ -175,6 +175,79 @@ class ApiClient(
             ),
         )
 
+    suspend fun queue(threadId: String): QueueResponse =
+        json.decodeFromString(
+            QueueResponse.serializer(),
+            command(
+                "queue.list",
+                buildJsonObject { put("thread_id", threadId) },
+            ),
+        )
+
+    suspend fun enqueueMessage(
+        threadId: String,
+        text: String,
+        model: String = "",
+        effort: String = "",
+    ): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.enqueue",
+                buildJsonObject {
+                    put("thread_id", threadId)
+                    put("text", text)
+                    if (model.isNotBlank()) put("model", model)
+                    if (effort.isNotBlank()) put("effort", effort)
+                },
+            ),
+        )
+
+    suspend fun steerQueue(queueId: String, expectedRevision: Long): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.steer",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("expected_revision", expectedRevision)
+                },
+            ),
+        )
+
+    suspend fun editQueue(
+        queueId: String,
+        text: String,
+        expectedRevision: Long,
+        model: String = "",
+        effort: String = "",
+    ): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.edit",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("text", text)
+                    put("expected_revision", expectedRevision)
+                    if (model.isNotBlank()) put("model", model)
+                    if (effort.isNotBlank()) put("effort", effort)
+                },
+            ),
+        )
+
+    suspend fun deleteQueue(queueId: String, expectedRevision: Long): SendResponse =
+        json.decodeFromString(
+            SendResponse.serializer(),
+            command(
+                "queue.delete",
+                buildJsonObject {
+                    put("queue_id", queueId)
+                    put("expected_revision", expectedRevision)
+                },
+            ),
+        )
+
     suspend fun markThreadRead(threadId: String): SendResponse =
         json.decodeFromString(
             SendResponse.serializer(),
@@ -227,7 +300,7 @@ class ApiClient(
         val listener = object : EventSourceListener() {
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 if (data.isBlank()) return
-                val parsed = runCatching { json.decodeFromString(StreamEvent.serializer(), data) }.getOrNull()
+                val parsed = decodeStreamEvent(data)
                 if (parsed != null) {
                     trySend(parsed)
                 }
