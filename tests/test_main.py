@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from codexbridge.admin_api import handle_request
 from codexbridge.codex.app_server import AppServerError, _resolve_codex_command
+from codexbridge.companion.store import CompanionStore
+from codexbridge.devices.discovery import DiscoveryResult
+from codexbridge.devices.manager import DeviceManager
+from codexbridge.devices.registry import DeviceRegistry
+from codexbridge.hub import BridgeHub
 from codexbridge.__main__ import (
     _CodexSourceHolder,
     _apply_companion_action,
@@ -123,6 +129,175 @@ class CodexSourceHolderTest(unittest.TestCase):
             {"source": "fallback"},
         )
         self.assertEqual(client.calls, [("project/list", {"limit": 100})])
+
+
+
+class UnifiedDeviceAdminTest(unittest.TestCase):
+    """The phone and a pending ESP must appear in one device list."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.registry = DeviceRegistry(root / "devices.json")
+        self.store = CompanionStore(root / "companion.json", registry=self.registry)
+        self.hub = BridgeHub(self.registry)
+        self.manager = DeviceManager(self.registry, self.hub)
+        self.addCleanup(self.manager.stop)
+        self.actions = []
+
+    def _pair_phone(self):
+        code = self.store.pairing_code()["code"]
+        return self.store.claim(code, "Pixel", client_id="install-1")
+
+    def _discover_pending_hardware(
+        self,
+        device_id="dotii-a1",
+        host="127.0.0.1",
+        nonce="r_0123456789abcdef",
+    ):
+        self.manager.sync(
+            [
+                DiscoveryResult(
+                    host=host,
+                    device="dotii",
+                    device_id=device_id,
+                    name="Desk",
+                    port=8765,
+                    capabilities=["status", "text", "queue"],
+                    registration_state="pending",
+                    registration_nonce=nonce,
+                )
+            ]
+        )
+        return self.registry.get(device_id)
+
+    def _registration_action(self, action, device_id):
+        self.actions.append((action, device_id))
+        return True
+
+    def _list_devices(self, host="127.0.0.1"):
+        status, payload = handle_request(
+            "GET",
+            "/api/admin/devices",
+            {},
+            b"",
+            host,
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 200, payload)
+        return payload["devices"]
+
+    def test_phone_and_pending_hardware_share_one_device_list(self):
+        phone = self._pair_phone()
+        self._discover_pending_hardware()
+
+        devices = self._list_devices()
+        by_id = {row["device_id"]: row for row in devices}
+        self.assertEqual(set(by_id), {phone["phone_id"], "dotii-a1"})
+
+        phone_row = by_id[phone["phone_id"]]
+        self.assertEqual(phone_row["kind"], "phone")
+        self.assertEqual(phone_row["transport"], "companion_http")
+        self.assertEqual(phone_row["registration_state"], "approved")
+        self.assertEqual(phone_row["registration_method"], "pairing_code")
+        self.assertTrue(phone_row["has_token"])
+        self.assertIn("queue", phone_row["supported"])
+        self.assertNotIn("token_hash", phone_row)
+        self.assertNotIn("token", phone_row)
+
+        pending_row = by_id["dotii-a1"]
+        self.assertEqual(pending_row["kind"], "hardware")
+        self.assertEqual(pending_row["transport"], "device_tcp")
+        self.assertEqual(pending_row["registration_state"], "pending")
+        self.assertEqual(pending_row["registration_method"], "admin_approval")
+        self.assertFalse(pending_row["has_token"])
+        self.assertNotIn("registration_nonce", pending_row)
+
+    def test_pending_hardware_is_not_online_before_approval(self):
+        self._discover_pending_hardware()
+
+        pending = self._list_devices()
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(pending[0]["online"])
+        self.assertEqual(pending[0]["registration_state"], "pending")
+        self.assertNotIn("dotii-a1", self.hub._sessions)
+
+    def test_approve_route_is_loopback_only(self):
+        self._discover_pending_hardware()
+        self.manager._send_register_offer = lambda *args, **kwargs: True
+
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/approve",
+            {},
+            b'{"device_id": "dotii-a1"}',
+            "192.168.1.77",
+            self.hub,
+            self.registry,
+            device_registration_action=self._registration_action,
+        )
+        self.assertEqual(status, 403, payload)
+        self.assertEqual(payload["error"], "loopback_required")
+        self.assertEqual(self.actions, [])
+
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/approve",
+            {},
+            b'{"device_id": "dotii-a1"}',
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            device_registration_action=self._registration_action,
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["changed"])
+        self.assertEqual(self.actions, [("approve", "dotii-a1")])
+
+    def test_rejected_stays_rejected_until_nonce_or_reregistration(self):
+        self._discover_pending_hardware()
+        self.assertTrue(self.manager.reject("dotii-a1"))
+        self.assertEqual(
+            self.registry.get("dotii-a1").registration_state,
+            "rejected",
+        )
+
+        # Repeating the same announcement must not silently re-open a device
+        # the admin already rejected.
+        self._discover_pending_hardware()
+        self.assertEqual(
+            self.registry.get("dotii-a1").registration_state,
+            "rejected",
+        )
+
+        # A fresh nonce is a new registration attempt and returns to pending.
+        self._discover_pending_hardware(nonce="r_fedcba9876543210")
+        self.assertEqual(
+            self.registry.get("dotii-a1").registration_state,
+            "pending",
+        )
+
+    def test_revoke_then_reapprove_restores_a_token(self):
+        self._discover_pending_hardware()
+        self.assertTrue(self.manager.revoke("dotii-a1"))
+        self.assertEqual(
+            self.registry.get("dotii-a1").registration_state,
+            "revoked",
+        )
+
+        # Re-registration puts the device back in the queue for approval.
+        self._discover_pending_hardware()
+        self.assertEqual(
+            self.registry.get("dotii-a1").registration_state,
+            "pending",
+        )
+        self.manager._send_register_offer = lambda *args, **kwargs: True
+        self.assertTrue(self.manager.approve("dotii-a1"))
+        record = self.registry.get("dotii-a1")
+        self.assertEqual(record.registration_state, "approved")
+        self.assertTrue(record.has_token)
 
 
 class CompanionActionTest(unittest.TestCase):

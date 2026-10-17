@@ -48,12 +48,38 @@ CodexBridge 内置手机伴侣接口：同一局域网内的手机在管理页�
 - 伴侣接口默认开启，可在管理页面关闭；配对令牌只保存在手机与电脑本机。
 - 接口细节见 [PROTOCOL.md](PROTOCOL.md) 第 17 节。
 
+### 统一设备中心
+
+管理页面里的手机和 ESP 硬件现在是同一份“设备中心”列表，不再是两份：
+
+- 手机通过“生成配对码 + 手机输入配对码”即时批准，登记为
+  `registration_state = approved`、`registration_method = pairing_code`。
+- 没有令牌的 ESP 会在 UDP 发现应答里声明 `registration_state = pending` 和一次性
+  `registration_nonce`，只出现在“待批准”里，不建立业务会话。
+- 在管理页点击“批准”后，CodexBridge 才下发 `register_offer`，设备保存令牌并返回
+  `register_ok`，下一次连接进入正常的 `bridge_auth`；拒绝、撤销和重新注册都在同一
+  张卡片上完成。
+- 列表筛选项为 `全部 / 手机 / 硬件 / 待批准`，设备名、来源地址、能力和正文预算
+  同列展示，令牌和注册随机值不会出现在页面上。
+
+### 待发送队列
+
+对话进行中继续输入的消息不再由手机直接 `steer`，而是进入由电脑端 CodexBridge
+统一持有并持久化（`%LOCALAPPDATA%\CodexBridge\queues.json`）的线程级队列：
+
+- 线程空闲时 Bridge 立即派发队首，线程进行中则保持 `pending`，turn 结束后自动派发下一项。
+- 队列属于线程而不是设备：任一客户端加入、编辑、删除，其他在线的手机、ESP 和电脑端
+  都会同步到同一份状态。
+- 每条待发送项都可以 `引导`（注入当前进行中的 turn）、`编辑` 或确认后 `删除`。
+- 队列命令要求 `queue` 能力，手机默认启用，ESP 需要在握手里声明；未声明 `queue` 的旧
+  客户端继续使用原有 `turn.start` / `mode=steer` 行为。
+
 Android 手机端应用源码与成品 APK 位于本仓库 [mobile/](mobile/README.md)：
 
-``text
+```text
 mobile/android/    Kotlin + Jetpack Compose 工程
-mobile/release/    CodexBridgeMobile-0.2.9-release.apk 及校验文件
-``
+mobile/release/    CodexBridgeMobile-0.3.5-release.apk 及校验文件
+```
 
 ## Development
 
