@@ -28,6 +28,13 @@ from codexbridge.codex.rollout_activity import (
     read_log_tail,
     status_from_activity,
 )
+from codexbridge.companion.read_cache import (
+    CACHEABLE_METHODS,
+    READ_TTL_SECONDS,
+    ReadCache,
+    TERMINAL_READ_TTL_SECONDS,
+    thread_tag,
+)
 
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
 # Name given to a continuation fork so the desktop can tell it apart from the
@@ -47,6 +54,14 @@ INTERMEDIATE_MESSAGE_KINDS = {
     "notice",
 }
 MAX_EVENT_QUEUE = 300
+# How often the background watcher reconciles thread state. A live turn needs
+# a fast beat so a completion reaches every device promptly; an idle Codex
+# only has to notice a desktop-initiated turn eventually, and a fixed 2-second
+# beat kept the whole machine warm for nothing.
+POLL_ACTIVE_SECONDS = 2.0
+POLL_IDLE_SECONDS = 15.0
+# Turn states that mean the thread body is finished being written.
+TERMINAL_BODY_STATUSES = frozenset({'completed', 'failed', 'interrupted'})
 ACCOUNT_CACHE_SECONDS = 45.0
 # Desktop turns are not visible to this app-server process, so the phone list
 # infers "working" from the rollout log the desktop itself is appending to.
@@ -453,6 +468,10 @@ class CompanionService:
         )
         self._log_cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
         self._log_cache_lock = threading.Lock()
+        self._read_cache = ReadCache()
+        # Threads whose turn has ended. Their body cannot change again
+        # until a new turn starts, so their reads stay valid far longer.
+        self._terminal_threads: set[str] = set()
         self._observed_threads: dict[str, dict[str, Any]] | None = None
         self._poll_thread: threading.Thread | None = None
         self._untitled_threads: set[str] = set()
@@ -474,15 +493,29 @@ class CompanionService:
             self._poll_thread.start()
 
     def _watch_threads(self) -> None:
-        while not self._stop.wait(2.0):
+        while not self._stop.wait(self._poll_seconds()):
             try:
                 self.poll_thread_changes()
             except (AppServerError, OSError, ValueError) as error:
                 self._note(f"任务同步暂时不可用：{error}")
 
+    def _poll_seconds(self) -> float:
+        # A live turn or a waiting approval needs the fast beat; an idle
+        # Codex only has to notice a desktop-initiated turn eventually.
+        observed = self._observed_threads
+        if observed is None:
+            return POLL_ACTIVE_SECONDS
+        if any(str(row.get('status') or '') in ACTIVE_STATUSES
+               for row in observed.values()):
+            return POLL_ACTIVE_SECONDS
+        if self.pending_approvals():
+            return POLL_ACTIVE_SECONDS
+        return POLL_IDLE_SECONDS
+
     def poll_thread_changes(self) -> None:
         current = {
-            row["thread_id"]: row for row in self.list_threads(limit=80)["threads"]
+            row["thread_id"]: row
+            for row in self.list_threads(limit=80, refresh=True)["threads"]
         }
         if self._client_factory is None:
             for thread_id in sorted(current, key=lambda key: self._desktop_discovery_due.get(key, 0)):
@@ -497,6 +530,12 @@ class CompanionService:
                     break
                 # Bound discovery work so list/completion reconciliation stays live.
                 break
+        for thread_id, row in current.items():
+            if str(row.get('status') or '') in ACTIVE_STATUSES:
+                # The desktop can resume a finished thread without telling
+                # this process, so a thread that woke up loses its cached
+                # body as well as its long TTL.
+                self._invalidate_reads(thread_id)
         previous = self._observed_threads
         self._observed_threads = current
         if previous is None:
@@ -588,6 +627,8 @@ class CompanionService:
         return status
 
     def _reset_client(self) -> None:
+        self._read_cache.clear()
+        self._terminal_threads.clear()
         with self._client_lock:
             client = self._client
             self._client = None
@@ -960,7 +1001,51 @@ class CompanionService:
         # process is running can still be seen as alive.
         return status_from_activity(self._thread_log(thread_id))
 
-    def _read(self, method: str, params: dict[str, Any]) -> Any:
+    def _read(self, method: str, params: dict[str, Any],
+             refresh: bool = False) -> Any:
+        # Reads dominate the cost of this API: one phone status call used to
+        # fan out into a thread/read per row, and every device polled it, all
+        # queued behind one app-server request lock. Cache briefly; retire an
+        # entry the moment a change touches its thread.
+        if method in CACHEABLE_METHODS:
+            return self._read_cache.call(
+                method, params, lambda: self._fetch(method, params),
+                ttl=self._read_ttl(method, params),
+                refresh=refresh)
+        return self._fetch(method, params)
+
+    def _read_ttl(self, method: str, params: dict[str, Any]) -> float:
+        if method != 'thread/read':
+            return READ_TTL_SECONDS
+        key = self.visible_thread_id(thread_tag(params))
+        if not key or key not in self._terminal_threads:
+            return READ_TTL_SECONDS
+        # The desktop can resume a finished thread without telling this
+        # process, so a thread whose rollout log is writing again loses the
+        # long body TTL at once.
+        if self._log_status(key):
+            return READ_TTL_SECONDS
+        return TERMINAL_READ_TTL_SECONDS
+
+    def _note_terminal(self, thread_id: str, status: str, live: bool = False) -> None:
+        """Remember that a thread's turn is over so its reads can be cached.
+
+        Only an app-server turn that actually reached a terminal state
+        qualifies: the rollout log also reports completion for turns another
+        process is running, and a thread can be resumed by the desktop at
+        any time, so a log-only verdict must not pin a live body.
+        """
+        if not thread_id:
+            return
+        if live:
+            self._terminal_threads.discard(thread_id)
+            return
+        if status in TERMINAL_BODY_STATUSES:
+            self._terminal_threads.add(thread_id)
+        else:
+            self._terminal_threads.discard(thread_id)
+
+    def _fetch(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
@@ -977,8 +1062,41 @@ class CompanionService:
     def unsubscribe(self, target: queue.Queue) -> None:
         self._events.unsubscribe(target)
 
+    # Streaming events repeat for every token of one turn, so they carry
+    # no new information about a thread body: refreshing the cache on each
+    # one would put us back to one read per row per poll.
+    STREAMING_EVENT_TYPES = frozenset({
+        'agent_delta',
+        'command_output',
+        'item_started',
+        'item_completed',
+    })
+
     def publish(self, payload: dict[str, Any]) -> None:
+        # An unknown event type invalidates: a new kind must never be able
+        # to leave a device looking at a stale body.
+        if payload.get('type') not in self.STREAMING_EVENT_TYPES:
+            self._invalidate_reads(str(payload.get('thread_id') or ''))
         self._events.publish(payload)
+
+    def _invalidate_reads(self, thread_id: str) -> None:
+        """Retire the cached reads a change makes stale.
+
+        A phone reads the hidden fork while the desktop holds the writer
+        lock, so a change reported against either id stales both bodies.
+        """
+        if not thread_id:
+            self._read_cache.clear()
+            self._terminal_threads.clear()
+            return
+        targets = {thread_id,
+                   self._fork_for(thread_id),
+                   self.visible_thread_id(thread_id),
+                   self._fork_origin.get(thread_id, '')}
+        for target in targets:
+            if target:
+                self._terminal_threads.discard(target)
+                self._read_cache.invalidate_thread(target)
 
     def event_log(self) -> list[str]:
         return list(self._log)
@@ -1353,7 +1471,12 @@ class CompanionService:
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             return None
-        return self._summary(thread)
+        summary = self._summary(thread)
+        # Rows the rollout log cannot classify are decided by this read, so
+        # a settled verdict here is what lets the next poll skip the trip.
+        self._note_terminal(thread_id, str(summary.get("status") or ""),
+                           live=bool(self._log_status(thread_id)))
+        return summary
 
     def _row_status_from_turn(self, thread_id: str) -> str:
         """Classify a row from its turn snapshot when the rollout log cannot."""
@@ -1372,6 +1495,7 @@ class CompanionService:
         limit: int = 40,
         search: str = "",
         cursor: str | None = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "limit": max(1, min(int(limit or 40), 80)),
@@ -1384,7 +1508,7 @@ class CompanionService:
             params["cursor"] = cursor
         if search:
             params["searchTerm"] = search[:120]
-        result = self._read("thread/list", params)
+        result = self._read("thread/list", params, refresh=refresh)
         rows = result.get("data") if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         threads = []
@@ -1621,6 +1745,9 @@ class CompanionService:
         )
         summary["status"] = resolved
         task["status"] = resolved
+        # A settled thread with a quiet rollout log cannot change again on
+        # its own, so its body is worth caching far longer than a live one.
+        self._note_terminal(thread_id, resolved, live=bool(live_status))
         if resolved in {"completed", "failed"}:
             completed_at = int(summary.get("completed_at") or task.get("completed_at_epoch") or 0)
             if completed_at <= 0:
