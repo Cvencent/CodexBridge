@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from codexbridge.settings_page import SETTINGS_HTML
@@ -5,68 +6,126 @@ from codexbridge.settings_page import SETTINGS_HTML
 
 class SettingsPageTest(unittest.TestCase):
     def test_page_defaults_to_simplified_chinese(self):
-        self.assertIn("<html lang=\"zh-CN\">", SETTINGS_HTML)
+        self.assertIn('<html lang="zh-CN">', SETTINGS_HTML)
         self.assertIn("CodexBridge 管理中心", SETTINGS_HTML)
 
-    def test_page_has_general_settings(self):
-        self.assertIn("常规设置", SETTINGS_HTML)
-        self.assertIn("开机自启动", SETTINGS_HTML)
-        self.assertIn("打开日志目录", SETTINGS_HTML)
-        self.assertIn("/api/admin/settings/general", SETTINGS_HTML)
+    def test_page_has_six_routes_in_the_required_order(self):
+        routes = re.findall(r'data-route-link="([^"]+)"', SETTINGS_HTML)
+        self.assertEqual(
+            routes,
+            ["overview", "devices", "queue", "access", "speech", "preferences"],
+        )
+        for route in routes:
+            self.assertIn(f'href="#{route}"', SETTINGS_HTML)
+            self.assertIn(f'id="{route}-panel"', SETTINGS_HTML)
 
-    def test_page_can_view_and_change_companion_port(self):
-        self.assertIn("端口状态", SETTINGS_HTML)
-        self.assertIn('id="companion-port"', SETTINGS_HTML)
-        self.assertIn('action: "set_port"', SETTINGS_HTML)
+    def test_pending_alert_is_an_actionable_button(self):
+        self.assertRegex(SETTINGS_HTML, r'<button[^>]+id="pending-alert"[^>]*>')
+        self.assertIn('data-action="show-pending"', SETTINGS_HTML)
+        self.assertIn("台设备待批准", SETTINGS_HTML)
+
+    def test_device_table_has_scan_friendly_columns(self):
+        columns = re.findall(r'data-column="([^"]+)"', SETTINGS_HTML)
+        self.assertEqual(
+            columns,
+            ["state", "device", "capabilities", "last-seen", "actions"],
+        )
+        for heading in ["状态", "设备", "能力", "最近连接", "操作"]:
+            self.assertIn(f">{heading}<", SETTINGS_HTML)
+
+    def test_pending_device_rows_keep_detail_shortcut(self):
+        pending_branch = re.search(
+            r'function rowActions\(model\) \{[\s\S]*?if \(model\.registrationState === "pending"\) \{[\s\S]*?\n    \}',
+            SETTINGS_HTML,
+        )
+        self.assertIsNotNone(pending_branch)
+        self.assertIn('actionButton("批准"', pending_branch.group(0))
+        self.assertIn('actionButton("拒绝"', pending_branch.group(0))
+        self.assertIn('actionButton("详情", "open-drawer"', pending_branch.group(0))
+
+    def test_device_filters_are_restored_from_session_storage(self):
+        self.assertIn("codexbridge.deviceFilter", SETTINGS_HTML)
+        self.assertIn("sessionStorage.getItem", SETTINGS_HTML)
+        self.assertIn("sessionStorage.setItem", SETTINGS_HTML)
+        self.assertIn("normalizeDeviceFilter", SETTINGS_HTML)
+
+    def test_mobile_card_errors_are_visible_when_loaded(self):
+        self.assertIn(".device-cards > .inline-alert", SETTINGS_HTML)
+        self.assertIn('cards.appendChild(emptyFailure(error, "devices"))', SETTINGS_HTML)
+
+    def test_device_drawer_has_complete_configuration_and_danger_actions(self):
+        self.assertIn('id="device-drawer"', SETTINGS_HTML)
+        self.assertIn('role="dialog"', SETTINGS_HTML)
+        self.assertIn('id="drawer-capabilities"', SETTINGS_HTML)
+        self.assertIn('id="drawer-budget"', SETTINGS_HTML)
+        self.assertIn('data-action="drawer-save"', SETTINGS_HTML)
+        self.assertIn('data-action="drawer-revoke"', SETTINGS_HTML)
+        self.assertIn('data-action="drawer-remove-phone"', SETTINGS_HTML)
+
+    def test_intermediate_events_live_only_in_preferences(self):
+        preferences = re.search(
+            r'<section[^>]+id="preferences-panel"[\s\S]*?</section>',
+            SETTINGS_HTML,
+        )
+        access = re.search(
+            r'<section[^>]+id="access-panel"[\s\S]*?</section>',
+            SETTINGS_HTML,
+        )
+        self.assertIsNotNone(preferences)
+        self.assertIsNotNone(access)
+        self.assertIn("显示中间事件", preferences.group(0))
+        self.assertNotIn("显示中间事件", access.group(0))
+
+    def test_queue_is_hidden_until_an_admin_queue_api_is_available(self):
+        self.assertRegex(SETTINGS_HTML, r'id="queue-nav-item"[^>]*\bhidden\b')
+        self.assertIn("/api/admin/queues", SETTINGS_HTML)
+        self.assertIn("queueCanEdit", SETTINGS_HTML)
+
+    def test_expected_management_apis_are_consumed(self):
+        for path in [
+            "/api/admin/status",
+            "/api/admin/codex-status",
+            "/api/admin/devices",
+            "/api/admin/devices/approve",
+            "/api/admin/devices/reject",
+            "/api/admin/devices/revoke",
+            "/api/admin/devices/capabilities",
+            "/api/admin/companion",
+            "/api/admin/settings/general",
+            "/api/admin/settings/speech",
+            "/api/admin/settings/speech/test",
+        ]:
+            self.assertIn(path, SETTINGS_HTML)
+
+    def test_page_avoids_native_alert_and_confirm(self):
+        self.assertNotIn("window.alert(", SETTINGS_HTML)
+        self.assertNotIn("window.confirm(", SETTINGS_HTML)
+        self.assertIn('id="confirm-dialog"', SETTINGS_HTML)
+        self.assertIn('id="toast-region"', SETTINGS_HTML)
+
+    def test_page_keeps_port_rules_and_access_fields(self):
+        self.assertIn("手机服务端口", SETTINGS_HTML)
+        self.assertIn("手机发现端口", SETTINGS_HTML)
         self.assertIn("8790 已保留", SETTINGS_HTML)
+        self.assertIn('id="companion-port-list"', SETTINGS_HTML)
+        self.assertIn('action: "set_port"', SETTINGS_HTML)
 
-    def test_port_rows_have_stable_edit_actions_and_fixed_state_text(self):
-        self.assertIn("port-actions-cell", SETTINGS_HTML)
-        self.assertIn('fixed: "设备定义"', SETTINGS_HTML)
-        self.assertIn("save.addEventListener", SETTINGS_HTML)
+    def test_page_has_responsive_application_shell(self):
+        self.assertIn("grid-template-columns: 232px minmax(0, 1fr)", SETTINGS_HTML)
+        self.assertIn("@media (max-width: 760px)", SETTINGS_HTML)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", SETTINGS_HTML)
+        self.assertIn("min-width: 320px", SETTINGS_HTML)
+        self.assertIn("overflow-wrap: anywhere", SETTINGS_HTML)
 
-    def test_page_can_configure_intermediate_event_visibility(self):
-        self.assertIn("显示中间事件", SETTINGS_HTML)
-        self.assertIn('id="companion-show-intermediate"', SETTINGS_HTML)
-        self.assertIn("show_intermediate_events: toggle.checked", SETTINGS_HTML)
+    def test_page_does_not_depend_on_external_assets(self):
+        self.assertNotIn("https://fonts.", SETTINGS_HTML)
+        self.assertNotIn("cdn.", SETTINGS_HTML)
 
-    def test_page_has_device_and_speech_sections(self):
-        self.assertIn("设备", SETTINGS_HTML)
-        self.assertIn("语音识别", SETTINGS_HTML)
-        self.assertIn("API Key", SETTINGS_HTML)
-        self.assertIn("/api/admin/settings/speech", SETTINGS_HTML)
+    def test_page_has_single_device_data_surface(self):
+        self.assertEqual(SETTINGS_HTML.count('id="device-table-body"'), 1)
+        self.assertEqual(SETTINGS_HTML.count('id="device-card-list"'), 1)
+        self.assertEqual(SETTINGS_HTML.count('id="device-list"'), 0)
 
-    def test_page_has_one_unified_device_center(self):
-        self.assertEqual(SETTINGS_HTML.count('id="device-list"'), 1)
-        self.assertEqual(SETTINGS_HTML.count('id="companion-phones"'), 0)
-        self.assertIn("连接与发现", SETTINGS_HTML)
-        self.assertIn("设备中心", SETTINGS_HTML)
-        self.assertIn("data-device-filter=\"all\"", SETTINGS_HTML)
-        self.assertIn("data-device-filter=\"phone\"", SETTINGS_HTML)
-        self.assertIn("data-device-filter=\"hardware\"", SETTINGS_HTML)
-        self.assertIn("data-device-filter=\"pending\"", SETTINGS_HTML)
 
-    def test_device_center_has_registration_actions(self):
-        self.assertIn("/api/admin/devices/approve", SETTINGS_HTML)
-        self.assertIn("/api/admin/devices/reject", SETTINGS_HTML)
-        self.assertIn("/api/admin/devices/revoke", SETTINGS_HTML)
-        self.assertIn("批准", SETTINGS_HTML)
-        self.assertIn("拒绝", SETTINGS_HTML)
-        self.assertIn("撤销", SETTINGS_HTML)
-        self.assertIn("registration_state", SETTINGS_HTML)
-
-    def test_page_uses_stable_desktop_layout(self):
-        self.assertIn("grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);", SETTINGS_HTML)
-        self.assertIn(".general-panel { grid-column: 1; grid-row: 1; }", SETTINGS_HTML)
-        self.assertIn(".companion-panel { grid-column: 1; grid-row: 2; }", SETTINGS_HTML)
-        self.assertIn(".speech-panel { grid-column: 1; grid-row: 3; }", SETTINGS_HTML)
-        self.assertIn(".devices-panel {", SETTINGS_HTML)
-        self.assertIn("grid-column: 2;", SETTINGS_HTML)
-        self.assertIn("grid-row: 1 / span 3;", SETTINGS_HTML)
-
-    def test_page_collapses_to_one_column_on_narrow_screens(self):
-        self.assertIn(".general-panel { grid-column: 1; grid-row: auto; order: 1; }", SETTINGS_HTML)
-        self.assertIn(".companion-panel { grid-column: 1; grid-row: auto; order: 2; }", SETTINGS_HTML)
-        self.assertIn(".devices-panel { grid-column: 1; grid-row: auto; align-self: auto; order: 3; }", SETTINGS_HTML)
-        self.assertIn(".speech-panel { grid-column: 1; grid-row: auto; order: 4; }", SETTINGS_HTML)
-        self.assertIn(".general-list, .source-options { grid-template-columns: 1fr; }", SETTINGS_HTML)
+if __name__ == "__main__":
+    unittest.main()

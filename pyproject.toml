@@ -20,6 +20,7 @@ packages = [
     "codexbridge.companion",
     "codexbridge.protocol",
     "codexbridge.devices",
+    "codexbridge.settings_ui",
 ]
 
 [tool.setuptools.package-data]
