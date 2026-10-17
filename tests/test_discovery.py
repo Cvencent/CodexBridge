@@ -1,6 +1,7 @@
 import socket
 import threading
 import unittest
+from unittest import mock
 
 from codexbridge.devices.discovery import (
     DISCOVERY_PORT,
@@ -47,16 +48,16 @@ class DiscoveryTest(unittest.TestCase):
         stop = threading.Event()
         ready = threading.Event()
         requests = []
+        responder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        responder.bind(("127.0.0.1", 0))
+        port = responder.getsockname()[1]
+        responder.settimeout(0.2)
 
-        def responder():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("127.0.0.1", DISCOVERY_PORT))
-            sock.settimeout(0.2)
+        def serve():
             ready.set()
             while not stop.is_set():
                 try:
-                    payload, source = sock.recvfrom(1024)
+                    payload, source = responder.recvfrom(1024)
                 except socket.timeout:
                     continue
                 requests.append(payload)
@@ -64,16 +65,19 @@ class DiscoveryTest(unittest.TestCase):
                     b'{"device":"dotii","device_id":"a1","name":"Desk",'
                     b'"port":8765,"capabilities":["status","tasks"]}'
                 )
-                sock.sendto(reply, source)
-            sock.close()
+                responder.sendto(reply, source)
 
-        thread = threading.Thread(target=responder, daemon=True)
+        thread = threading.Thread(target=serve, daemon=True)
         thread.start()
         self.assertTrue(ready.wait(1.0))
         try:
-            results = discover(timeout=1.0, targets=("127.0.0.1",))
+            with unittest.mock.patch(
+                "codexbridge.devices.discovery.DISCOVERY_PORT", port
+            ):
+                results = discover(timeout=1.0, targets=("127.0.0.1",))
         finally:
             stop.set()
             thread.join(timeout=1.0)
+            responder.close()
         self.assertEqual([result.device_id for result in results], ["a1"])
         self.assertEqual(requests, [DISCOVERY_REQUEST])

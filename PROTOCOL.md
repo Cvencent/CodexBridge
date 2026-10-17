@@ -800,6 +800,11 @@ turn 结束后再派发下一项。手机不再自行决定 `steer` 或 `start`�
 HTTP 手机使用现有 `POST /api/companion/commands` 信封，TCP 设备使用现有
 `{"type":"command",...}` 信封。大结果继续使用 `command_chunk` 分片。
 
+旧式的 `POST /api/companion/threads/<thread_id>/messages` 保持兼容：已协商
+`queue` 的手机发送 `mode=start`（或省略 mode）时映射为 `queue.enqueue`，返回
+队列项；`mode=steer` 仍是立即引导。未声明 `queue` 的旧手机继续直接调用
+`turn.start`。
+
 ### 11A.2 队列项
 
 ```json
@@ -839,6 +844,11 @@ HTTP 手机使用现有 `POST /api/companion/commands` 信封，TCP 设备使用
 客户端按 `queue_id` 和 revision 合并，不能按事件到达顺序推断队列顺序。每个事件带
 全局 `revision`、`thread_id` 和 `server_time`。派发失败时项变为 `failed` 并暂停该线程；
 编辑或删除失败项后恢复派发。
+
+SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `queue` 的客户端，
+`approval_*`、`turn_*` / `resync_required` 和其余任务事件分别要求 `approval`、
+`status` 和 `tasks`。声明 `queue` 的手机在 HTTP SSE 连接建立时按线程收到
+`queue_snapshot`；设备在 `bridge_auth` 完成后的 attach replay 中收到同一快照。
 
 ### 11A.4 上限与恢复
 

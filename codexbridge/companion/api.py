@@ -385,8 +385,14 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 text = str(payload.get("text") or "")
                 model = str(payload.get("model") or "")
                 effort = str(payload.get("effort") or "")
-                if str(payload.get("mode") or "start") == "steer":
+                mode = str(payload.get("mode") or "start")
+                if mode == "steer":
                     result = self.app.service.steer_turn(parts[3], text)
+                elif "queue" in device.capabilities():
+                    result = self.app.service.queue_enqueue(
+                        parts[3], text, model=model, effort=effort
+                    )
+                    result["request_id"] = str(payload.get("client_message_id") or "")
                 else:
                     result = self.app.service.start_turn(
                         parts[3],
@@ -493,6 +499,17 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             self.wfile.write(
                 ("retry: 3000\ndata: " + json.dumps(hello, ensure_ascii=False) + "\n\n").encode("utf-8")
             )
+            current = (
+                self.app.store.authorize(self._token(query))
+                if device is not None
+                else None
+            )
+            if current is not None and "queue" in current.capabilities():
+                for snapshot in self.app.service.queue_snapshots():
+                    if thread_filter and snapshot.get("thread_id") != thread_filter:
+                        continue
+                    data = json.dumps({"type": "queue_snapshot", **snapshot}, ensure_ascii=False)
+                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
             self.wfile.flush()
             while time.monotonic() < deadline:
                 try:
@@ -507,7 +524,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     if current is None or not self.app.store.enabled:
                         break
                     kind = payload.get('type', '')
-                    required = ('approval' if kind.startswith('approval_') else
+                    required = ('queue' if kind.startswith('queue_') else
+                                'approval' if kind.startswith('approval_') else
                                 'status' if kind.startswith('turn_') or kind == 'resync_required' else 'tasks')
                     if required not in current.capabilities():
                         continue

@@ -126,6 +126,15 @@ class CompanionApiTests(unittest.TestCase):
             return response.status, data.decode("utf-8")
         return response.status, json.loads(data.decode("utf-8"))
 
+    def _read_sse_data(self, response):
+        while True:
+            line = response.fp.readline()
+            if not line:
+                raise AssertionError("SSE stream ended before a data event")
+            decoded = line.decode("utf-8").rstrip("\r\n")
+            if decoded.startswith("data: "):
+                return json.loads(decoded[len("data: "):])
+
     def test_ping_requires_no_token(self) -> None:
         status, payload = self.request("GET", "/api/companion/ping")
         self.assertEqual(status, 200)
@@ -146,6 +155,118 @@ class CompanionApiTests(unittest.TestCase):
         _, second = self.request('POST', '/api/companion/commands', request, token=token)
         self.assertEqual(first, second)
         self.assertEqual(sum(method == 'turn/start' for method, _ in self.client.requests), 1)
+
+    def test_queue_enqueue_command_returns_the_queued_item(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+
+        status, payload = self.request(
+            "POST",
+            "/api/companion/commands",
+            {
+                "request_id": "mobile-queue-1",
+                "method": "queue.enqueue",
+                "params": {"thread_id": "t1", "text": "排队继续"},
+            },
+            token=paired["token"],
+        )
+
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["item"]["text"], "排队继续")
+        self.assertEqual(payload["result"]["thread_id"], "t1")
+
+    def test_queue_capable_phone_legacy_start_enqueues_instead_of_starting(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+
+        status, payload = self.request(
+            "POST",
+            "/api/companion/threads/t1/messages",
+            {"text": "进行中继续输入"},
+            token=paired["token"],
+        )
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["item"]["text"], "进行中继续输入")
+        self.assertNotIn("turn/start", [method for method, _ in self.client.requests])
+
+    def test_phone_without_queue_capability_keeps_legacy_start_behavior(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        status, negotiated = self.request(
+            "POST",
+            "/api/companion/capabilities",
+            {"supported": ["control"]},
+            token=paired["token"],
+        )
+        self.assertEqual(status, 200, negotiated)
+        self.assertEqual(negotiated["enabled"], ["control"])
+
+        status, payload = self.request(
+            "POST",
+            "/api/companion/threads/t1/messages",
+            {"text": "旧手机立即发送"},
+            token=paired["token"],
+        )
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["turn_id"], "turn-2")
+        self.assertEqual(self.client.requests[-1][0], "turn/start")
+
+    def test_sse_sends_initial_queue_snapshot_to_queue_phone(self) -> None:
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        self.store.negotiate(paired["phone_id"], ["queue"])
+        queued = self.service.queue_enqueue("t1", "连接前已排队")["item"]
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=1.5
+        )
+        connection.request(
+            "GET",
+            "/api/companion/events",
+            headers={"Authorization": "Bearer " + paired["token"]},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self._read_sse_data(response)["type"], "hello")
+        snapshot = self._read_sse_data(response)
+        connection.close()
+
+        self.assertEqual(snapshot["type"], "queue_snapshot")
+        self.assertEqual(snapshot["thread_id"], "t1")
+        self.assertEqual(
+            [item["queue_id"] for item in snapshot["items"]],
+            [queued["queue_id"]],
+        )
+
+    def test_sse_delivers_queue_events_to_queue_only_phone(self) -> None:
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        self.store.negotiate(paired["phone_id"], ["queue"])
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.port, timeout=1.5
+        )
+        connection.request(
+            "GET",
+            "/api/companion/events",
+            headers={"Authorization": "Bearer " + paired["token"]},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self._read_sse_data(response)
+        self.service.publish(
+            {
+                "type": "queue_item_added",
+                "thread_id": "t1",
+                "queue_id": "q1",
+                "revision": 2,
+            }
+        )
+        payload = self._read_sse_data(response)
+        connection.close()
+        self.assertEqual(payload["type"], "queue_item_added")
+        self.assertEqual(payload["queue_id"], "q1")
 
     def test_status_requires_token(self) -> None:
         status, payload = self.request("GET", "/api/companion/status")
@@ -174,7 +295,8 @@ class CompanionApiTests(unittest.TestCase):
             token=token,
         )
         self.assertEqual(status, 200, sent)
-        self.assertEqual(sent["turn_id"], "turn-2")
+        self.assertEqual(sent["item"]["text"], "继续")
+        self.assertEqual(sent["item"]["status"], "pending")
 
     def test_read_ack_is_shared_by_all_paired_phones(self) -> None:
         code = self.store.pairing_code()["code"]

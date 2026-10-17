@@ -293,7 +293,8 @@ class BridgeHub:
                 except queue.Empty:
                     break
                 kind = event.get('type', '')
-                capability = ('approval' if kind.startswith('approval_') else
+                capability = ('queue' if kind.startswith('queue_') else
+                              'approval' if kind.startswith('approval_') else
                               'status' if kind.startswith('turn_') or kind == 'resync_required'
                               else 'tasks')
                 if capability in self.capabilities_for(device_id):
@@ -427,7 +428,7 @@ class BridgeHub:
             with self._lock:
                 self._unsubscribe_events(device_id)
                 if event_type == 'events_subscribe' and self.commands is not None:
-                    if not self.capabilities_for(device_id) & {'status', 'tasks', 'approval'}:
+                    if not self.capabilities_for(device_id) & {'status', 'tasks', 'approval', 'queue'}:
                         self._send_error(device_id, 'capability_not_enabled')
                         return
                     after = event.get('after', '')
@@ -693,6 +694,12 @@ class BridgeHub:
         # correct for pull-only clients without the host hardcoding them.
         if "status" in self.capabilities_for(device_id):
             self._send_codex_state(device_id, {})
+
+        if "queue" in self.capabilities_for(device_id):
+            queue_snapshots = getattr(self.commands.service, "queue_snapshots", None) if self.commands else None
+            if callable(queue_snapshots):
+                for snapshot in queue_snapshots():
+                    self._send(device_id, {"type": "queue_snapshot", **snapshot})
 
         self._prime_codex_catalog(device_id)
 

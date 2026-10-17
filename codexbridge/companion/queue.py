@@ -165,6 +165,10 @@ class QueueService:
         with self._lock:
             return self._snapshot(thread_id)
 
+    def snapshots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [self._snapshot(thread_id) for thread_id in sorted(self._items)]
+
     def _emit(self, event_type: str, thread_id: str, item: dict[str, Any] | None = None,
               **extra: Any) -> None:
         event = {

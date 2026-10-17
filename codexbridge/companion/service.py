@@ -1332,6 +1332,9 @@ class CompanionService:
     def queue_steer(self, queue_id: str, expected_revision: int = 0) -> dict[str, Any]:
         return self.queues.steer(queue_id, expected_revision=expected_revision)
 
+    def queue_snapshots(self) -> list[dict[str, Any]]:
+        return self.queues.snapshots()
+
     def snapshot(self) -> dict[str, Any]:
         account = self._account()
         listing = self.list_threads(limit=12)

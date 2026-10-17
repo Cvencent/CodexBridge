@@ -437,6 +437,77 @@ class HubTest(unittest.TestCase):
         self.assertEqual(self.s3.sent[-1]["code"], "capability_not_enabled")
         self.assertTrue(self.s3.sent[-1]["text"])
 
+    def test_queue_event_subscription_accepts_queue_only_device(self):
+        from codexbridge.companion.events import EventStream
+        from codexbridge.protocol.commands import CommandDispatcher
+
+        class QueueService:
+            def __init__(self):
+                self.events = EventStream()
+
+            def subscribe(self, after=""):
+                return self.events.subscribe(after)
+
+            def unsubscribe(self, target):
+                self.events.unsubscribe(target)
+
+        registry = DeviceRegistry(None)
+        registry.upsert("queue-device", model="esp", supported=["queue"])
+        registry.set_enabled("queue-device", ["queue"])
+        service = QueueService()
+        hub = BridgeHub(registry, commands=CommandDispatcher(service))
+        session = FakeSession()
+        hub.attach("queue-device", session)
+
+        hub.handle_device_event("queue-device", {"type": "events_subscribe"})
+        service.events.publish(
+            {
+                "type": "queue_item_added",
+                "thread_id": "t1",
+                "queue_id": "q1",
+                "revision": 2,
+            }
+        )
+        hub.poll_events()
+
+        self.assertEqual(session.sent[-1]["type"], "device_event")
+        self.assertEqual(session.sent[-1]["event"]["type"], "queue_item_added")
+        hub.detach("queue-device")
+        self.assertEqual(len(service.events._subscribers), 0)
+
+    def test_replay_state_sends_queue_snapshot_to_queue_device(self):
+        from codexbridge.protocol.commands import CommandDispatcher
+
+        snapshot = {
+            "thread_id": "t1",
+            "revision": 3,
+            "paused": False,
+            "items": [
+                {
+                    "queue_id": "q1",
+                    "thread_id": "t1",
+                    "text": "等待发送",
+                    "status": "pending",
+                    "revision": 1,
+                }
+            ],
+        }
+
+        class QueueService:
+            def queue_snapshots(self):
+                return [snapshot]
+
+        registry = DeviceRegistry(None)
+        registry.upsert("queue-device", model="esp", supported=["queue"])
+        registry.set_enabled("queue-device", ["queue"])
+        hub = BridgeHub(registry, commands=CommandDispatcher(QueueService()))
+        session = FakeSession()
+        hub.attach("queue-device", session)
+
+        hub.replay_state("queue-device")
+
+        self.assertEqual(session.sent, [{"type": "queue_snapshot", **snapshot}])
+
 
 
 
