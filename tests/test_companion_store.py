@@ -117,6 +117,20 @@ class CompanionStoreTests(unittest.TestCase):
         reloaded.load()
         self.assertIsNotNone(reloaded.authorize(claimed["token"]))
 
+    def test_stale_instance_authorizes_phone_paired_by_newer_instance(self) -> None:
+        stale = CompanionStore(self.path)
+        stale.load()
+        fresh = CompanionStore(self.path)
+        fresh.load()
+        claimed = fresh.claim(fresh.pairing_code()["code"], "新手机")
+        assert claimed is not None
+
+        authorized = stale.authorize(claimed["token"])
+
+        self.assertIsNotNone(authorized)
+        assert authorized is not None
+        self.assertEqual(authorized.phone_id, claimed["phone_id"])
+
     def test_saved_payload_never_contains_plain_token(self) -> None:
         code = self.store.pairing_code()["code"]
         claimed = self.store.claim(code, "备机")

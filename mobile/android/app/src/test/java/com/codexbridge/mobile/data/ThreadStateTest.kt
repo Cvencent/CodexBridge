@@ -107,13 +107,54 @@ class ThreadStateTest {
     }
 
     @Test
-    fun visibleThreadsKeepActiveTasksFirst() {
+    fun visibleThreadsKeepCompletedTasksFirst() {
         val active = ThreadSummary(thread_id = "active", status = "working", recency_at = 10)
         val completed = ThreadSummary(thread_id = "completed", status = "completed", recency_at = 20)
         val idle = ThreadSummary(thread_id = "idle", status = "idle", recency_at = 30)
 
         val sorted = sortThreadsByActivity(listOf(completed, idle, active))
 
-        assertEquals(listOf("active", "idle", "completed"), sorted.map { it.thread_id })
+        assertEquals(listOf("completed", "active", "idle"), sorted.map { it.thread_id })
+    }
+
+    @Test
+    fun pendingCompletionUpdatesStaleThreadWithoutWaitingForNetwork() {
+        val stale = ThreadSummary(
+            thread_id = "thread-1",
+            status = "working",
+            updated_at = 10,
+        )
+        val pending = PendingCompletion(
+            threadId = "thread-1",
+            status = "completed",
+            completedAt = 20,
+        )
+
+        val merged = mergePendingCompletions(listOf(stale), listOf(pending))
+
+        assertEquals("completed", merged.single().status)
+        assertEquals(20, merged.single().completed_at)
+    }
+
+    @Test
+    fun onlyNewerAuthoritativeTerminalStateClearsPendingCompletion() {
+        val pending = listOf(
+            PendingCompletion("confirmed", "completed", 20),
+            PendingCompletion("stale", "completed", 20),
+        )
+        val threads = listOf(
+            ThreadSummary(
+                thread_id = "confirmed",
+                status = "completed",
+                completed_at = 20,
+            ),
+            ThreadSummary(
+                thread_id = "stale",
+                status = "completed",
+                completed_at = 10,
+            ),
+        )
+
+        assertEquals(setOf("confirmed"), confirmedPendingCompletionIds(threads, pending))
     }
 }

@@ -31,6 +31,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -207,6 +208,20 @@ fun ChatScreen(
                     }
                     items(state.approvals, key = { "approval-" + it.request_id }) { approval ->
                         ApprovalCard(approval = approval, onDecision = onResolveApproval, onResponse = onRespondApproval)
+                    }
+                }
+                if (state.chatLoading) {
+                    Column(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "正在加载会话…",
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
                 if (showJumpToBottom) {

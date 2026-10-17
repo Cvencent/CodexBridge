@@ -27,6 +27,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,7 +64,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (viewModel.state.value.paired) viewModel.refreshThreadsNow()
+        viewModel.setForeground(true)
+    }
+
+    override fun onPause() {
+        viewModel.setForeground(false)
+        super.onPause()
     }
 
     private fun openThreadFromIntent(intent: android.content.Intent?) {
@@ -94,6 +101,7 @@ class MainActivity : ComponentActivity() {
 private fun AppRoot(state: UiState, viewModel: AppViewModel) {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(state.error, state.notice) {
         val message = state.error ?: state.notice
@@ -146,8 +154,10 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 onDiscoveryPort = viewModel::setDiscoveryPort,
                 onUnpair = viewModel::unpair,
                 onTestNotification = {
-                    CompletionNotificationService.showTestNotification(context)
+                    val result = CompletionNotificationService.showTestNotification(context)
+                    scope.launch { snackbarHostState.showSnackbar(result) }
                 },
+                onOpenNotificationSettings = { CompletionNotificationService.openNotificationSettings(context) },
                 onOpenBackgroundSettings = { openBatteryOptimizationSettings(context) },
             )
         }

@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.RingtoneManager
+import android.media.AudioManager
+import android.provider.Settings
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -184,6 +186,7 @@ class CompletionNotificationService : Service() {
                             // read arrive with read=true: never alert twice there.
                             if (event.read) {
                                 cancelCompletion(event.thread_id)
+                                settings.clearPendingCompletion(event.thread_id)
                                 return@collect
                             }
                             if (event.turn_id.isBlank() && event.completed_at <= 0) return@collect
@@ -194,13 +197,23 @@ class CompletionNotificationService : Service() {
                                     event.completed_at,
                                 )
                             ) return@collect
-                            notifyCompletion(event.thread_id, failed)
+                            notifyCompletion(
+                                event.thread_id,
+                                failed,
+                                event.completed_at.takeIf { it > 0 } ?: System.currentTimeMillis() / 1000,
+                            )
                         }
                         "thread_status" -> {
                             // Another client (phone or ESP device) marked the task
                             // read, so drop this device's pending alert.
                             if (event.thread_id.isNotBlank() && event.status == "idle") {
                                 cancelCompletion(event.thread_id)
+                                settings.clearPendingCompletion(event.thread_id)
+                            } else if (
+                                event.thread_id.isNotBlank() &&
+                                (event.status == "active" || event.active_flags.isNotEmpty())
+                            ) {
+                                settings.clearPendingCompletion(event.thread_id)
                             }
                         }
                     }
@@ -239,7 +252,7 @@ class CompletionNotificationService : Service() {
                             return@forEach
                         }
                         if (completions.shouldNotify(thread.thread_id, thread.turn_id, thread.completed_at)) {
-                            notifyCompletion(thread.thread_id, failed)
+                            notifyCompletion(thread.thread_id, failed, thread.completed_at)
                         }
                     }
                 }
@@ -249,7 +262,12 @@ class CompletionNotificationService : Service() {
         }
     }
 
-    private fun notifyCompletion(threadId: String, failed: Boolean) {
+    private fun notifyCompletion(threadId: String, failed: Boolean, completedAt: Long) {
+        SettingsStore(this).recordPendingCompletion(
+            threadId,
+            if (failed) "failed" else "completed",
+            completedAt,
+        )
         postCompletionNotification(this, threadId, failed)
     }
 
@@ -276,9 +294,36 @@ class CompletionNotificationService : Service() {
         }
 
         /** Used by the settings screen to check the sound while the screen is off. */
-        fun showTestNotification(context: Context) {
+        fun showTestNotification(context: Context): String {
             createChannels(context)
+            val manager = context.getSystemService(NotificationManager::class.java)
+            val channel = manager.getNotificationChannel(COMPLETION_CHANNEL)
+            val audio = context.getSystemService(AudioManager::class.java)
+            if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+                return "通知权限已关闭，请在通知设置中允许通知"
+            }
+            if (channel.importance < NotificationManager.IMPORTANCE_DEFAULT || channel.sound == null) {
+                return "任务完成提醒渠道已静音，请在通知设置中开启声音"
+            }
+            if (audio.ringerMode != AudioManager.RINGER_MODE_NORMAL ||
+                audio.getStreamVolume(AudioManager.STREAM_NOTIFICATION) == 0
+            ) return "手机处于静音或振动模式，或通知音量为零"
+            if (manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) {
+                return "勿扰模式可能阻止提醒声音，请检查手机勿扰设置"
+            }
+            if (channel.sound == RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION) &&
+                RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_NOTIFICATION) == null
+            ) return "系统默认通知铃声为静音，请在通知设置中选择铃声"
             postCompletionNotification(context, "", false)
+            return "已发送测试通知；若仍无声音，请检查通知设置中的铃声及系统声音限制"
+        }
+
+        fun openNotificationSettings(context: Context) {
+            createChannels(context)
+            context.startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                .putExtra(Settings.EXTRA_CHANNEL_ID, COMPLETION_CHANNEL)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
     }
 }

@@ -48,6 +48,7 @@ fun SettingsScreen(
     onDiscoveryPort: (Int) -> Unit,
     onUnpair: () -> Unit,
     onTestNotification: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
     onOpenBackgroundSettings: () -> Unit,
 ) {
     var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
@@ -126,6 +127,9 @@ fun SettingsScreen(
                         OutlinedButton(onClick = onOpenBackgroundSettings, modifier = Modifier.weight(1f)) {
                             Text("后台运行设置")
                         }
+                    }
+                    OutlinedButton(onClick = onOpenNotificationSettings, modifier = Modifier.fillMaxWidth()) {
+                        Text("通知声音设置")
                     }
                 }
             }

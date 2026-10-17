@@ -83,6 +83,39 @@ class SettingsStore(context: Context) : CompletionNotificationState {
         prefs.edit().putLong("completion_watermark_$threadId", completedAt).apply()
     }
 
+    fun recordPendingCompletion(threadId: String, status: String, completedAt: Long) {
+        if (threadId.isBlank() || status !in setOf("completed", "failed") || completedAt <= 0) return
+        prefs.edit()
+            .putString("pending_completion_status_$threadId", status)
+            .putLong("pending_completion_at_$threadId", completedAt)
+            .apply()
+    }
+
+    fun pendingCompletions(): List<PendingCompletion> =
+        prefs.all.keys
+            .asSequence()
+            .filter { it.startsWith("pending_completion_status_") }
+            .mapNotNull { key ->
+                val threadId = key.removePrefix("pending_completion_status_")
+                val status = prefs.getString(key, "").orEmpty()
+                val completedAt = prefs.getLong("pending_completion_at_$threadId", 0L)
+                if (
+                    threadId.isBlank() ||
+                    status !in setOf("completed", "failed") ||
+                    completedAt <= 0
+                ) null
+                else PendingCompletion(threadId, status, completedAt)
+            }
+            .toList()
+
+    fun clearPendingCompletion(threadId: String) {
+        if (threadId.isBlank()) return
+        prefs.edit()
+            .remove("pending_completion_status_$threadId")
+            .remove("pending_completion_at_$threadId")
+            .apply()
+    }
+
     val isPaired: Boolean
         get() = baseUrl.isNotBlank() && token.isNotBlank()
 
@@ -96,6 +129,7 @@ class SettingsStore(context: Context) : CompletionNotificationState {
             .filter {
                 it.startsWith("completion_seen_") ||
                     it.startsWith("completion_watermark_") ||
+                    it.startsWith("pending_completion_") ||
                     it.startsWith("notified_")
             }
             .forEach(editor::remove)

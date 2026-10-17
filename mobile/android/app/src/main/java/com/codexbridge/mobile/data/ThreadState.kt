@@ -2,6 +2,65 @@ package com.codexbridge.mobile.data
 
 val ACTIVE_TASK_STATUSES = setOf("working", "waiting_user")
 
+data class PendingCompletion(
+    val threadId: String,
+    val status: String,
+    val completedAt: Long,
+)
+
+fun mergePendingCompletions(
+    threads: List<ThreadSummary>,
+    pending: List<PendingCompletion>,
+): List<ThreadSummary> {
+    val terminal = pending
+        .filter { it.threadId.isNotBlank() && it.status in setOf("completed", "failed") }
+        .associateBy { it.threadId }
+    if (terminal.isEmpty()) return threads
+
+    val existingIds = threads.mapTo(mutableSetOf()) { it.thread_id }
+    val merged = threads.map { thread ->
+        val completion = terminal[thread.thread_id] ?: return@map thread
+        val newestKnown = maxOf(thread.completed_at, thread.updated_at, thread.recency_at)
+        if (completion.completedAt < newestKnown) {
+            thread
+        } else {
+            thread.copy(
+                status = completion.status,
+                completed_at = maxOf(thread.completed_at, completion.completedAt),
+                updated_at = maxOf(thread.updated_at, completion.completedAt),
+                recency_at = maxOf(thread.recency_at, completion.completedAt),
+            )
+        }
+    }
+    val missing = terminal.values
+        .filterNot { it.threadId in existingIds }
+        .map { completion ->
+            ThreadSummary(
+                thread_id = completion.threadId,
+                status = completion.status,
+                completed_at = completion.completedAt,
+                updated_at = completion.completedAt,
+                recency_at = completion.completedAt,
+            )
+        }
+    return merged + missing
+}
+
+fun confirmedPendingCompletionIds(
+    threads: List<ThreadSummary>,
+    pending: List<PendingCompletion>,
+): Set<String> {
+    val byId = threads.associateBy { it.thread_id }
+    return pending.mapNotNullTo(mutableSetOf()) { completion ->
+        val thread = byId[completion.threadId] ?: return@mapNotNullTo null
+        val newestKnown = maxOf(thread.completed_at, thread.updated_at, thread.recency_at)
+        completion.threadId.takeIf {
+            thread.status in setOf("completed", "failed") &&
+                newestKnown >= completion.completedAt
+        }
+    }
+}
+
 /**
  * Keep one thread's UI state coherent while a detail request is in flight.
  *
@@ -40,7 +99,13 @@ fun applyThreadStatusEvent(current: String, status: String, activeFlags: List<St
 
 fun sortThreadsByActivity(threads: List<ThreadSummary>): List<ThreadSummary> =
     threads.sortedWith(
-        compareBy<ThreadSummary> { if (it.status in ACTIVE_TASK_STATUSES) 0 else 1 }
+        compareBy<ThreadSummary> {
+            when {
+                it.status == "completed" || it.status == "failed" -> 0
+                it.status in ACTIVE_TASK_STATUSES -> 1
+                else -> 2
+            }
+        }
             .thenByDescending { maxOf(it.recency_at, it.updated_at) }
             .thenByDescending { it.thread_id },
     )

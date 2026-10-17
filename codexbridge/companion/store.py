@@ -413,6 +413,7 @@ class CompanionStore:
             return None
         digest = _hash_token(token)
         with self._lock:
+            self._reload_locked()
             for record in self.phones.values():
                 if hmac.compare_digest(record.token_hash, digest):
                     return record
