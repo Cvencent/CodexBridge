@@ -22,6 +22,12 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
+def _free_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -56,7 +62,7 @@ class NetGateTest(unittest.TestCase):
         self.assertFalse(port_is_in_use("127.0.0.1", port))
 
     def test_an_exclusive_datagram_socket_refuses_a_shared_bind(self):
-        port = _free_port()
+        port = _free_udp_port()
         holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(holder.close)
         holder.bind(("127.0.0.1", port))
