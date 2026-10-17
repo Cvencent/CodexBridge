@@ -19,7 +19,14 @@ from codexbridge.devices.discovery import (
 )
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
+from codexbridge.devices.session import CbdpDeviceSession
 from codexbridge.hub import BridgeHub
+from codexbridge.cbdp.events import EventSpine
+from codexbridge.cbdp.gateway import CbdpGateway
+from codexbridge.cbdp.leases import LeaseManager
+from codexbridge.cbdp.projection import ProjectionStore
+from codexbridge.cbdp.refs import ReferenceRegistry
+from codexbridge.cbdp.subscriptions import SubscriptionManager
 from codexbridge.read_state import ReadStateStore
 from codexbridge.companion import (
     CompanionApi,
@@ -380,8 +387,48 @@ def main(argv: list[str] | None = None) -> int:
         workspace=codex_cwd,
     )
     read_state = ReadStateStore(data_dir / "read-state.json")
-    hub = BridgeHub(registry, speech=speech, codex_catalog=codex_catalog, read_state=read_state)
-    manager = DeviceManager(registry, hub)
+    event_spine = EventSpine(data_dir / "cbdp-events.sqlite3")
+    projection = ProjectionStore(data_dir / "cbdp-projection.sqlite3")
+    references = ReferenceRegistry(data_dir / "cbdp-refs.sqlite3")
+    subscriptions = SubscriptionManager(event_spine)
+    leases = LeaseManager()
+    hub = BridgeHub(
+        registry,
+        speech=speech,
+        codex_catalog=codex_catalog,
+        read_state=read_state,
+        event_spine=event_spine,
+        projection=projection,
+        subscriptions=subscriptions,
+        references=references,
+    )
+
+    def cbdp_gateway_factory(device_id, record):
+        return CbdpGateway(
+            commands=lambda: hub.commands,
+            event_spine=event_spine,
+            subscriptions=subscriptions,
+            leases=leases,
+            references=references,
+            pairing_token=lambda target: (
+                candidate.token
+                if (candidate := registry.get(target)) is not None
+                else ""
+            ),
+            capability_policy=lambda target: hub.capabilities_for(target),
+            transport_allowed=lambda target: (
+                (1 << 64) - 1
+                if (candidate := registry.get(target)) is not None
+                else 0
+            ),
+        )
+
+    manager = DeviceManager(
+        registry,
+        hub,
+        cbdp_session_factory=CbdpDeviceSession,
+        cbdp_gateway_factory=cbdp_gateway_factory,
+    )
     codex_state = _CodexState()
 
     companion_store = CompanionStore(data_dir / "companion.json", registry=registry)
@@ -481,6 +528,9 @@ def main(argv: list[str] | None = None) -> int:
             emit(f"端口 {ADMIN_PORT} 已被另一个程序占用，CodexBridge 无法启动。请退出那个程序后重试。错误：{error}")
         else:
             emit(f"CodexBridge 无法监听端口 {ADMIN_PORT}：{error}")
+        projection.close()
+        event_spine.close()
+        references.close()
         _release_instance_lock()
         return 1
     if companion_store.enabled:
@@ -568,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
         # Close the fallback client only after the collector has stopped using
         # the source holder; closing it first can race an in-flight request.
         source_holder.close()
+        projection.close()
+        event_spine.close()
+        references.close()
     if restart_requested.is_set():
         # Hand the ports to the replacement instead of competing with it.
         _release_instance_lock()

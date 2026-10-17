@@ -1,11 +1,11 @@
 # CodexBridge
 
-> **文档导航：** **项目说明** · [通用协议](PROTOCOL.md)
+> **文档导航：** **项目说明** · [通用协议](PROTOCOL.md) · [CBDP v1 协议](docs/CBDP-V1-PROTOCOL.md)
 
 CodexBridge is the PC-side host for Codex-aware devices on a local network.
-It owns Codex collection, a line-delimited JSON device protocol, per-device
-capabilities, unified messages, read-state synchronization, shared speech
-recognition, and the tray UI.
+It owns Codex collection, the CBDP v1 binary device protocol, the legacy
+JSON compatibility gateway, per-device capabilities, unified messages,
+read-state synchronization, shared speech recognition, and the tray UI.
 
 ## Settings
 

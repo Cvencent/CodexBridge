@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import select
 import socket
 import threading
@@ -8,6 +9,25 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from codexbridge.cbdp.capabilities import capability_names
+from codexbridge.cbdp.constants import (
+    FLAG_REQUEST,
+    FLAG_RESPONSE,
+    TAG_CAPABILITY_BITS,
+    TAG_DEVICE_ID,
+    TAG_DISCOVERY_NONCE,
+    TAG_DISCOVERY_SCOPE,
+    TAG_FIRMWARE,
+    TAG_MODEL,
+    TAG_PORT,
+    TAG_PROFILE,
+    TAG_SUPPORTED_CAPS,
+    TAG_TRANSPORT_SECURITY,
+    TYPE_DISCOVERY,
+    TYPE_DISCOVERY_REPLY,
+)
+from codexbridge.cbdp.frame import Frame, decode_frame, encode_frame
+from codexbridge.cbdp.tlv import CBDPError, decode_u8, decode_u16, decode_utf8, u8, u16, utf8
 from codexbridge.net_gate import configure_exclusive
 
 DISCOVERY_PORT = 8764
@@ -16,6 +36,74 @@ DISCOVERY_PORT = 8764
 PRESENCE_DEDUPE_SECONDS = 5.0
 DISCOVERY_REQUEST = b"CODEXBRIDGE_DISCOVER"
 MAX_REPLY_BYTES = 1024
+
+
+def build_cbdp_discovery_request(
+    nonce: bytes,
+    *,
+    scope: int = 2,
+    profile: int = 0,
+) -> bytes:
+    if len(nonce) != 16:
+        raise ValueError("discovery nonce must be 16 bytes")
+    if scope not in {0, 1, 2}:
+        raise ValueError("discovery scope must be 0, 1 or 2")
+    if profile not in {0, 1, 2}:
+        raise ValueError("discovery profile must be 0, 1 or 2")
+    return encode_frame(
+        Frame(
+            message_type=TYPE_DISCOVERY,
+            flags=FLAG_REQUEST,
+            header={
+                TAG_DISCOVERY_NONCE: bytes(nonce),
+                TAG_DISCOVERY_SCOPE: u8(scope),
+                TAG_PROFILE: u8(profile),
+            },
+        )
+    )
+
+
+def parse_cbdp_reply(
+    payload: bytes,
+    host: str,
+    *,
+    expected_nonce: bytes | None = None,
+) -> DiscoveryResult | None:
+    if not isinstance(payload, bytes) or len(payload) > MAX_REPLY_BYTES:
+        return None
+    try:
+        frame = decode_frame(payload, max_frame_bytes=MAX_REPLY_BYTES)
+        if frame.message_type != TYPE_DISCOVERY_REPLY:
+            return None
+        if not frame.flags & FLAG_RESPONSE:
+            return None
+        nonce = frame.header.get(TAG_DISCOVERY_NONCE)
+        if nonce is None or len(nonce) != 16:
+            return None
+        if expected_nonce is not None and nonce != expected_nonce:
+            return None
+        device_id = decode_utf8(frame.header[TAG_DEVICE_ID])
+        model = decode_utf8(frame.header[TAG_MODEL])
+        firmware = decode_utf8(frame.header[TAG_FIRMWARE])
+        profile = decode_u8(frame.header[TAG_PROFILE])
+        port = decode_u16(frame.header[TAG_PORT])
+        supported = frame.header.get(TAG_SUPPORTED_CAPS)
+        if supported is None or len(supported) != 8:
+            return None
+        capabilities = sorted(capability_names(int.from_bytes(supported, "big")))
+    except (CBDPError, KeyError, ValueError):
+        return None
+    if not device_id or not model or profile not in {0, 1, 2} or not 1 <= port <= 65535:
+        return None
+    return DiscoveryResult(
+        host=host,
+        device=model,
+        device_id=device_id,
+        name=None,
+        port=port,
+        capabilities=capabilities,
+        protocol="cbdp",
+    )
 
 # How long one round waits for replies. A Wi-Fi device in power-save mode
 # only wakes for its access point on a fixed interval (an ESP32-C3 station
@@ -35,6 +123,7 @@ class DiscoveryResult:
     capabilities: list[str]
     registration_state: str = "approved"
     registration_nonce: str | None = None
+    protocol: str = "legacy_json"
 
 
 def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
@@ -85,6 +174,10 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
     ):
         return None
 
+    protocol = value.get("protocol", "legacy_json")
+    if protocol not in {"legacy_json", "cbdp"}:
+        protocol = "legacy_json"
+
     return DiscoveryResult(
         host=host,
         device=device,
@@ -94,6 +187,7 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
         capabilities=capabilities,
         registration_state=registration_state,
         registration_nonce=registration_nonce,
+        protocol=protocol,
     )
 
 
@@ -145,6 +239,8 @@ def discover(
 
     deadline = time.monotonic() + timeout
     results: dict[tuple[str, str], DiscoveryResult] = {}
+    nonce = secrets.token_bytes(16)
+    cbdp_request = build_cbdp_discovery_request(nonce, scope=1)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.bind(("", 0))
@@ -152,6 +248,7 @@ def discover(
         for target in target_hosts:
             try:
                 sock.sendto(DISCOVERY_REQUEST, (target, port))
+                sock.sendto(cbdp_request, (target, port))
             except OSError:
                 continue
 
@@ -166,7 +263,11 @@ def discover(
                 payload, source = sock.recvfrom(MAX_REPLY_BYTES + 1)
             except OSError:
                 continue
-            result = parse_reply(payload, source[0])
+            result = parse_cbdp_reply(
+                payload,
+                source[0],
+                expected_nonce=nonce,
+            ) or parse_reply(payload, source[0])
             if result is not None:
                 results[(result.device_id, result.host)] = result
 
@@ -259,7 +360,10 @@ class PresenceListener:
                 payload, source = sock.recvfrom(MAX_REPLY_BYTES + 1)
             except OSError:
                 continue
-            result = parse_reply(payload, source[0])
+            result = parse_cbdp_reply(payload, source[0]) or parse_reply(
+                payload,
+                source[0],
+            )
             if result is None:
                 continue
             now = time.monotonic()

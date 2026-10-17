@@ -56,6 +56,9 @@ class DeviceRecord:
     # that only wakes on its access point's traffic interval.
     host: str | None = None
     port: int | None = None
+    # Wire protocol used by this record.  Older registry files predate the
+    # field and therefore continue to mean the legacy JSON line protocol.
+    protocol: str = "legacy_json"
 
     @property
     def has_token(self) -> bool:
@@ -74,6 +77,7 @@ class DeviceRecord:
             "customized": self.customized,
             "host": self.host,
             "port": self.port,
+            "protocol": self.protocol,
             "kind": self.kind,
             "transport": self.transport,
             "registration_state": self.registration_state,
@@ -162,6 +166,9 @@ class DeviceRecord:
             and not isinstance(registration_discovered_value, bool)
             else None
         )
+        protocol = str(value.get("protocol") or "legacy_json")
+        if protocol not in {"legacy_json", "cbdp"}:
+            protocol = "legacy_json"
         return cls(
             device_id=str(value.get("device_id") or device_id),
             model=model,
@@ -189,6 +196,7 @@ class DeviceRecord:
             registration_address=registration_address,
             registration_discovered_at=registration_discovered_at,
             registration_error=str(value.get("registration_error") or "")[:64],
+            protocol=protocol,
         )
 
 
@@ -296,6 +304,7 @@ class DeviceRegistry:
         supported: Iterable[str] | None = None,
         host: str | None = ...,
         port: int | None = ...,
+        protocol: str | None = None,
     ) -> DeviceRecord:
         with self._lock:
             record = self._devices.get(device_id)
@@ -319,6 +328,7 @@ class DeviceRegistry:
                     registration_state=("approved" if token else "pending"),
                     registration_method="admin_approval",
                     last_address=None if host is ... else host,
+                    protocol=protocol if protocol in {"legacy_json", "cbdp"} else "legacy_json",
                 )
                 self._devices[device_id] = record
                 return record
@@ -337,6 +347,8 @@ class DeviceRegistry:
                     record.last_address = host
             if port is not ...:
                 record.port = port
+            if protocol in {"legacy_json", "cbdp"}:
+                record.protocol = protocol
             if supported is not None:
                 record.supported = normalize(supported)
                 if not record.customized:
@@ -463,6 +475,7 @@ class DeviceRegistry:
             "last_seen": record.last_seen,
             "last_address": record.last_address,
             "has_token": record.has_token,
+            "protocol": record.protocol,
             "supported": sorted(record.supported),
             "enabled": sorted(record.enabled),
             "max_text_chars": record.max_text_chars,

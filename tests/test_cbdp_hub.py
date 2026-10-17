@@ -1,0 +1,192 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from codexbridge.cbdp.compat import EVENT_MESSAGE_READ, CompatContext, to_cbdp
+from codexbridge.cbdp.constants import (
+    QOS_CRITICAL,
+    QOS_STATE,
+    TAG_APPLIED_POLICY,
+    TAG_BODY_REF,
+    TAG_CREATED_AT_MS,
+    TAG_DEVICE_ID,
+    TAG_DEVICE_REF,
+    TAG_EFFECTIVE_CAPS,
+    TAG_KIND,
+    TAG_LAST_SEEN_MS,
+    TAG_MESSAGE_REF,
+    TAG_POLICY_REASON,
+    TAG_POLICY_VERSION,
+    TAG_PROFILE,
+    TAG_READ_AT_MS,
+    TAG_REVISION,
+    TAG_SENDER,
+    TAG_STATUS,
+    TAG_SUMMARY,
+    TAG_THREAD_REF,
+    TAG_TURN_REF,
+    TAG_UPDATED_AT_MS,
+)
+from codexbridge.cbdp.events import EventSpine
+from codexbridge.cbdp.projection import ProjectionStore
+from codexbridge.cbdp.refs import ReferenceRegistry, SYSTEM_DEVICES_TOPIC
+from codexbridge.cbdp.tlv import (
+    decode_i64,
+    decode_tlvs,
+    decode_u8,
+    decode_u16,
+    decode_u32,
+    decode_u64,
+)
+from codexbridge.hub import BridgeHub
+from codexbridge.messages_store import MessageRecord
+
+
+class _Registry:
+    def __init__(self):
+        self.records = {}
+
+    def get(self, device_id):
+        return self.records.get(device_id)
+
+
+class _Record:
+    profile = 2
+    last_seen = 1.5
+    supported = {"status", "text"}
+    enabled = {"status", "text"}
+    max_text_chars = 4096
+
+
+class _Session:
+    gateway = None
+    profile = 1
+
+
+class CbdpHubEventTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.events = EventSpine(self.root / "events.sqlite3")
+        self.addCleanup(self.events.close)
+        self.refs = ReferenceRegistry(self.root / "refs.sqlite3")
+        self.addCleanup(self.refs.close)
+        self.projection = ProjectionStore(self.root / "projection.sqlite3")
+        self.addCleanup(self.projection.close)
+        self.registry = _Registry()
+        self.hub = BridgeHub(
+            self.registry,
+            event_spine=self.events,
+            projection=self.projection,
+            references=self.refs,
+        )
+
+    def _events(self, event_type):
+        return [event for event in self.events.events_since(0) if event.event_type == event_type]
+
+    def test_message_event_contains_protocol_required_fields_and_types(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="m1",
+                thread_id="t1",
+                kind="assistant_text",
+                status="completed",
+                title="Answer",
+                body="hello",
+                created_at=2.0,
+                data={"task": {"turn_id": "u1"}},
+            )
+        )
+        event = self._events(0x0301)[0]
+        payload = event.payload
+        self.assertEqual(decode_u32(payload[TAG_THREAD_REF]), self.refs.ref_for("thread", "t1"))
+        self.assertEqual(decode_u32(payload[TAG_TURN_REF]), self.refs.ref_for("turn", "u1"))
+        self.assertEqual(decode_u32(payload[TAG_MESSAGE_REF]), self.refs.ref_for("message", "m1"))
+        self.assertEqual(decode_u8(payload[TAG_KIND]), 1)
+        self.assertEqual(decode_u16(payload[TAG_STATUS]), 2)
+        self.assertEqual(decode_u8(payload[TAG_SENDER]), 1)
+        self.assertEqual(payload[TAG_SUMMARY], b"Answer")
+        self.assertEqual(payload[TAG_BODY_REF], b"content:m1")
+        self.assertEqual(decode_i64(payload[TAG_CREATED_AT_MS]), 2000)
+        self.assertEqual(decode_i64(payload[TAG_UPDATED_AT_MS]), 2000)
+
+    def test_unchanged_message_fingerprint_does_not_append_twice(self):
+        record = MessageRecord(
+            message_id="m1",
+            thread_id="t1",
+            kind="result",
+            status="completed",
+            title="Answer",
+            body="hello",
+            created_at=2.0,
+        )
+        self.hub.publish(record)
+        self.hub.publish(record)
+        self.assertEqual(len(self._events(0x0301)), 1)
+        self.assertEqual(len(self._events(0x0302)), 0)
+
+    def test_message_read_uses_read_at_ms_and_device_ref(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="m1",
+                thread_id="t1",
+                kind="result",
+                status="completed",
+                title="Answer",
+                body="hello",
+                created_at=2.0,
+            )
+        )
+        self.hub._append_read_event("m1", "t1", "dev-1")
+        payload = self._events(EVENT_MESSAGE_READ)[0].payload
+        self.assertEqual(set(payload), {TAG_THREAD_REF, TAG_MESSAGE_REF, TAG_READ_AT_MS, TAG_DEVICE_REF})
+        self.assertEqual(len(payload[TAG_READ_AT_MS]), 8)
+        decode_i64(payload[TAG_READ_AT_MS])
+
+    def test_device_online_offline_use_profile_and_last_seen(self):
+        self.registry.records["dev-1"] = _Record()
+        self.hub.attach("dev-1", _Session())
+        self.hub.detach("dev-1")
+        for event_type in (0x0601, 0x0602):
+            payload = self._events(event_type)[0].payload
+            self.assertEqual(payload[TAG_DEVICE_ID], b"dev-1")
+            self.assertEqual(decode_u8(payload[TAG_PROFILE]), 2)
+            self.assertEqual(len(payload[TAG_LAST_SEEN_MS]), 8)
+            self.assertNotIn(TAG_STATUS, payload)
+
+    def test_policy_change_uses_devices_topic_and_applied_policy(self):
+        self.registry.records["dev-1"] = _Record()
+        self.hub.note_policy_changed("dev-1")
+        event = self._events(0x0603)[0]
+        self.assertEqual(event.topic_id, SYSTEM_DEVICES_TOPIC)
+        payload = event.payload
+        applied = decode_tlvs(payload[TAG_APPLIED_POLICY])
+        self.assertEqual(decode_u32(applied[TAG_POLICY_VERSION]), 1)
+        self.assertEqual(decode_u32(payload[TAG_POLICY_VERSION]), 1)
+        self.assertEqual(payload[TAG_POLICY_REASON], b"registry_update")
+        self.assertEqual(decode_u64(payload[TAG_REVISION]), event.revision)
+
+    def test_projection_rebuilds_all_protocol_timestamps(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="m1",
+                thread_id="t1",
+                kind="result",
+                status="completed",
+                title="Answer",
+                body="hello",
+                created_at=2.0,
+            )
+        )
+        rebuilt = ProjectionStore(self.root / "rebuilt.sqlite3")
+        self.addCleanup(rebuilt.close)
+        rebuilt.rebuild(self.events.events_since(0))
+        message = rebuilt.get_message("m1")
+        self.assertEqual(message.thread_id, "t1")
+        self.assertEqual(message.status, 2)
+        self.assertEqual(message.body, "hello")
+
+
+if __name__ == "__main__":
+    unittest.main()

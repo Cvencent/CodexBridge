@@ -15,6 +15,49 @@ from codexbridge.messages_store import (
     is_fresh,
     is_in_flight,
 )
+from codexbridge.cbdp.constants import (
+    QOS_CRITICAL,
+    QOS_STATE,
+    TAG_APPLIED_POLICY,
+    TAG_BODY,
+    TAG_BODY_REF,
+    TAG_CREATED_AT_MS,
+    TAG_DEVICE_ID,
+    TAG_DEVICE_REF,
+    TAG_EFFECTIVE_CAPS,
+    TAG_KIND,
+    TAG_LAST_SEEN_MS,
+    TAG_MAX_TEXT_CHARS,
+    TAG_MESSAGE_ID,
+    TAG_MESSAGE_REF,
+    TAG_POLICY_REASON,
+    TAG_POLICY_VERSION,
+    TAG_PROFILE,
+    TAG_READ_AT_MS,
+    TAG_REVISION,
+    TAG_SENDER,
+    TAG_STATUS,
+    TAG_SUMMARY,
+    TAG_THREAD_ID,
+    TAG_THREAD_REF,
+    TAG_TITLE,
+    TAG_TURN_ID,
+    TAG_TURN_REF,
+    TAG_UPDATED_AT_MS,
+)
+
+from codexbridge.cbdp.capabilities import capability_bitmap
+from codexbridge.cbdp.projection import (
+    EVENT_MESSAGE_APPENDED,
+    EVENT_MESSAGE_UPDATED,
+)
+from codexbridge.cbdp.refs import (
+    SYSTEM_BRIDGE_TOPIC,
+    SYSTEM_DEVICES_TOPIC,
+    SYSTEM_RESYNC_TOPIC,
+    SYSTEM_THREAD_SUMMARIES_TOPIC,
+)
+from codexbridge.cbdp.tlv import encode_tlvs, i64, u8, u16, u32, u64, utf8
 from codexbridge.protocol.capabilities import effective
 from codexbridge.protocol.messages import clip_text, clip_utf8, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
@@ -115,6 +158,10 @@ class BridgeHub:
         codex_catalog=None,
         commands=None,
         read_state: ReadStateStore | None = None,
+        event_spine=None,
+        projection=None,
+        subscriptions=None,
+        references=None,
     ):
         self.registry = registry
         self.store = store or MessageStore()
@@ -129,6 +176,10 @@ class BridgeHub:
         self.speech = speech
         self.codex_catalog = codex_catalog
         self.commands = commands
+        self.event_spine = event_spine
+        self.projection = projection
+        self.subscriptions = subscriptions
+        self.references = references
         self._sessions: dict[str, Any] = {}
         self._event_subscriptions: dict[str, Any] = {}
         self._incoming_commands: dict[str, dict] = {}
@@ -137,6 +188,110 @@ class BridgeHub:
         self._work: dict[str, "queue.Queue[tuple[str, Any]]"] = {}
         self._workers: dict[str, threading.Thread] = {}
         self._depth: dict[str, int] = {}
+        self._cbdp_message_events: dict[str, tuple[str, int]] = {}
+        self._cbdp_gateways: dict[str, Any] = {}
+
+    def _cbdp_ref(self, kind: str, external_id: str) -> int:
+        if self.references is None or not external_id:
+            return 0
+        return int(self.references.ref_for(kind, external_id))
+
+    def _cbdp_topic(self, thread_id: str = "") -> int:
+        if self.references is None or not thread_id:
+            return SYSTEM_BRIDGE_TOPIC
+        return int(self.references.topic_for(thread_id))
+
+    def _append_event(self, topic_id: int, event_type: int, qos: int, payload: dict):
+        if self.event_spine is None:
+            return None
+        event = self.event_spine.append(topic_id, event_type, qos, payload)
+        if self.projection is not None:
+            self.projection.apply(event)
+        for gateway in list(self._cbdp_gateways.values()):
+            deliver = getattr(gateway, "deliver_event", None)
+            if deliver is not None:
+                deliver(event)
+        return event
+
+    def register_cbdp_gateway(self, device_id: str, gateway) -> None:
+        with self._lock:
+            self._cbdp_gateways[str(device_id)] = gateway
+
+    def unregister_cbdp_gateway(self, device_id: str) -> None:
+        with self._lock:
+            self._cbdp_gateways.pop(str(device_id), None)
+
+    def _append_message_event(self, record: MessageRecord, appended: bool) -> None:
+        data = record.data if isinstance(record.data, dict) else {}
+        task = data.get("task") if isinstance(data.get("task"), dict) else {}
+        turn_id = str(task.get("turn_id") or data.get("turn_id") or "")
+        sender = {
+            "user_text": 0,
+            "assistant_text": 1,
+            "commentary": 1,
+            "tool": 2,
+            "file_change": 2,
+            "approval": 3,
+            "system": 3,
+            "status": 3,
+            "task": 3,
+            "result": 1,
+        }.get(str(record.kind or ""), 3)
+        created_at_ms = int(float(record.created_at or 0) * 1000)
+        payload = {
+            TAG_THREAD_REF: u32(self._cbdp_ref("thread", record.thread_id)),
+            TAG_TURN_REF: u32(self._cbdp_ref("turn", turn_id)),
+            TAG_MESSAGE_REF: u32(self._cbdp_ref("message", record.message_id)),
+            TAG_KIND: u8(
+                {
+                    "user_text": 0,
+                    "assistant_text": 1,
+                    "commentary": 2,
+                    "tool": 3,
+                    "file_change": 4,
+                    "error": 5,
+                    "approval": 6,
+                    "system": 7,
+                    "status": 7,
+                    "task": 2,
+                    "result": 1,
+                }.get(str(record.kind or ""), 7)
+            ),
+            TAG_STATUS: u16(
+                {
+                    "pending": 0,
+                    "streaming": 1,
+                    "completed": 2,
+                    "failed": 3,
+                    "interrupted": 4,
+                    "working": 1,
+                    "waiting_user": 0,
+                    "queued": 0,
+                    "starting": 0,
+                    "done": 2,
+                }.get(str(record.status or ""), 0)
+            ),
+            TAG_SENDER: u8(sender),
+            TAG_SUMMARY: utf8(str(record.title or record.body or "")),
+            TAG_BODY_REF: utf8(f"content:{record.message_id}"),
+            TAG_BODY: utf8(str(record.body or "")),
+            TAG_CREATED_AT_MS: i64(created_at_ms),
+            TAG_UPDATED_AT_MS: i64(created_at_ms),
+        }
+        if record.title:
+            payload[TAG_TITLE] = utf8(str(record.title))
+        if record.thread_id:
+            payload[TAG_THREAD_ID] = utf8(str(record.thread_id))
+        if turn_id:
+            payload[TAG_TURN_ID] = utf8(turn_id)
+        if record.message_id:
+            payload[TAG_MESSAGE_ID] = utf8(str(record.message_id))
+        self._append_event(
+            self._cbdp_topic(record.thread_id),
+            EVENT_MESSAGE_APPENDED if appended else EVENT_MESSAGE_UPDATED,
+            QOS_CRITICAL if appended else QOS_STATE,
+            payload,
+        )
 
     def set_codex_catalog(self, codex_catalog: Any) -> None:
         with self._lock:
@@ -252,6 +407,8 @@ class BridgeHub:
                 # Same words on the same screen: the periodic snapshot must not
                 # turn into periodic radio traffic and device wake-ups.
                 return
+            if self.event_spine is not None:
+                self._append_message_event(record, appended=previous is None)
             capability = KIND_CAPABILITY.get(record.kind)
             if capability is None:
                 return
@@ -263,13 +420,47 @@ class BridgeHub:
                 # set so every connected device updates at the same time.
                 self._broadcast_codex_state()
 
+    def _device_profile(self, device_id: str, session: Any = None) -> int:
+        record = self.registry.get(device_id)
+        profile = getattr(record, "profile", None) if record is not None else None
+        if profile is None:
+            profile = getattr(session, "profile", None)
+        try:
+            return max(0, min(2, int(profile or 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _device_last_seen_ms(self, device_id: str) -> int:
+        record = self.registry.get(device_id)
+        seen = getattr(record, "last_seen", None) if record is not None else None
+        try:
+            return int(float(seen or 0) * 1000)
+        except (TypeError, ValueError):
+            return 0
+
     def attach(self, device_id: str, session: Any) -> None:
+        gateway = getattr(session, "gateway", None)
+        if gateway is not None:
+            self.register_cbdp_gateway(device_id, gateway)
+        profile = self._device_profile(device_id, session)
         with self._lock:
             self._sessions[device_id] = session
+        self._append_event(
+            SYSTEM_DEVICES_TOPIC,
+            0x0601,
+            QOS_STATE,
+            {
+                TAG_DEVICE_ID: utf8(str(device_id)),
+                TAG_DEVICE_REF: u32(self._cbdp_ref("device", device_id)),
+                TAG_PROFILE: u8(profile),
+                TAG_LAST_SEEN_MS: i64(self._device_last_seen_ms(device_id)),
+            },
+        )
 
     def detach(self, device_id: str) -> None:
+        self.unregister_cbdp_gateway(device_id)
         with self._lock:
-            self._sessions.pop(device_id, None)
+            session = self._sessions.pop(device_id, None)
             self._incoming_commands.pop(device_id, None)
             # A device that went away has no one left to answer, so its queued
             # work must not keep wait_idle() (or the depth counter) occupied.
@@ -277,6 +468,18 @@ class BridgeHub:
             # detached session are already no-ops.
             self._depth.pop(device_id, None)
             self._unsubscribe_events(device_id)
+        profile = self._device_profile(device_id, session)
+        self._append_event(
+            SYSTEM_DEVICES_TOPIC,
+            0x0602,
+            QOS_STATE,
+            {
+                TAG_DEVICE_ID: utf8(str(device_id)),
+                TAG_DEVICE_REF: u32(self._cbdp_ref("device", device_id)),
+                TAG_PROFILE: u8(profile),
+                TAG_LAST_SEEN_MS: i64(self._device_last_seen_ms(device_id)),
+            },
+        )
 
     def _unsubscribe_events(self, device_id: str) -> None:
         target = self._event_subscriptions.pop(device_id, None)
@@ -624,6 +827,40 @@ class BridgeHub:
             return set()
         return effective(record.supported, record.enabled)
 
+    def note_policy_changed(self, device_id: str) -> None:
+        """Publish an explicit device-policy transition after registry updates."""
+
+        if self.event_spine is None:
+            return
+        record = self.registry.get(device_id)
+        capabilities = sorted(effective(
+            record.supported if record is not None else [],
+            record.enabled if record is not None else [],
+        ))
+        policy_version = int(getattr(self, "policy_version", 1) or 1)
+        self._append_event(
+            SYSTEM_DEVICES_TOPIC,
+            0x0603,
+            QOS_CRITICAL,
+            lambda revision: {
+                TAG_DEVICE_ID: utf8(str(device_id)),
+                TAG_DEVICE_REF: u32(self._cbdp_ref("device", device_id)),
+                TAG_EFFECTIVE_CAPS: u64(capability_bitmap(capabilities)),
+                TAG_APPLIED_POLICY: encode_tlvs(
+                    {
+                        TAG_POLICY_VERSION: u32(policy_version),
+                        TAG_MAX_TEXT_CHARS: u32(
+                            int(getattr(record, "max_text_chars", 0) or 0)
+                            if record is not None
+                            else 0
+                        ),
+                    }.items()
+                ),
+                TAG_POLICY_VERSION: u32(policy_version),
+                TAG_POLICY_REASON: utf8("registry_update"),
+                TAG_REVISION: u64(revision),
+            },
+        )
     def state_for(self, device_id: str) -> dict:
         with self._lock:
             capabilities = self.capabilities_for(device_id)
@@ -735,6 +972,7 @@ class BridgeHub:
             # The first global marker sends the fan-out.  Suppress the thread
             # notification here so one read cannot produce duplicate updates.
             self.read_state.mark_message(record.message_id, source=device_id)
+            self._append_read_event(record.message_id, record.thread_id, device_id)
             if record.thread_id and record.created_at > 0:
                 self.read_state.mark_thread(
                     record.thread_id,
@@ -807,6 +1045,7 @@ class BridgeHub:
         thread_id = str(event.get("thread_id") or "")
         source = str(event.get("source") or "")
         if message_id:
+            self._append_read_event(message_id, thread_id, source)
             self._broadcast_read_state(
                 {
                     "type": "read_state",
@@ -835,6 +1074,7 @@ class BridgeHub:
                     source=source,
                     notify=False,
                 )
+                self._append_read_event(covered_id, thread_id, source)
             self._broadcast_read_state(
                 {
                     "type": "read_state",
@@ -846,6 +1086,24 @@ class BridgeHub:
             )
         self._retract_companion_badge(thread_id)
         self._broadcast_codex_state()
+
+    def _append_read_event(self, message_id: str, thread_id: str, source: str) -> None:
+        if not message_id or self.event_spine is None:
+            return
+        record = self.store.get(message_id)
+        thread_id = str(thread_id or (record.thread_id if record is not None else ""))
+        payload = {
+            TAG_THREAD_REF: u32(self._cbdp_ref("thread", thread_id)),
+            TAG_MESSAGE_REF: u32(self._cbdp_ref("message", message_id)),
+            TAG_DEVICE_REF: u32(self._cbdp_ref("device", source)),
+            TAG_READ_AT_MS: i64(int(time.time() * 1000)),
+        }
+        self._append_event(
+            self._cbdp_topic(thread_id),
+            0x0303,
+            QOS_STATE,
+            payload,
+        )
 
     def _broadcast(self, payload: dict, capability: str) -> None:
         with self._lock:

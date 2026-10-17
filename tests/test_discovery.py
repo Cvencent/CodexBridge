@@ -1,6 +1,13 @@
 import socket
 import threading
 import unittest
+from codexbridge.cbdp.constants import (
+    FLAG_REQUEST,
+    TAG_DISCOVERY_NONCE,
+    TAG_DISCOVERY_SCOPE,
+    TYPE_DISCOVERY,
+)
+from codexbridge.cbdp.frame import decode_frame
 from codexbridge.devices.discovery import (
     DISCOVERY_PORT,
     DISCOVERY_REQUEST,
@@ -115,4 +122,11 @@ class DiscoveryTest(unittest.TestCase):
             stop.set()
             thread.join(timeout=1.0)
         self.assertEqual([result.device_id for result in results], ["a1"])
-        self.assertEqual(requests, [DISCOVERY_REQUEST])
+        self.assertIn(DISCOVERY_REQUEST, requests)
+        cbdp_requests = [payload for payload in requests if payload != DISCOVERY_REQUEST]
+        self.assertEqual(len(cbdp_requests), 1)
+        frame = decode_frame(cbdp_requests[0])
+        self.assertEqual(frame.message_type, TYPE_DISCOVERY)
+        self.assertEqual(frame.flags & FLAG_REQUEST, FLAG_REQUEST)
+        self.assertEqual(len(frame.header[TAG_DISCOVERY_NONCE]), 16)
+        self.assertEqual(frame.header[TAG_DISCOVERY_SCOPE], b"\x01")

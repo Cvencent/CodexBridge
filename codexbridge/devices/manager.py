@@ -9,7 +9,11 @@ from typing import Any
 from codexbridge.devices.discovery import DiscoveryResult
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.protocol.capabilities import parse_max_text_chars
-from codexbridge.devices.session import DeviceSession, send_register_offer
+from codexbridge.devices.session import (
+    CbdpDeviceSession,
+    DeviceSession,
+    send_register_offer,
+)
 from codexbridge.hub import BridgeHub
 
 # The host heartbeat is a liveness ping, not a status channel. It must arrive
@@ -48,12 +52,16 @@ class DeviceManager:
         hub: BridgeHub,
         *,
         session_factory: Any = DeviceSession,
+        cbdp_session_factory: Any | None = None,
+        cbdp_gateway_factory: Any | None = None,
         heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
         timeout_seconds: float = 15.0,
     ):
         self.registry = registry
         self.hub = hub
         self.session_factory = session_factory
+        self.cbdp_session_factory = cbdp_session_factory or session_factory
+        self.cbdp_gateway_factory = cbdp_gateway_factory
         self.heartbeat_seconds = heartbeat_seconds
         self.timeout_seconds = timeout_seconds
         self._sessions: dict[str, Any] = {}
@@ -128,6 +136,7 @@ class DeviceManager:
                     name=record.name,
                     port=record.port or DEFAULT_PORT,
                     capabilities=sorted(record.supported),
+                    protocol=record.protocol,
                 ),
                 dial_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
             )
@@ -195,6 +204,7 @@ class DeviceManager:
                 port=record.port,
                 capabilities=sorted(record.supported),
                 registration_state="approved",
+                protocol=record.protocol,
             )
         )
         return True
@@ -254,6 +264,7 @@ class DeviceManager:
             supported=supported,
             host=result.host,
             port=result.port,
+            protocol=result.protocol,
         )
         if legacy is not None and result.device_id != legacy_id:
             self.registry.remove(legacy_id)
@@ -282,7 +293,20 @@ class DeviceManager:
         if not record.token:
             return
 
-        session = self.session_factory(
+        factory = (
+            self.cbdp_session_factory
+            if result.protocol == "cbdp"
+            else self.session_factory
+        )
+        session_kwargs: dict[str, Any] = {}
+        if result.protocol == "cbdp":
+            session_kwargs["protocol"] = "cbdp"
+            if self.cbdp_gateway_factory is not None:
+                session_kwargs["gateway"] = self.cbdp_gateway_factory(
+                    result.device_id,
+                    record,
+                )
+        session = factory(
             result.host,
             result.port,
             record.token,
@@ -301,6 +325,7 @@ class DeviceManager:
                 if dial_timeout_seconds is not None
                 else self.timeout_seconds
             ),
+            **session_kwargs,
         )
         thread = threading.Thread(
             target=self._run_session,
@@ -330,6 +355,7 @@ class DeviceManager:
         record = self.registry.get(device_id)
         if record is None:
             return set()
+        previous_supported = tuple(sorted(record.supported or []))
         model = info.get("model")
         name = info.get("name")
         capabilities = info.get("capabilities")
@@ -348,6 +374,8 @@ class DeviceManager:
         updated = self.registry.get(device_id)
         updated.last_seen = time.time()
         self.registry.save()
+        if tuple(sorted(updated.supported or [])) != previous_supported:
+            self.hub.note_policy_changed(device_id)
         return self.hub.capabilities_for(device_id)
 
     def _online(self, device_id: str, session: Any) -> None:
