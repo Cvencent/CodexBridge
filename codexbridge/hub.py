@@ -8,9 +8,15 @@ import uuid
 from typing import Any
 
 from codexbridge.devices.registry import DeviceRegistry
-from codexbridge.messages_store import KIND_CAPABILITY, MessageRecord, MessageStore
+from codexbridge.messages_store import (
+    KIND_CAPABILITY,
+    MessageRecord,
+    MessageStore,
+    is_fresh,
+    is_in_flight,
+)
 from codexbridge.protocol.capabilities import effective
-from codexbridge.protocol.messages import clip_text, decode, wire_messages
+from codexbridge.protocol.messages import clip_text, clip_utf8, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
 
@@ -64,6 +70,27 @@ BLOCKING_DEVICE_EVENTS = frozenset(
 # every part against this limit would reject legitimate requests.
 WORKER_QUEUE_LIMIT = 24
 
+# A device renders whatever text the host sends; it must never need a table of
+# its own for host error codes. Codes stay machine-readable for logic, the
+# human sentence travels with them, so one protocol works for any client.
+ERROR_TEXT: dict[str, str] = {
+    "busy_retry": "\u7535\u8111\u7aef\u8fd8\u5728\u5904\u7406\u4e0a\u4e00\u6761\u8bf7\u6c42\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5",
+    "capability_not_enabled": "\u8fd9\u4e2a\u529f\u80fd\u6ca1\u6709\u5728\u7535\u8111\u7aef\u5f00\u542f",
+    "codex_catalog_unavailable": "\u7535\u8111\u7aef\u6ca1\u6709\u53ef\u7528\u7684 Codex\uff0c\u8bf7\u786e\u8ba4 Codex \u5df2\u6253\u5f00",
+    "codex_catalog_failed": "\u7535\u8111\u7aef\u8bfb\u53d6 Codex\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5",
+    "codex_unavailable": "\u7535\u8111\u7aef\u7684 Codex \u6682\u65f6\u4e0d\u53ef\u7528",
+    "invalid_request_id": "\u8bf7\u6c42\u7f16\u53f7\u65e0\u6548\uff0c\u8bf7\u91cd\u8bd5",
+    "invalid_command_chunk": "\u6307\u4ee4\u6570\u636e\u635f\u574f\uff0c\u8bf7\u91cd\u8bd5",
+    "invalid_request": "\u8bf7\u6c42\u683c\u5f0f\u4e0d\u6b63\u786e",
+    "invalid_event_cursor": "\u8ba2\u9605\u4f4d\u7f6e\u65e0\u6548\uff0c\u8bf7\u91cd\u65b0\u8fde\u63a5",
+}
+
+# Byte ceilings for one flat `codex_status_snapshot` line. Together they leave
+# comfortable room inside MAX_LINE_BYTES for the field names themselves.
+SNAPSHOT_ID_BYTES = 64
+SNAPSHOT_STATUS_BYTES = 24
+SNAPSHOT_ACTION_BYTES = 240
+
 # Device events whose answer comes from the Codex catalog service. Their
 # "no catalog service" error is cheap enough to return synchronously.
 CATALOG_BACKED_EVENTS = frozenset(
@@ -94,6 +121,11 @@ class BridgeHub:
         self.read_state = read_state or ReadStateStore(None)
         self.read_state.add_listener(self.handle_cross_client_read)
         self.companion_events: Any = None
+        # Which Codex thread each device is looking at, learned from the catalog
+        # selection it confirmed (and echoed back on later requests). Live records
+        # for a thread nobody selected must not drive a screen that is waiting on
+        # its own task.
+        self._device_thread: dict[str, str] = {}
         self.speech = speech
         self.codex_catalog = codex_catalog
         self.commands = commands
@@ -128,16 +160,23 @@ class BridgeHub:
 
         ``completed_unread`` and ``failed_unread`` are the canonical fields for
         new clients.  ``done`` and ``failed`` remain as compatibility aliases
-        with the same unread-only meaning.
+        with the same unread-only meaning. Only records the collector is still
+        refreshing count as running, so a stopped collector cannot leave the
+        badge lit forever.
         """
         running = 0
         completed_unread = 0
         failed_unread = 0
+        now = time.time()
         with self._lock:
             records = self.store.records()
         for record in records:
             if record.kind == "task":
-                if record.status in {"working", "waiting_user", "queued"}:
+                if (
+                    record.status in {"working", "waiting_user", "queued"}
+                    and is_in_flight(record)
+                    and is_fresh(record, now)
+                ):
                     running += 1
                 continue
             if record.kind != "result" or not self._record_is_unread(record):
@@ -154,12 +193,52 @@ class BridgeHub:
             "failed": failed_unread,
         }
 
+    def note_device_thread(self, device_id: str, thread_id: str) -> None:
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return
+        self._device_thread[device_id] = thread_id
+
+    def followed_thread(self, device_id: str) -> str:
+        return self._device_thread.get(device_id, "")
+
+    def _message_visible(self, device_id: str, payload: dict) -> bool:
+        """Can this record change what the device is showing right now?
+
+        Aggregate counters are always shared -- the home screen legitimately
+        reports how much work the computer is doing. A single thread's progress
+        text is not: without this rule any other Codex session on the desktop
+        could cut into a device that is waiting on its own task.
+        """
+        kind = str(payload.get("kind") or "")
+        if kind not in {"status", "task", "result"}:
+            return True
+        followed = self.followed_thread(device_id)
+        if followed:
+            return str(payload.get("thread_id") or "") == followed
+        # A client that has never picked a conversation keeps the aggregate
+        # feed: older firmware, the phone, and any future reader all learn
+        # about work this way until they say otherwise. Records the collector
+        # marks as one thread's private progress stay out of that feed.
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("aggregate") is False:
+            return False
+        return True
+
     def _send_codex_state(self, device_id: str, event: dict) -> None:
+        asked = event.get("thread_id")
+        if isinstance(asked, str) and asked.strip():
+            self.note_device_thread(device_id, asked)
         payload = {"type": "codex_state", **self.counts()}
         request_id = event.get("request_id")
         if "request_id" in event:
             payload["request_id"] = request_id
         self._send(device_id, payload)
+        snapshot = self._status_snapshot(device_id)
+        if snapshot is not None and "request_id" in event:
+            snapshot["request_id"] = request_id
+        if snapshot is not None:
+            self._send(device_id, snapshot)
 
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
@@ -177,7 +256,7 @@ class BridgeHub:
             if capability is None:
                 return
             payload = {"type": "message", **self._message_payload(record)}
-            self._broadcast(payload, capability)
+            self._broadcast_messages(payload, capability)
             if record.kind in {"task", "result"}:
                 # The badge counts are aggregate state, not a chat message.
                 # Push them as soon as a task enters or leaves the terminal
@@ -266,7 +345,12 @@ class BridgeHub:
             if depth >= WORKER_QUEUE_LIMIT:
                 self._send(
                     device_id,
-                    {"type": "error", "code": "busy_retry", "request_id": (event or {}).get("request_id")},
+                    {
+                        "type": "error",
+                        "code": "busy_retry",
+                        "text": ERROR_TEXT["busy_retry"],
+                        "request_id": (event or {}).get("request_id"),
+                    },
                 )
                 return
             self._depth[device_id] = depth + 1
@@ -439,6 +523,10 @@ class BridgeHub:
         except Exception:
             self._send_error(device_id, "codex_catalog_failed")
             return
+        # The voice path may have started a thread of its own; that is the
+        # conversation this device is now waiting on.
+        if hasattr(service, "active_thread"):
+            self.note_device_thread(device_id, service.active_thread(device_id))
         for message in messages or []:
             if isinstance(message, dict):
                 self._send(device_id, message)
@@ -454,6 +542,9 @@ class BridgeHub:
         except Exception:
             self._send_error(device_id, "codex_catalog_failed")
             return
+        for message in messages or []:
+            if isinstance(message, dict) and message.get("type") == "codex_selected":
+                self.note_device_thread(device_id, message.get("thread_id"))
         request_id = event.get("request_id")
         has_request_id = "request_id" in event
         for message in messages or []:
@@ -538,11 +629,20 @@ class BridgeHub:
             pending = [
                 record
                 for record in self.store.pending_for(device_id, capabilities)
-                if not self.read_state.is_message_read(record.message_id)
+                if (
+                    # Live state is not a notification anyone can consume: the
+                    # phone reading "task is working" must not stop a device
+                    # that reconnects later from learning the task is alive.
+                    (is_in_flight(record) and is_fresh(record))
+                    or not self.read_state.is_message_read(record.message_id)
+                )
                 and not (
-                    record.thread_id
+                    not is_in_flight(record)
+                    and record.thread_id
                     and record.created_at > 0
-                    and self.read_state.is_thread_read(record.thread_id, int(record.created_at))
+                    and self.read_state.is_thread_read(
+                        record.thread_id, int(record.created_at)
+                    )
                 )
             ]
             visible = self.store.pending_for(
@@ -749,14 +849,78 @@ class BridgeHub:
                         self._apply_budget(payload, self.budget_for(device_id)),
                     )
 
+    def _broadcast_messages(self, payload: dict, capability: str) -> None:
+        """Fan one record out, but only to devices allowed to see it."""
+        with self._lock:
+            targets = [
+                (device_id, session)
+                for device_id, session in list(self._sessions.items())
+                if capability in self.capabilities_for(device_id)
+                and self._message_visible(device_id, payload)
+            ]
+        for device_id, session in targets:
+            self._send_to(
+                session,
+                self._apply_budget(payload, self.budget_for(device_id)),
+            )
+
     def _send_error(self, device_id: str, code: str) -> None:
-        self._send(device_id, {"type": "error", "code": code})
+        self._send(
+            device_id,
+            {"type": "error", "code": code, "text": ERROR_TEXT.get(code, code)},
+        )
 
     def _send(self, device_id: str, message: dict) -> None:
         with self._lock:
             session = self._sessions.get(device_id)
         if session is not None:
             self._send_to(session, self._apply_budget(message, self.budget_for(device_id)))
+
+    def _status_snapshot(self, device_id: str) -> dict | None:
+        """One bounded line describing what Codex is doing right now.
+
+        A device whose screen stopped making progress pulls this instead of
+        waiting for a push that content dedupe will never send. The payload is
+        a single flat record -- thread id, status, current action, turn id and
+        plan counters -- clipped to the device's declared text budget, so the
+        same call works for an ESP32 and for a desktop client.
+        """
+        with self._lock:
+            # Answer about the thread this device is watching, not whichever
+            # record the collector touched last.
+            live = self.store.live_status(self.followed_thread(device_id))
+        if live is None:
+            return None
+        task = live.data.get("task") if isinstance(live.data, dict) else None
+        task = task if isinstance(task, dict) else {}
+        # The device owns the character budget; SNAPSHOT_*_BYTES are the room a
+        # single flat record has left inside the 768-byte line. Nothing here is
+        # specific to a model of hardware.
+        budget = self.budget_for(device_id)
+
+        def number(value: Any) -> int:
+            try:
+                return max(0, min(1_000_000, int(value)))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "type": "codex_status_snapshot",
+            "thread_id": clip_utf8(str(live.thread_id or ""),
+                                   max_bytes=SNAPSHOT_ID_BYTES),
+            "status": clip_utf8(str(live.status or ""),
+                                max_bytes=SNAPSHOT_STATUS_BYTES),
+            "current_action": clip_utf8(
+                str(task.get("current_action") or live.body or ""),
+                max_chars=budget,
+                max_bytes=SNAPSHOT_ACTION_BYTES,
+            ),
+            "turn_id": clip_utf8(str(task.get("turn_id") or ""),
+                                 max_bytes=SNAPSHOT_ID_BYTES),
+            "plan_completed": number(task.get("plan_completed")),
+            "plan_total": number(task.get("plan_total")),
+            "created_at": int(live.created_at or 0),
+        }
 
     def budget_for(self, device_id: str) -> int | None:
         with self._lock:

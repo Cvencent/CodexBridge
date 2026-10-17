@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from codexbridge import VERSION
+from codexbridge.codex.rollout_activity import (
+    RolloutActivity,
+    status_from_activity,
+)
 from codexbridge.console import emit
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
@@ -756,9 +760,20 @@ class CodexAppServerSource:
         "The following is the Codex agent history",
     )
 
-    def __init__(self, runtime_folder: Path, cwd: Path, codex_command: str | None = None) -> None:
+    def __init__(
+        self,
+        runtime_folder: Path,
+        cwd: Path,
+        codex_command: str | None = None,
+        activity: RolloutActivity | None = None,
+    ) -> None:
         self.runtime_folder = runtime_folder
         self.cwd = cwd
+        # Same rollout-log liveness the phone API uses. The desktop owns its
+        # threads, so "status.type" stays "notLoaded" and "recencyAt" is frozen
+        # at the moment a turn started. Without the log, a long-running task
+        # looks finished to a device no matter how much work it is doing.
+        self.activity = activity or RolloutActivity()
         self.command = _resolve_codex_command(codex_command, runtime_folder)
         self.client = AppServerClient(self.command, cwd)
         self.account: dict[str, Any] = account_snapshot({}, {})
@@ -819,6 +834,18 @@ class CodexAppServerSource:
             return
 
         display_threads = [item for item in threads if self._is_display_thread(item)]
+        # Liveness first: a rollout whose log is still growing is running even
+        # when the listing buries it far down the recency order.
+        liveness: dict[str, str] = {}
+        for listed in display_threads:
+            if not isinstance(listed, dict):
+                continue
+            listed_id = str(listed.get("id") or "")
+            if not listed_id:
+                continue
+            state = status_from_activity(self.activity.activity(listed))
+            if state:
+                liveness[listed_id] = state
         unreadable_ids = getattr(self, "_unreadable_thread_ids", set())
         display_thread_ids = {
             str(item.get("id") or "") for item in display_threads if isinstance(item, dict)
@@ -831,6 +858,7 @@ class CodexAppServerSource:
             if not thread_id or thread_id in seen or thread_id in unreadable_ids:
                 continue
             if (self._is_active_hint(selected) or thread_id in self.active_thread_ids or
+                    liveness.get(thread_id) == "working" or
                     len(candidates) < self.MAX_DISPLAY_TASKS):
                 candidates.append(selected)
                 seen.add(thread_id)
@@ -855,6 +883,17 @@ class CodexAppServerSource:
             if not self._is_display_thread(thread):
                 continue
             snapshot = thread_snapshot(thread)
+            listed_id = str(selected.get("id") or thread.get("id") or "")
+            if liveness.get(listed_id, "") == "working" and snapshot["status"] not in {
+                    "working", "waiting_user", "completed"}:
+                # The desktop is still appending turn records to this rollout.
+                # A second app-server cannot see that and reports the live turn
+                # as interrupted, so the log outranks the detached reading.
+                snapshot["status"] = "working"
+                snapshot["conversation_mode"] = "progress"
+                idle_action = "等待新任务"
+                if snapshot.get("current_action") in ("", idle_action):
+                    snapshot["current_action"] = "正在处理任务"
             if fallback is None:
                 fallback = snapshot
             if snapshot["status"] in {"working", "waiting_user"}:

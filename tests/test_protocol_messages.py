@@ -51,3 +51,45 @@ class MessageWireTest(unittest.TestCase):
         self.assertEqual("".join(item["body"] for item in decoded), body)
         self.assertLessEqual(len(decoded[0]["title"].encode("utf-8")), 160)
         self.assertTrue(decoded[0]["title"].endswith("..."))
+
+
+class ClipUtf8Test(unittest.TestCase):
+    def test_character_budget_applies_first(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        self.assertEqual(clip_utf8("一二三四五六", max_chars=4), "一...")
+
+    def test_byte_budget_never_splits_a_character(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        out = clip_utf8("一二三四五六七八", max_bytes=10)
+        # 7 usable bytes after the suffix fit two 3-byte characters, never a
+        # partial third one.
+        self.assertLessEqual(len(out.encode("utf-8")), 10)
+        self.assertEqual(out, "一二" + "...")
+
+    def test_both_budgets_together_take_the_tighter(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        # A three-character budget is exactly the ellipsis, and the byte budget
+        # is satisfied by it, so the character rule wins and nothing is lost.
+        self.assertEqual(clip_utf8("abcdefgh", max_chars=3, max_bytes=3), "...")
+        # A character budget wider than the bytes available is cut down again.
+        self.assertEqual(clip_utf8("一二三四五", max_chars=5, max_bytes=9), "一二" + "...")
+
+    def test_short_text_passes_through(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        self.assertEqual(clip_utf8("ok", max_bytes=240), "ok")
+        self.assertEqual(clip_utf8("ok"), "ok")
+
+    def test_non_strings_become_empty(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        self.assertEqual(clip_utf8(None, max_bytes=8), "")
+        self.assertEqual(clip_utf8(5, max_bytes=8), "")
+
+    def test_tiny_byte_budget_does_not_crash(self):
+        from codexbridge.protocol.messages import clip_utf8
+
+        self.assertEqual(clip_utf8("abcdef", max_bytes=2), "")

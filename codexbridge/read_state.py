@@ -29,7 +29,27 @@ class ReadStateStore:
         self.load()
 
     def add_listener(self, listener: Any) -> None:
+        if any(
+            self._same_listener(existing, listener)
+            for existing in self._listeners
+        ):
+            return
         self._listeners.append(listener)
+
+    @staticmethod
+    def _same_listener(existing: Any, listener: Any) -> bool:
+        if existing is listener:
+            return True
+        if isinstance(existing, tuple) and isinstance(listener, tuple):
+            return existing == listener
+        existing_func = getattr(existing, "__func__", None)
+        listener_func = getattr(listener, "__func__", None)
+        return (
+            existing_func is not None
+            and existing_func is listener_func
+            and getattr(existing, "__self__", None)
+            is getattr(listener, "__self__", None)
+        )
 
     def _notify(
         self,

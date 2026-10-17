@@ -11,10 +11,20 @@ from codexbridge.protocol.capabilities import parse_max_text_chars
 from codexbridge.devices.session import DeviceSession
 from codexbridge.hub import BridgeHub
 
-# The host heartbeat is a liveness ping, not a status channel. Devices pull the
-# state they render (see ``codex_state_request``), so a slow beat keeps the
-# session warm without waking a battery-powered radio every few seconds.
-DEFAULT_HEARTBEAT_SECONDS = 15.0
+# The host heartbeat is a liveness ping, not a status channel. It must arrive
+# before the device's session timeout, so a 5 s beat is intentional.
+DEFAULT_HEARTBEAT_SECONDS = 5.0
+
+DEFAULT_PORT = 8765
+
+# Remembered-endpoint dials are bounded so a stale IP cannot turn into a retry
+# storm: a device is only re-dialled after this many seconds.
+REDIAL_COOLDOWN_SECONDS = 10.0
+
+# A remembered endpoint is a guess: the LAN is close, so a device that is not
+# there should refuse the socket long before this. Anything slower is a dead
+# host and the round should move on.
+CONNECT_TIMEOUT_SECONDS = 3.0
 
 
 class DeviceManager:
@@ -36,12 +46,76 @@ class DeviceManager:
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.RLock()
         self._stopping = threading.Event()
+        self._redial_at: dict[str, float] = {}
 
     def sync(self, results: Iterable[DiscoveryResult]) -> None:
         if self._stopping.is_set():
             return
         for result in results:
             self._sync_one(result)
+
+    def paired_count(self) -> int:
+        """Paired devices that do not have a live session right now.
+
+        Per device, not globally: a phone with a healthy session must not make a
+        passport that is waiting for its first dial look connected. That mix-up
+        is what let one online device push the broadcast cadence to fifteen
+        seconds and starve every other device out of the LAN.
+        """
+        with self._lock:
+            sessions = set(self._sessions)
+        return sum(
+            1
+            for record in self.registry.all()
+            if record.token
+            and record.device_id not in sessions
+            and not record.device_id.startswith("legacy:")
+        )
+
+    def online_count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def redial_paired(self) -> int:
+        """Dial remembered endpoints for paired devices with no live session.
+
+        UDP discovery stays the authority on *which* devices exist. This only
+        shortens the wait for one that is already known and currently listening:
+        a Wi-Fi station in power-save mode can answer a broadcast later than the
+        host's listen window, which is what made the first entry into an app read
+        "not connected" for close to ten seconds.
+        """
+        now = time.time()
+        with self._lock:
+            waiting = [
+                record
+                for record in self.registry.all()
+                if record.token
+                and record.host
+                and not record.device_id.startswith("legacy:")
+                and record.device_id not in self._sessions
+                and now - self._redial_at.get(record.device_id, 0.0)
+                >= REDIAL_COOLDOWN_SECONDS
+            ]
+            for record in waiting:
+                self._redial_at[record.device_id] = now
+        started = 0
+        for record in waiting:
+            if self._stopping.is_set():
+                break
+            self._sync_one(
+                DiscoveryResult(
+                    host=str(record.host),
+                    device=record.model,
+                    device_id=record.device_id,
+                    name=record.name,
+                    port=record.port or DEFAULT_PORT,
+                    capabilities=sorted(record.supported),
+                ),
+                dial_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
+            )
+            started += 1
+        return started
 
     def stop(self) -> None:
         self._stopping.set()
@@ -63,7 +137,11 @@ class DeviceManager:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
 
-    def _sync_one(self, result: DiscoveryResult) -> None:
+    def _sync_one(
+        self,
+        result: DiscoveryResult,
+        dial_timeout_seconds: float | None = None,
+    ) -> None:
         supported = result.capabilities
         legacy_id = f"legacy:{result.host}"
         legacy = self.registry.get(legacy_id)
@@ -78,17 +156,22 @@ class DeviceManager:
             name=result.name or result.device,
             token=token,
             supported=supported,
+            host=result.host,
+            port=result.port,
         )
         if legacy is not None and result.device_id != legacy_id:
             self.registry.remove(legacy_id)
+        with self._lock:
+            alive = result.device_id in self._sessions
+        if alive:
+            # We are already talking to this device. An announcement or broadcast
+            # from it is expected while it is connected, and rewriting the
+            # registry file every round buys nothing.
+            return
         record.last_seen = time.time()
         self.registry.save()
         if not record.token:
             return
-
-        with self._lock:
-            if result.device_id in self._sessions:
-                return
 
         session = self.session_factory(
             result.host,
@@ -103,7 +186,11 @@ class DeviceManager:
             on_online=lambda: self._online(result.device_id, session),
             on_offline=lambda: self._offline(result.device_id, session),
             heartbeat_seconds=self.heartbeat_seconds,
-            timeout_seconds=self.timeout_seconds,
+            timeout_seconds=(
+                dial_timeout_seconds
+                if dial_timeout_seconds is not None
+                else self.timeout_seconds
+            ),
         )
         thread = threading.Thread(
             target=self._run_session,
@@ -121,6 +208,11 @@ class DeviceManager:
     def _run_session(self, device_id: str, session: Any) -> None:
         try:
             session.run_once()
+        except OSError as exc:
+            # A remembered endpoint can be stale after a DHCP lease moves, so a
+            # refused dial is expected occasionally and must not raise a thread
+            # traceback into the user's console.
+            print(f"CodexBridge: dial {device_id} failed: {exc}")
         finally:
             self._offline(device_id, session)
 

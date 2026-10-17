@@ -24,6 +24,10 @@ from codexbridge.codex.app_server import (
     thread_snapshot,
 )
 from codexbridge.codex.desktop_ipc import DesktopIpcError
+from codexbridge.codex.rollout_activity import (
+    read_log_tail,
+    status_from_activity,
+)
 
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
 # Name given to a continuation fork so the desktop can tell it apart from the
@@ -947,89 +951,14 @@ class CompanionService:
 
     @staticmethod
     def _read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
-        try:
-            stat = path.stat()
-            size = stat.st_size
-            blob = _read_file_tail(path, size)
-        except OSError:
-            return None
-        # The log records its own timestamps, but a stale tail can carry
-        # fresh-looking stamps long after the writer stopped. The file's mtime
-        # is the ground truth for "is someone still appending right now".
-        written_at = float(stat.st_mtime)
-        newest = 0.0
-        # Resuming a thread appends a ``thread_settings_applied`` record with a
-        # fresh timestamp but no real turn work. Reading or resuming an idle
-        # task therefore refreshes the file mtime and the newest stamp, which
-        # used to flicker long-finished tasks into "working". Track the newest
-        # stamp that reflects actual turn activity separately so we can ignore
-        # the bookkeeping noise.
-        real_activity = 0.0
-        kind = ""
-        kind_stamp = 0.0
-        with_timestamps = 0
-        for raw in blob.splitlines():
-            line = raw.decode("utf-8", "replace")
-            if '"timestamp"' not in line:
-                continue
-            activity = _log_activity(line)
-            if activity is not None:
-                stamp, activity_kind = activity
-                kind = activity_kind
-                kind_stamp = stamp
-            else:
-                stamp = _line_stamp(line)
-            if stamp is None:
-                continue
-            with_timestamps += 1
-            if stamp > newest:
-                newest = stamp
-            if not _is_bookkeeping_line(line) and stamp > real_activity:
-                real_activity = stamp
-        if with_timestamps == 0:
-            return None
-        return newest, kind, kind_stamp, written_at, real_activity
+        # One liveness algorithm, shared with the device collector.
+        return read_log_tail(path)
 
     def _log_status(self, thread_id: str) -> str:
-        activity = self._thread_log(thread_id)
-        if activity is None:
-            return ""
-        newest, kind, kind_stamp, written_at, real_activity = activity
-        if newest <= 0:
-            return ""
-        now = time.time()
-        # A finished turn keeps its outcome for as long as the log remembers it.
-        # This used to expire after LOG_SETTLED_SECONDS, which made a task that
-        # failed half an hour ago drop to "idle" in the list while the chat
-        # header still read the turn's own "failed" -- the row and the header
-        # disagreeing about the same task.
-        #
-        # The outcome only holds while it is still the newest real activity. A
-        # thread that completed once and then started another turn has real work
-        # after that completion record, and must report as running rather than
-        # keep showing the older result forever.
-        # ``kind_stamp`` older than the newest real activity means work happened
-        # after that completion, so the completion no longer describes the thread.
-        if kind == "task_complete" and kind_stamp >= real_activity - 1.0:
-            return "completed"
-        if kind == "turn_aborted" and kind_stamp >= real_activity - 1.0:
-            return "idle"
-        # Only claim a turn is running when the freshest append reflects real
-        # work. A resume or a read-only ``thread/read`` drops a
-        # ``thread_settings_applied`` record that carries no turn activity, so
-        # ``real_activity`` is the signal that matters -- the raw newest stamp
-        # would flicker idle tasks into "working" on every read.
-        #
-        # ``real_activity`` comes from the records themselves and is the primary
-        # gate. The file mtime is deliberately NOT required to agree: on this
-        # machine Windows reports a frozen mtime for a rollout that is still
-        # growing, so gating on it reported live turns as idle for hours. The
-        # mtime is only consulted when the tail carries no timestamp at all.
-        if real_activity <= 0:
-            # No usable record timestamp, so fall back to the file's own idea
-            # of when it was last touched.
-            return "working" if now - written_at <= LOG_ACTIVE_SECONDS else ""
-        return "working" if now - real_activity <= LOG_ACTIVE_SECONDS else ""
+        # One liveness algorithm, shared with the device collector: the rollout
+        # log the desktop appends to is the only place a turn that another
+        # process is running can still be seen as alive.
+        return status_from_activity(self._thread_log(thread_id))
 
     def _read(self, method: str, params: dict[str, Any]) -> Any:
         last_error: Exception | None = None

@@ -3,13 +3,24 @@ from __future__ import annotations
 import json
 import select
 import socket
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 DISCOVERY_PORT = 8764
+
+# Repeated announcements from the same endpoint collapse into one dial.
+PRESENCE_DEDUPE_SECONDS = 5.0
 DISCOVERY_REQUEST = b"CODEXBRIDGE_DISCOVER"
 MAX_REPLY_BYTES = 1024
+
+# How long one round waits for replies. A Wi-Fi device in power-save mode
+# only wakes for its access point on a fixed interval (an ESP32-C3 station
+# here reports 1.024 s), so a window shorter than that interval can simply
+# miss a listener that is there and willing to answer. Two intervals plus a
+# margin keeps discovery honest without holding the host longer than needed.
+DISCOVERY_TIMEOUT_SECONDS = 2.5
 
 
 @dataclass(frozen=True)
@@ -128,3 +139,89 @@ def discover(
                 results[(result.device_id, result.host)] = result
 
     return list(results.values())
+
+
+class PresenceListener:
+    """Receive unsolicited identity announcements on the discovery port.
+
+    A device that just opened its listener tells the LAN instead of waiting to
+    be asked, because a station in power save only answers a broadcast when its
+    listen interval happens to line up. The payload is the same discovery reply
+    `parse_reply` already accepts, so any device that can answer a broadcast can
+    also announce itself with no extra protocol.
+    """
+
+    def __init__(
+        self,
+        on_result,
+        logger=print,
+        *,
+        port: int = DISCOVERY_PORT,
+    ) -> None:
+        self.on_result = on_result
+        self.logger = logger
+        # Overridable so a test can bind a free port; two live listeners cannot
+        # share the discovery port and keep the datagrams unambiguous.
+        self.port = port
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._sock: socket.socket | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", self.port))
+        except OSError as exc:
+            # Another program holds the discovery port. Broadcast discovery keeps
+            # working without this, so the bridge must still start.
+            self.logger(f"CodexBridge: presence listener unavailable: {exc}")
+            return
+        sock.settimeout(1.0)
+        self._sock = sock
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        seen: dict[str, float] = {}
+        while not self._stop.is_set():
+            try:
+                readable, _, _ = select.select([sock], [], [], 1.0)
+                if not readable:
+                    continue
+                payload, source = sock.recvfrom(MAX_REPLY_BYTES + 1)
+            except OSError:
+                continue
+            result = parse_reply(payload, source[0])
+            if result is None:
+                continue
+            now = time.monotonic()
+            key = f"{result.device_id}:{result.host}:{result.port}"
+            # Devices repeat announcements to survive a lost datagram; one dial
+            # per device per window is enough.
+            if now - seen.get(key, 0.0) < PRESENCE_DEDUPE_SECONDS:
+                continue
+            seen[key] = now
+            try:
+                self.on_result(result)
+            except Exception as exc:
+                self.logger(f"CodexBridge: presence handler failed: {exc}")
+
+    def stop(self) -> None:
+        self._stop.set()
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            self._thread = None

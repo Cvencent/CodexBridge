@@ -59,9 +59,17 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
 
 
 class FakeDevice:
-    def __init__(self, host: str = "127.0.0.1", device_id: str = "fake-device"):
+    def __init__(self, host: str = "127.0.0.1", device_id: str = "fake-device",
+                 capabilities: list[str] | None = None,
+                 max_text_chars: int | None = None):
         self.host = host
         self.device_id = device_id
+        # A device announces its own capabilities and its own body budget; the
+        # host must honour both without per-device branches.
+        self.model = "dotii"
+        self._capabilities = list(capabilities) if capabilities else [
+            "status", "text", "read_ack"]
+        self.max_text_chars = max_text_chars
         self._expected_token: str | None = None
         self._stalled = False
         self._callbacks: list[Callable[[], None]] = []
@@ -131,10 +139,13 @@ class FakeDevice:
             callback()
 
     def _device_info(self) -> dict:
-        return {
+        info = {
             "device_id": self.device_id,
-            "model": "dotii",
+            "model": self.model,
             "name": "Fake Device",
             "firmware": "test",
-            "capabilities": ["status", "text", "read_ack"],
+            "capabilities": list(self._capabilities),
         }
+        if self.max_text_chars is not None:
+            info["max_text_chars"] = self.max_text_chars
+        return info

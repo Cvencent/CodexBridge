@@ -193,14 +193,18 @@ class HubTest(unittest.TestCase):
 
     def test_voice_command_without_catalog_reports_unavailable(self):
         self.hub.handle_device_event("d4", {"type": "voice_command", "text": "在吗"})
-        self.assertEqual(self.s4.sent[-1],
-                         {"type": "error", "code": "codex_catalog_unavailable"})
+        last = self.s4.sent[-1]
+        self.assertEqual(last["type"], "error")
+        self.assertEqual(last["code"], "codex_catalog_unavailable")
+        self.assertTrue(last["text"])
 
     def test_voice_command_failure_is_reported(self):
         self.hub.set_codex_catalog(VoiceCatalog(error=RuntimeError("boom")))
         self.hub.handle_device_event("d4", {"type": "voice_command", "text": "在吗"})
         self.assertTrue(self.hub.wait_idle(2.0))
-        self.assertEqual(self.s4.sent[-1], {"type": "error", "code": "codex_catalog_failed"})
+        last = self.s4.sent[-1]
+        self.assertEqual(last["code"], "codex_catalog_failed")
+        self.assertTrue(last["text"])
 
     def test_reconnect_state_includes_unread_messages(self):
         self.hub.publish(
@@ -341,8 +345,13 @@ class HubTest(unittest.TestCase):
             MessageRecord("result:t3:2", "t3", "result", "failed", "结果", "正文", 2.0)
         )
         self.hub.handle_device_event("d1", {"type": "codex_state_request", "request_id": 7})
+        counters = [
+            message
+            for message in self.s1.sent
+            if message.get("type") == "codex_state"
+        ]
         self.assertEqual(
-            self.s1.sent[-1],
+            counters[-1],
             {
                 "type": "codex_state",
                 "running": 1,
@@ -353,6 +362,14 @@ class HubTest(unittest.TestCase):
                 "request_id": 7,
             },
         )
+        snapshots = [
+            message
+            for message in self.s1.sent
+            if message.get("type") == "codex_status_snapshot"
+        ]
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual("t1", snapshots[0]["thread_id"])
+        self.assertEqual(7, snapshots[0]["request_id"])
 
     def test_new_terminal_result_pushes_fresh_codex_state_to_status_devices(self):
         for session in (self.s1, self.s2, self.s3, self.s4):
@@ -417,10 +434,8 @@ class HubTest(unittest.TestCase):
     def test_codex_state_request_requires_status_capability(self):
         self.hub.registry.set_enabled("d3", ["tasks"])
         self.hub.handle_device_event("d3", {"type": "codex_state_request"})
-        self.assertEqual(
-            self.s3.sent[-1],
-            {"type": "error", "code": "capability_not_enabled"},
-        )
+        self.assertEqual(self.s3.sent[-1]["code"], "capability_not_enabled")
+        self.assertTrue(self.s3.sent[-1]["text"])
 
 
 

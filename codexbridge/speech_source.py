@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import subprocess
 import sys
+import time
 import tempfile
 import threading
 import wave
@@ -318,30 +319,119 @@ class OpenAICompatibleSpeechRecognizer:
         self.last_error = ""
         self._probe: tuple[bool, str] | None = None
         self._probe_at = 0.0
+        self._probe_key = ""
         self._probe_lock = threading.Lock()
+        self._probing = False
 
     def _config(self) -> dict:
         return _normalize_config(self._config_loader())
+
+    @staticmethod
+    def _signature(config: dict) -> str:
+        # Identity of "the same endpoint we already proved". A new model name, a
+        # different gateway or a saved API key must all force a fresh probe,
+        # otherwise a verdict earned by one configuration gets reused by another.
+        return "|".join(
+            [
+                str(config.get("endpoint") or ""),
+                str(config.get("model") or ""),
+                str(config.get("language") or ""),
+                str(hash(str(config.get("api_key") or ""))),
+            ]
+        )
 
     def invalidate_probe(self) -> None:
         with self._probe_lock:
             self._probe = None
             self._probe_at = 0.0
+            self._probe_key = ""
 
     @property
     def recognition_timeout_seconds(self) -> float:
         return float(self._config()["timeout_seconds"]) + 5.0
 
     def available(self) -> tuple[bool, str]:
+        """Honest availability, without making a recording wait for a probe.
+
+        "Configured" is not "working": a gateway can list two dozen chat models
+        and still 404 every audio request, which is how the device ended up
+        silently transcribing through a fallback while the user only saw wrong
+        text. A proven verdict -- good or bad -- is reused for
+        ``PROBE_TTL_SECONDS``. While nothing is known the endpoint is assumed
+        usable and a background probe settles it, so no take is delayed by the
+        check itself.
+        """
         config = self._config()
         valid, reason = validate_speech_endpoint(config["endpoint"])
         if not valid:
             return False, reason
-        return (
-            True,
+        label = (
             f"OpenAI 兼容接口已配置：{_endpoint_label(config['endpoint'])}"
-            f" · {config['model']}",
+            f" · {config['model']}"
         )
+        key = self._signature(config)
+        with self._probe_lock:
+            verdict = self._probe
+            fresh = (
+                verdict is not None
+                and self._probe_key == key
+                and (time.monotonic() - self._probe_at) < self.PROBE_TTL_SECONDS
+            )
+            start_probe = (not fresh) and (not self._probing)
+            if start_probe:
+                self._probing = True
+        if fresh and verdict is not None:
+            ok, detail = verdict
+            if not ok:
+                return False, f"接口实测不可用：{detail}"
+            return True, label
+        if start_probe:
+            threading.Thread(
+                target=self._background_probe,
+                args=(key,),
+                name="speech-probe",
+                daemon=True,
+            ).start()
+        return True, label
+
+    def _background_probe(self, key: str) -> None:
+        try:
+            ok, detail = self._run_probe()
+        except Exception as error:  # noqa: BLE001 - the probe is best effort
+            ok, detail = False, str(error) or error.__class__.__name__
+        with self._probe_lock:
+            if self._probe_key == key or not self._probe_key:
+                self._probe = (ok, detail)
+                self._probe_at = time.monotonic()
+                self._probe_key = key
+            self._probing = False
+
+    def _run_probe(self) -> tuple[bool, str]:
+        """Round-trip with one second of silence to learn the real answer."""
+        config = self._config()
+        valid, reason = validate_speech_endpoint(config["endpoint"])
+        if not valid:
+            return False, reason
+        with tempfile.TemporaryDirectory(prefix="codexbridge-probe-") as temp_dir:
+            path = Path(temp_dir) / "probe.wav"
+            with wave.open(str(path), "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"\x00\x00" * 8000)
+            try:
+                self._request(path, timeout=self.PROBE_TIMEOUT_SECONDS)
+            except Exception as error:  # noqa: BLE001 - report, never raise
+                detail = str(error)
+                if not (
+                    "HTTP 422" in detail
+                    and _is_expected_silence_probe_error(422, detail)
+                ):
+                    self.last_error = detail
+                    return False, self.last_error
+        self.last_error = ""
+        return True, f"连接成功：{_endpoint_label(config['endpoint'])}"
+
 
     def _request(self, wav_path: Path, timeout: float | None = None):
         config = self._config()
@@ -395,29 +485,19 @@ class OpenAICompatibleSpeechRecognizer:
         return text
 
     def probe(self) -> tuple[bool, str]:
-        config = self._config()
-        valid, reason = validate_speech_endpoint(config["endpoint"])
-        if not valid:
-            return False, reason
-        with tempfile.TemporaryDirectory(prefix="codexbridge-probe-") as temp_dir:
-            path = Path(temp_dir) / "probe.wav"
-            with wave.open(str(path), "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(16000)
-                wav_file.writeframes(b"\x00\x00" * 8000)
-            try:
-                self._request(path, timeout=self.PROBE_TIMEOUT_SECONDS)
-            except Exception as error:  # noqa: BLE001 - report probe failure
-                detail = str(error)
-                if not (
-                    "HTTP 422" in detail
-                    and _is_expected_silence_probe_error(422, detail)
-                ):
-                    self.last_error = detail
-                    return False, self.last_error
-        self.last_error = ""
-        return True, f"连接成功：{_endpoint_label(config['endpoint'])}"
+        """Explicit test behind the settings page "测试" button.
+
+        The verdict is cached under the current signature, so an endpoint that
+        just passed a manual test is not probed again by ``available()`` until
+        the TTL expires.
+        """
+        key = self._signature(self._config())
+        ok, detail = self._run_probe()
+        with self._probe_lock:
+            self._probe = (ok, detail)
+            self._probe_at = time.monotonic()
+            self._probe_key = key
+        return ok, detail
 
     def start(self, wav_path: Path):
         return _RecognitionJob(self.transcribe, wav_path)

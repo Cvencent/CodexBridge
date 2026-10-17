@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 import hashlib
 import json
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +35,41 @@ def _without_volatile(value: Any) -> Any:
     return value
 
 
+# A task that is still moving is not a notification the user has consumed.
+# These records describe live state, so the host must keep them reachable after
+# any client has marked them read, and a pull must always be able to answer
+# with the current one.
+IN_FLIGHT_KINDS: frozenset[str] = frozenset({"status", "task"})
+IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
+    {"working", "waiting_user", "queued", "starting"}
+)
+
+
+def is_in_flight(record: "MessageRecord") -> bool:
+    return record.kind in IN_FLIGHT_KINDS and record.status in IN_FLIGHT_STATUSES
+
+
+# A live record only proves the host is still refreshing it. If the collector
+# stops republishing a working thread, the old record must not keep the running
+# badge lit forever.
+IN_FLIGHT_STALE_AFTER_SECONDS: float = 90.0
+
+
+def is_fresh(
+    record: "MessageRecord",
+    now: float | None = None,
+    max_age_seconds: float = IN_FLIGHT_STALE_AFTER_SECONDS,
+) -> bool:
+    """Return whether a live record has been republished recently enough."""
+    if max_age_seconds <= 0:
+        return True
+    stamp = record.seen_at or record.created_at
+    if stamp <= 0:
+        return True
+    reference = time.time() if now is None else float(now)
+    return reference - stamp <= float(max_age_seconds)
+
+
 KIND_CAPABILITY: dict[str, str] = {
     "status": "status",
     "task": "tasks",
@@ -56,6 +90,8 @@ class MessageRecord:
     created_at: float
     data: dict[str, Any] | None = None
     read_by: set[str] = field(default_factory=set)
+    # Set by the store on each live arrival; transport metadata, not content.
+    seen_at: float = 0.0
 
     @property
     def fingerprint(self) -> str:
@@ -96,6 +132,9 @@ class MessageStore:
             record.read_by.update(existing.read_by)
             if record.data is None:
                 record.data = existing.data
+        if record.kind in IN_FLIGHT_KINDS:
+            record.seen_at = time.time()
+        if existing is not None:
             del self._messages[record.message_id]
         self._messages[record.message_id] = record
         while len(self._messages) > self.max_messages:
@@ -115,6 +154,34 @@ class MessageStore:
     def read_by(self, message_id: str) -> set[str]:
         record = self._messages.get(message_id)
         return set(record.read_by) if record is not None else set()
+
+    def live_status(self, thread_id: str = "") -> MessageRecord | None:
+        """Most recent in-flight status record, or None.
+
+        The device asks for this when its screen stops making progress, so the
+        answer has to be the record the host is currently sitting on rather than
+        the last one that happened to look new. ``thread_id`` narrows the answer
+        to the conversation a client is actually watching.
+        """
+        wanted = str(thread_id or "")
+        fresh = [
+            record
+            for record in self._messages.values()
+            if is_in_flight(record) and is_fresh(record)
+            and (not wanted or str(record.thread_id or "") == wanted)
+        ]
+        status_records = [record for record in fresh if record.kind == "status"]
+        # A task record carries the same live thread when only one half of the
+        # pair was republished, so it is still a valid answer.
+        candidates = status_records or [
+            record for record in fresh if record.kind == "task"
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (item.seen_at or item.created_at, item.message_id),
+        )
 
     def records(self) -> list[MessageRecord]:
         """Snapshot of stored records in insertion order.

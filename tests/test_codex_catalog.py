@@ -305,6 +305,9 @@ class CodexCatalogTest(unittest.TestCase):
                     "title": "修复登录",
                     "project": "项目 1",
                     "last_message": "登录问题已经修复。",
+                    # The id tells the host which thread this device now follows,
+                    # so other sessions cannot cut into its screen.
+                    "thread_id": "thread-1",
                 }
             ],
         )

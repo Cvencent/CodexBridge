@@ -228,6 +228,17 @@ class CodexCatalogService:
         listing = self._render_thread_list(state, project)
         return selected + listing
 
+    def active_thread(self, device_id: str) -> str:
+        """Thread this device is following, or an empty string.
+
+        The hub uses this to decide which live records may reach the device: a
+        status line about someone else's session must not cut into a screen that
+        is waiting on its own task.
+        """
+        with self._lock:
+            state = self._states.get(device_id)
+            return str(state.active_thread_id or "") if state else ""
+
     def handle_voice_command(self, device_id: str, text: str) -> list[dict[str, Any]]:
         """Turn a confirmed voice instruction into a real Codex turn.
 
@@ -613,6 +624,10 @@ class CodexCatalogService:
             "type": "codex_selected",
             "title": _safe_text(title, CATALOG_TITLE_CHARS),
             "project": _safe_text(project_name, CATALOG_DETAIL_CHARS),
+            # The device repeats this id back on every later request, so the
+            # host can answer questions about *this* thread rather than the most
+            # recent one any client touched.
+            "thread_id": _safe_text(state.active_thread_id, 63),
         }
         if last_message:
             payload["last_message"] = last_message
