@@ -62,6 +62,8 @@ class DeviceManager:
         self._stopping = threading.Event()
         self._redial_at: dict[str, float] = {}
         self._send_register_offer = send_register_offer
+        self._last_seen_saved_at: dict[str, float] = {}
+        self._last_seen_save_seconds = 30.0
 
     def sync(self, results: Iterable[DiscoveryResult]) -> None:
         if self._stopping.is_set():
@@ -292,6 +294,7 @@ class DeviceManager:
             on_event=lambda event: self.hub.handle_device_event(result.device_id, event),
             on_online=lambda: self._online(result.device_id, session),
             on_offline=lambda: self._offline(result.device_id, session),
+            on_heartbeat=lambda: self._heartbeat(result.device_id),
             heartbeat_seconds=self.heartbeat_seconds,
             timeout_seconds=(
                 dial_timeout_seconds
@@ -351,6 +354,7 @@ class DeviceManager:
         record = self.registry.get(device_id)
         if record is not None:
             record.last_seen = time.time()
+            self._last_seen_saved_at[device_id] = time.monotonic()
             self.registry.save()
         self.hub.attach(device_id, session)
         # The attach-time replay primes the Codex catalog, which is a blocking
@@ -358,9 +362,21 @@ class DeviceManager:
         # so hand it to the hub's per-device worker instead.
         self.hub.replay_state_async(device_id)
 
+    def _heartbeat(self, device_id: str) -> None:
+        record = self.registry.get(device_id)
+        if record is None:
+            return
+        record.last_seen = time.time()
+        monotonic_now = time.monotonic()
+        last_saved = self._last_seen_saved_at.get(device_id, 0.0)
+        if monotonic_now - last_saved >= self._last_seen_save_seconds:
+            self.registry.save()
+            self._last_seen_saved_at[device_id] = monotonic_now
+
     def _offline(self, device_id: str, session: Any) -> None:
         self.hub.detach(device_id)
         with self._lock:
             if self._sessions.get(device_id) is session:
                 self._sessions.pop(device_id, None)
                 self._threads.pop(device_id, None)
+            self._last_seen_saved_at.pop(device_id, None)

@@ -46,12 +46,15 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onToggleTheme: (Boolean) -> Unit,
     onDiscoveryPort: (Int) -> Unit,
+    onUpdateRoutes: (String, String) -> Unit,
     onUnpair: () -> Unit,
     onTestNotification: () -> Unit,
     onOpenNotificationSettings: () -> Unit,
     onOpenBackgroundSettings: () -> Unit,
 ) {
     var discoveryPort by remember(state.discoveryPort) { mutableStateOf(state.discoveryPort.toString()) }
+    var lanUrl by remember(state.lanUrl) { mutableStateOf(state.lanUrl) }
+    var wanUrl by remember(state.wanUrl) { mutableStateOf(state.wanUrl) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -77,7 +80,32 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("连接", fontWeight = FontWeight.Medium)
-                    SettingRow("电脑地址", state.baseUrl.ifBlank { "--" })
+                    SettingRow("当前线路", state.activeRouteLabel.ifBlank { "--" })
+                    SettingRow("当前地址", state.baseUrl.ifBlank { "--" })
+                    OutlinedTextField(
+                        value = lanUrl,
+                        onValueChange = { lanUrl = it },
+                        label = { Text("内网地址") },
+                        placeholder = { Text("192.168.0.42:8568") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = wanUrl,
+                        onValueChange = { wanUrl = it },
+                        label = { Text("外网地址") },
+                        placeholder = { Text("tokenplanx.vip:8080") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedButton(
+                        onClick = { onUpdateRoutes(lanUrl, wanUrl) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("保存并重新选择线路")
+                    }
                     SettingRow("电脑名称", state.bridgeName.ifBlank { "--" })
                     SettingRow("CodexBridge 版本", state.bridgeVersion.ifBlank { "--" })
                     SettingRow("手机 ID", state.phoneId.ifBlank { "--" })

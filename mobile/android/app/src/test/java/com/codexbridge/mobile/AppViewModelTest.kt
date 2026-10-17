@@ -1,6 +1,7 @@
 package com.codexbridge.mobile
 
 import android.content.Context
+import com.codexbridge.mobile.data.ConnectionRoute
 import com.codexbridge.mobile.data.SettingsStore
 import com.codexbridge.mobile.data.ThreadSummary
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,4 +46,28 @@ class AppViewModelTest {
         val field = AppViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
         return field.get(model) as MutableStateFlow<UiState>
     }
+    @Test
+    fun stateExposesDualRoutesAndActiveRoleLabel() {
+        val state = UiState(
+            lanUrl = "http://192.168.0.42:8568",
+            wanUrl = "http://tokenplanx.vip:8568",
+            baseUrl = "http://tokenplanx.vip:8568",
+            activeRouteRole = "wan",
+        )
+
+        assertEquals("外网", state.activeRouteLabel)
+    }
+
+    @Test
+    fun activeRouteLabelFallsBackToLan() {
+        val state = UiState(
+            lanUrl = "http://192.168.0.42:8568",
+            wanUrl = "",
+            baseUrl = "http://192.168.0.42:8568",
+            activeRouteRole = "lan",
+        )
+
+        assertEquals("内网", state.activeRouteLabel)
+    }
+
 }

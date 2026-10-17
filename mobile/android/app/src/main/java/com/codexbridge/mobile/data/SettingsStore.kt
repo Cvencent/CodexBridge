@@ -12,6 +12,28 @@ class SettingsStore(context: Context) : CompletionNotificationState {
         get() = migrateLegacyPort(prefs.getString("base_url", "") ?: "")
         set(value) = prefs.edit().putString("base_url", value).apply()
 
+    /**
+     * LAN and WAN addresses are stored independently. The legacy base_url is
+     * still the fallback for installations created before dual routing.
+     */
+    var lanUrl: String
+        get() {
+            val stored = migrateLegacyPort(prefs.getString("lan_url", "") ?: "")
+            if (stored.isNotBlank()) return stored
+            // A legacy single address predates the WAN field. Once a WAN
+            // address exists, an empty LAN address must stay empty.
+            return if (wanUrl.isBlank()) baseUrl else ""
+        }
+        set(value) = prefs.edit().putString("lan_url", value).apply()
+
+    var wanUrl: String
+        get() = migrateLegacyPort(prefs.getString("wan_url", "") ?: "")
+        set(value) = prefs.edit().putString("wan_url", value).apply()
+
+    var lastSuccessfulUrl: String
+        get() = migrateLegacyPort(prefs.getString("last_successful_url", "") ?: "")
+        set(value) = prefs.edit().putString("last_successful_url", value).apply()
+
     var token: String
         get() = prefs.getString("token", "") ?: ""
         set(value) = prefs.edit().putString("token", value).apply()
@@ -140,12 +162,6 @@ class SettingsStore(context: Context) : CompletionNotificationState {
         prefs.edit().clear().apply()
     }
 
-    private fun migrateLegacyPort(value: String): String {
-        val text = value.trim()
-        val migrated = ApiClient.migrateStoredBase(text)
-        if (migrated != text) {
-            prefs.edit().putString("base_url", migrated).apply()
-        }
-        return migrated
-    }
+    private fun migrateLegacyPort(value: String): String =
+        ApiClient.migrateStoredBase(value.trim())
 }

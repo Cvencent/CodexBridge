@@ -11,6 +11,8 @@ import android.content.pm.ServiceInfo
 import android.media.RingtoneManager
 import android.media.AudioManager
 import android.provider.Settings
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -20,6 +22,8 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.codexbridge.mobile.data.ApiClient
+import com.codexbridge.mobile.data.ConnectionRoute
+import com.codexbridge.mobile.data.ConnectionSelector
 import com.codexbridge.mobile.data.CompletionNotificationTracker
 import com.codexbridge.mobile.data.SettingsStore
 import kotlinx.coroutines.CoroutineScope
@@ -155,11 +159,37 @@ class CompletionNotificationService : Service() {
         }
     }
 
+    private suspend fun clientFor(settings: SettingsStore): ApiClient {
+        val candidates = ConnectionRoute.candidatesFor(
+            legacyUrl = settings.baseUrl,
+            lanUrl = settings.lanUrl,
+            wanUrl = settings.wanUrl,
+            onWifi = isOnWifi(),
+        )
+        val selected = ConnectionSelector.select(candidates) { endpoint ->
+            ApiClient(endpoint.url, settings.token).ping()
+        }
+        if (selected != null) {
+            settings.lastSuccessfulUrl = selected.url
+            settings.baseUrl = selected.url
+            return ApiClient(selected.url, settings.token)
+        }
+        return ApiClient(settings.baseUrl, settings.token)
+    }
+
+    private fun isOnWifi(): Boolean {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return true
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+
     private suspend fun seedCompletionBaseline(settings: SettingsStore) {
         completions = CompletionNotificationTracker(settings)
         try {
             val startedAt = System.currentTimeMillis() / 1000
-            val client = ApiClient(settings.baseUrl, settings.token)
+            val client = clientFor(settings)
             completions.seed(
                 client.threads().threads,
                 beforeOrAt = startedAt,
@@ -176,7 +206,7 @@ class CompletionNotificationService : Service() {
     ) {
         while (scope.isActive) {
             try {
-                val client = ApiClient(settings.baseUrl, settings.token)
+                val client = clientFor(settings)
                 client.events().collect { event ->
                     when (event.type) {
                         "turn_completed" -> {
@@ -236,7 +266,7 @@ class CompletionNotificationService : Service() {
         while (scope.isActive) {
             delay(POLL_MS)
             try {
-                val client = ApiClient(settings.baseUrl, settings.token)
+                val client = clientFor(settings)
                 val threads = client.threads().threads
                 if (!baselineReady) {
                     // The first snapshot is history, not a completion. If the

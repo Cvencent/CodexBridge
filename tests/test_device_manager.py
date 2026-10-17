@@ -234,6 +234,23 @@ class DeviceManagerTest(unittest.TestCase):
             "the host must beat before the device closes the session",
         )
 
+    def test_heartbeat_refreshes_last_seen(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="d1",
+            name="Desk",
+            port=8765,
+            capabilities=["status", "text", "results", "read_ack"],
+        )
+        self.manager.sync([result])
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
+        first_seen = self.registry.get("d1").last_seen
+        self.assertIsNotNone(first_seen)
+        time.sleep(0.01)
+        FakeSession.created.kwargs["on_heartbeat"]()
+        self.assertGreater(self.registry.get("d1").last_seen, first_seen)
+
     def test_discovery_name_survives_missing_device_info_name(self):
         result = DiscoveryResult(
             host="127.0.0.1",

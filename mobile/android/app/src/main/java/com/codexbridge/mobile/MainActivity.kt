@@ -155,6 +155,7 @@ private fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 onBack = viewModel::closeSettings,
                 onToggleTheme = viewModel::setDarkTheme,
                 onDiscoveryPort = viewModel::setDiscoveryPort,
+                onUpdateRoutes = viewModel::updateConnectionRoutes,
                 onUnpair = viewModel::unpair,
                 onTestNotification = {
                     val result = CompletionNotificationService.showTestNotification(context)
