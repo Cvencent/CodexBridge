@@ -1,9 +1,11 @@
 package com.codexbridge.mobile
 
 import com.codexbridge.mobile.data.QueueItem
+import com.codexbridge.mobile.data.ThreadDetailResponse
 import com.codexbridge.mobile.data.applyQueueSnapshot
 import com.codexbridge.mobile.data.applyQueueUpdate
 import com.codexbridge.mobile.data.decodeStreamEvent
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -77,6 +79,27 @@ class QueueStateTest {
         assertEquals("第一项", event.queue.first().text)
         assertEquals(1L, event.queue.first().revision)
         assertEquals(1770000000.5, event.queue.first().createdAt, 0.0)
+    }
+
+    @Test
+    fun decodesThreadDetailQueueSnapshot() {
+        val raw = """
+            {"ok":true,"thread":{"thread_id":"t1"},"task":{"thread_id":"t1"},
+             "messages":[],
+             "queue":{"thread_id":"t1","revision":7,"paused":false,
+               "items":[
+                 {"queue_id":"q1","thread_id":"t1","text":"排队中","model":"","effort":"",
+                  "status":"pending","revision":1,"created_at":1770000000.5,
+                  "updated_at":1770000000.5,"created_by":"phone-1",
+                  "created_by_kind":"phone","error":""}
+               ]}}
+        """.trimIndent()
+
+        val detail = Json { ignoreUnknownKeys = true }
+            .decodeFromString(ThreadDetailResponse.serializer(), raw)
+
+        assertEquals(listOf("q1"), detail.queue.items.map { it.queue_id })
+        assertEquals(7L, detail.queue.revision)
     }
 
     @Test

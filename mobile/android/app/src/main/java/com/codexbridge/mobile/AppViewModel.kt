@@ -530,7 +530,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         queue = applyQueueSnapshot(
                             state.queue,
                             threadId,
-                            detail.queue,
+                            detail.queue.items,
                         ),
                         busy = false,
                     )
@@ -602,7 +602,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 approvals = detail.pending_approvals,
                                 working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
                                 messageCount = detail.message_count,
-                                queue = applyQueueSnapshot(state.queue, threadId, detail.queue),
+                                queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
                             )
                         }
                     }
@@ -1061,7 +1061,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                     approvals = detail.pending_approvals,
                                     working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
                                     messageCount = detail.message_count,
-                                    queue = applyQueueSnapshot(state.queue, threadId, detail.queue),
+                                    queue = applyQueueSnapshot(state.queue, threadId, detail.queue.items),
                                 )
                             }
                         }

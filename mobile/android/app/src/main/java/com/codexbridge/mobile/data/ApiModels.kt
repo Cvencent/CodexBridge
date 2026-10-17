@@ -59,6 +59,14 @@ data class QueueResponse(
     val revision: Long = 0,
 )
 
+@Serializable
+data class QueueSnapshot(
+    @SerialName("thread_id") val threadId: String = "",
+    @SerialName("items") val items: List<QueueItem> = emptyList(),
+    val revision: Long = 0,
+    val paused: Boolean = false,
+)
+
 fun applyQueueSnapshot(
     current: List<QueueItem>,
     threadId: String,
@@ -260,7 +268,7 @@ data class ThreadDetailResponse(
     val truncated: Boolean = false,
     val continued_as: String = "",
     val pending_approvals: List<ApprovalRequest> = emptyList(),
-    @SerialName("items") val queue: List<QueueItem> = emptyList(),
+    val queue: QueueSnapshot = QueueSnapshot(),
 )
 
 @Serializable
