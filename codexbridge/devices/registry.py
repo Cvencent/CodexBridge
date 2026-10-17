@@ -38,6 +38,11 @@ class DeviceRecord:
     # the enabled set is derived from the model defaults, so a firmware that
     # grows new capabilities starts using them without a manual re-enable.
     customized: bool = False
+    # Last known LAN endpoint, remembered from discovery. The host can dial it
+    # directly instead of waiting for a broadcast round to line up with a device
+    # that only wakes on its access point's traffic interval.
+    host: str | None = None
+    port: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +55,8 @@ class DeviceRecord:
             "last_seen": self.last_seen,
             "max_text_chars": self.max_text_chars,
             "customized": self.customized,
+            "host": self.host,
+            "port": self.port,
         }
 
     @classmethod
@@ -61,6 +68,15 @@ class DeviceRecord:
         last_seen = (
             float(last_seen_value)
             if isinstance(last_seen_value, (int, float))
+            else None
+        )
+        host_value = value.get("host")
+        host = str(host_value) if isinstance(host_value, str) and host_value else None
+        port_value = value.get("port")
+        port = (
+            int(port_value)
+            if isinstance(port_value, int) and not isinstance(port_value, bool)
+            and 1 <= port_value <= 65535
             else None
         )
         supported = normalize(value.get("supported") or [])
@@ -79,6 +95,8 @@ class DeviceRecord:
             last_seen=last_seen,
             max_text_chars=max_text_chars,
             customized=bool(value.get("customized", False)),
+            host=host,
+            port=port,
         )
 
 
@@ -163,6 +181,10 @@ class DeviceRegistry:
                 if temporary_name and os.path.exists(temporary_name):
                     os.unlink(temporary_name)
 
+    def all(self) -> list[DeviceRecord]:
+        with self._lock:
+            return list(self._devices.values())
+
     def get(self, device_id: str) -> DeviceRecord | None:
         with self._lock:
             return self._devices.get(device_id)
@@ -175,6 +197,8 @@ class DeviceRegistry:
         name: str | None = None,
         token: str | None = None,
         supported: Iterable[str] | None = None,
+        host: str | None = ...,
+        port: int | None = ...,
     ) -> DeviceRecord:
         with self._lock:
             record = self._devices.get(device_id)
@@ -186,6 +210,8 @@ class DeviceRegistry:
                     name=name,
                     token=token,
                     supported=declared,
+                    host=None if host is ... else host,
+                    port=None if port is ... else port,
                     enabled=(
                         default_for(model) & (declared | set(MINIMAL))
                         if supported is not None
@@ -202,6 +228,10 @@ class DeviceRegistry:
                 record.name = name
             if token is not None:
                 record.token = token
+            if host is not ...:
+                record.host = host
+            if port is not ...:
+                record.port = port
             if supported is not None:
                 record.supported = normalize(supported)
                 if not record.customized:

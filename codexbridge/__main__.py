@@ -12,7 +12,11 @@ from codexbridge.admin_api import AdminApi
 from codexbridge.codex.app_server import AppServerClient, AppServerError, _resolve_codex_command
 from codexbridge.codex.catalog import CodexCatalogService
 from codexbridge.codex.collector import records_from_snapshot, run_codex_collector
-from codexbridge.devices.discovery import discover
+from codexbridge.devices.discovery import (
+    DISCOVERY_TIMEOUT_SECONDS,
+    PresenceListener,
+    discover,
+)
 from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
@@ -68,14 +72,26 @@ def _discovery_loop(
     stop: threading.Event,
 ) -> None:
     while not stop.is_set():
+        # A remembered endpoint is the fastest path, so dial it before spending
+        # a broadcast round: a device that is already listening is connected in
+        # milliseconds instead of after the next announcement window.
+        manager.redial_paired()
         try:
-            results = discover(timeout=0.75)
+            results = discover(timeout=DISCOVERY_TIMEOUT_SECONDS)
         except OSError:
             results = []
         manager.sync(results)
-        # Reconnect a freshly rebooted device quickly, then back off once a
-        # session is established to avoid unnecessary radio wake-ups.
-        cadence = 5.0 if manager.online_count() == 0 else 15.0
+        # The device carries the low-latency path itself: it announces as soon
+        # as its listener exists, so this broadcast is only a safety net for a
+        # datagram that never arrived, a device being paired for the first time,
+        # or an address that moved. Nothing here needs to be urgent, and a slow
+        # beat keeps both radios quiet, which the home screen's temperature
+        # depends on.
+        if manager.online_count() and not manager.paired_count():
+            # Every paired device is connected; announce only to catch a reboot.
+            cadence = 15.0
+        else:
+            cadence = 5.0
         stop.wait(cadence)
 
 
@@ -243,6 +259,74 @@ def _apply_companion_action(
     raise ValueError("action")
 
 
+# Two CodexBridge processes on one machine is never a good idea: each dials the
+# same devices, and a device holds exactly one TCP session, so the newer dial
+# tears the older one down mid-transfer. That showed up as a recording that died
+# with "connection aborted" a second after it started, and as a Codex page that
+# flipped to an error the moment the user pressed the talk key. Both the
+# installed build and a source checkout can be open at the same time, so the
+# guard asks the running peer to identify itself rather than trusting its own
+# build. The admin API binds with SO_REUSEADDR, which on Windows lets a second
+# process bind the same port silently, so a lock alone is not enough.
+_INSTANCE_LOCK: object | None = None
+_INSTANCE_LOCK_NAME = "Local\\CodexBridgeSingleton"
+
+
+def _another_instance_is_running(admin_port: int = ADMIN_PORT) -> bool:
+    """True when a CodexBridge is already answering its admin API."""
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{admin_port}/api/admin/status", timeout=1.5
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("ok") is True
+
+
+def _acquire_instance_lock(admin_port: int = ADMIN_PORT) -> bool:
+    """True when this process may run; False when another instance already holds it."""
+    global _INSTANCE_LOCK
+    if _another_instance_is_running(admin_port):
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes
+
+        error_already_exists = 183
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, False, _INSTANCE_LOCK_NAME)
+        if not handle:
+            # Cannot create the mutex; do not block a real user over a mystery.
+            return True
+        if ctypes.get_last_error() == error_already_exists:
+            kernel32.CloseHandle(ctypes.wintypes.HANDLE(handle))
+            return False
+        _INSTANCE_LOCK = handle
+    return True
+
+
+def _release_instance_lock() -> None:
+    global _INSTANCE_LOCK
+    handle = _INSTANCE_LOCK
+    _INSTANCE_LOCK = None
+    if handle is None or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.ReleaseMutex(ctypes.wintypes.HANDLE(handle))
+        kernel32.CloseHandle(ctypes.wintypes.HANDLE(handle))
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="codexbridge")
     parser.add_argument(
@@ -263,9 +347,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.settings:
+        # The settings page talks to whichever instance is already running, so
+        # this path must stay allowed while the lock is held.
         import webbrowser
 
         webbrowser.open("http://127.0.0.1:8788/settings")
+        return 0
+
+    if not _acquire_instance_lock():
+        print(
+            "已有一个 CodexBridge 在运行，本次启动退出。"
+            "请先退出旧实例再重新打开。"
+        )
         return 0
 
     _repair_uninstall_record()
@@ -402,6 +495,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     discovery_thread.start()
 
+    def on_presence(result) -> None:
+        # A device that announces itself is already listening, so it does not
+        # wait for the next broadcast round.
+        print(f"CodexBridge: {result.device_id} announced itself at {result.host}")
+        manager.sync([result])
+
+    presence = PresenceListener(on_presence, logger=print)
+    presence.start()
+
     def poll_speech() -> None:
         while not stop.wait(0.25):
             hub.poll_speech()
@@ -432,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
         # Let queued Codex work finish before the sessions go away, otherwise a
         # shutdown mid-request leaves devices with a half-delivered catalog.
         hub.wait_idle(timeout=2.0)
+        presence.stop()
         manager.stop()
         speech.close()
         companion_discovery.stop()
@@ -445,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
         # the source holder; closing it first can race an in-flight request.
         source_holder.close()
     if restart_requested.is_set():
+        # Hand the ports to the replacement instead of competing with it.
+        _release_instance_lock()
         _launch_restarted_process(data_dir)
     return 0
 
