@@ -180,3 +180,49 @@ class DeviceCommandTests(unittest.TestCase):
         import json
         restored = json.loads(''.join(chunk['data'] for chunk in chunks))
         self.assertEqual(restored, response)
+
+
+class QueueCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.service = Service()
+        self.calls = []
+        self.service.queue_list = lambda **params: self.calls.append(("list", params)) or {"items": []}
+        self.service.queue_enqueue = lambda **params: self.calls.append(("enqueue", params)) or {"items": [{"queue_id": "q1"}]}
+        self.service.queue_edit = lambda **params: self.calls.append(("edit", params)) or {"items": []}
+        self.service.queue_delete = lambda **params: self.calls.append(("delete", params)) or {"removed": True}
+        self.service.queue_steer = lambda **params: self.calls.append(("steer", params)) or {"items": []}
+        self.commands = CommandDispatcher(self.service)
+
+    def test_queue_commands_require_queue_capability(self):
+        request = {
+            "request_id": "q-cap",
+            "method": "queue.enqueue",
+            "params": {"thread_id": "t1", "text": "hello"},
+        }
+        with self.assertRaisesRegex(CommandError, "capability_not_enabled"):
+            self.commands.execute("phone-a", {"control"}, request)
+        self.assertEqual(self.calls, [])
+
+    def test_queue_enqueue_dispatches_with_revision_fields(self):
+        result = self.commands.execute("phone-a", {"queue"}, {
+            "request_id": "q-enqueue",
+            "method": "queue.enqueue",
+            "params": {"thread_id": "t1", "text": "hello", "model": "gpt-5", "effort": "high"},
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.calls[0][0], "enqueue")
+        self.assertEqual(self.calls[0][1]["text"], "hello")
+
+    def test_queue_edit_requires_positive_expected_revision(self):
+        for revision in [0, -1, True, "1"]:
+            with self.assertRaisesRegex(CommandError, "invalid_params"):
+                self.commands.execute("phone-a", {"queue"}, {
+                    "request_id": "q-edit-" + str(revision),
+                    "method": "queue.edit",
+                    "params": {
+                        "queue_id": "q1",
+                        "text": "updated",
+                        "expected_revision": revision,
+                    },
+                })
+        self.assertEqual(self.calls, [])

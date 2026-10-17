@@ -1795,3 +1795,20 @@ class CompanionServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueueLifecycleTests(unittest.TestCase):
+    def test_turn_completion_releases_paused_queue_dispatch(self):
+        from codexbridge.companion.service import CompanionService
+        service = CompanionService.__new__(CompanionService)
+        calls = []
+        service.queues = type("Q", (), {
+            "on_turn_finished": lambda self, thread_id: calls.append(thread_id),
+        })()
+        service._queue_thread_active = lambda thread_id: False
+        CompanionService._on_turn_completed(service, "thread-1")
+        self.assertEqual(calls, ["thread-1"])
+
+
+if __name__ == "__main__":
+    unittest.main()

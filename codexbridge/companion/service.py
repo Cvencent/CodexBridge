@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 from codexbridge.companion.events import EventStream
 from codexbridge.protocol.commands import CommandDispatcher
+from codexbridge.companion.queue import QueueService
 
 from codexbridge.read_state import ReadStateStore
 from codexbridge.codex.app_server import (
@@ -414,6 +415,14 @@ class CompanionService:
         self._stop = threading.Event()
         self._events = EventStream(subscriber_capacity=MAX_EVENT_QUEUE)
         self.commands = CommandDispatcher(self)
+        self.queues = QueueService(
+            self.data_dir / "queues.json",
+            start_turn=self.start_turn,
+            steer_turn=self.steer_turn,
+            thread_exists=self._queue_thread_exists,
+            is_active=self._queue_thread_active,
+            publish=self.publish,
+        )
         self._approvals: dict[int, dict[str, Any]] = {}
         self._desktop_approval_routes: dict[int, tuple[str, str, Any, str]] = {}
         self._next_desktop_approval = 1_000_000_000
@@ -466,6 +475,7 @@ class CompanionService:
 
     def start(self) -> None:
         self._stop.clear()
+        self.queues.start()
         self._ensure_client()
         if self._poll_thread is None or not self._poll_thread.is_alive():
             self._poll_thread = threading.Thread(
@@ -521,6 +531,7 @@ class CompanionService:
 
     def stop(self) -> None:
         self._stop.set()
+        self.queues.stop()
         if self._desktop is not None:
             self._desktop.close()
         if self._desktop_pump is not None:
@@ -1235,6 +1246,7 @@ class CompanionService:
                     self._hidden_intermediate_items.pop(hidden_item, None)
             thread_id = self.visible_thread_id(str(params.get("threadId") or ""))
             completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
+            self._on_turn_completed(thread_id)
             return {
                 "type": "turn_completed",
                 "thread_id": thread_id,
@@ -1292,6 +1304,34 @@ class CompanionService:
                 "message": _clip(str(params.get("message") or params.get("error") or ""), 500),
             }
         return None
+    def _on_turn_completed(self, thread_id: str) -> None:
+        if thread_id:
+            self.queues.on_turn_finished(thread_id)
+
+    def _queue_thread_exists(self, thread_id: str) -> bool:
+        return bool(thread_id)
+
+    def _queue_thread_active(self, thread_id: str) -> bool:
+        try:
+            return bool(self._active_turn_id(thread_id))
+        except (AppServerError, OSError, ValueError):
+            return False
+
+    def queue_list(self, thread_id: str) -> dict[str, Any]:
+        return self.queues.list(thread_id)
+
+    def queue_enqueue(self, thread_id: str, text: str, model: str = "", effort: str = "") -> dict[str, Any]:
+        return self.queues.enqueue(thread_id, text, model=model, effort=effort)
+
+    def queue_edit(self, queue_id: str, text: str, model: str = "", effort: str = "", expected_revision: int = 0) -> dict[str, Any]:
+        return self.queues.edit(queue_id, text, model=model, effort=effort, expected_revision=expected_revision)
+
+    def queue_delete(self, queue_id: str, expected_revision: int = 0) -> dict[str, Any]:
+        return self.queues.delete(queue_id, expected_revision=expected_revision)
+
+    def queue_steer(self, queue_id: str, expected_revision: int = 0) -> dict[str, Any]:
+        return self.queues.steer(queue_id, expected_revision=expected_revision)
+
     def snapshot(self) -> dict[str, Any]:
         account = self._account()
         listing = self.list_threads(limit=12)
@@ -1407,6 +1447,7 @@ class CompanionService:
             original = self._original_title(visible_id)
             if original:
                 summary["title"] = original
+            summary["queued_count"] = len(self.queues.list(visible_id).get("items") or [])
             threads.append(summary)
         for index, summary in enumerate(threads):
             if index >= LOG_SCAN_LIMIT:
@@ -1639,6 +1680,7 @@ class CompanionService:
                 value for value in self.pending_approvals()
                 if value.get("thread_id") == thread_id
             ],
+            "queue": self.queues.list(thread_id),
         }
 
     @staticmethod
@@ -2121,6 +2163,7 @@ class CompanionService:
                 if terminal:
                     if key in self._desktop_active_turns and completed_key not in self._desktop_completed_turns:
                         self._desktop_completed_turns.add(completed_key)
+                        self._on_turn_completed(thread_id)
                         self.publish({'type': 'turn_completed', 'thread_id': thread_id,
                             'turn_id': turn_id,
                             'status': 'completed' if terminal == 'completed' else 'failed'})

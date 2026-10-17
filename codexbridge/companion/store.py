@@ -22,7 +22,7 @@ PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
 PHONE_TOKEN_PREFIX = "cbp_"
 MAX_PHONES = 16
-PHONE_CAPABILITIES = {'status', 'tasks', 'control', 'approval'}
+PHONE_CAPABILITIES = {'status', 'tasks', 'control', 'approval', 'queue'}
 
 
 def _hash_token(token: str) -> str:

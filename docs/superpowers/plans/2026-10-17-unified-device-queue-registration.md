@@ -18,7 +18,7 @@
 - 管理批准、拒绝、撤销接口只允许 `127.0.0.1` 回环访问。
 - 不提交 `build/`、`dist/`、`release/`、APK、日志、截图、XML 和现有未跟踪诊断文件。
 - 默认测试命令：`python -m unittest discover -s tests -v`。
-- 当前版本为 `1.4.3`，本次发布目标版本为 `1.4.4`。
+- 当前版本为 `1.4.6`，本次发布目标版本为 `1.4.7`。
 
 ## Review Focus
 
@@ -186,19 +186,19 @@
 - [ ] **Step 5: Run `python -m unittest discover -s tests -v` and `git diff --check`; both must be clean.**
 - [ ] **Step 6: Commit `docs: document unified devices and bridge queue protocol`.**
 
-### Task 8: 完整验证与 v1.4.4 发布
+### Task 8: 完整验证与 v1.4.7 发布
 
 **Files:**
 - Modify: `codexbridge/__init__.py`
-- Create: `release-notes/v1.4.4.md`
+- Create: `release-notes/v1.4.7.md`
 - Build: Windows installer, portable ZIP, Android APK.
 
 **Interfaces:**
-- Produces: tested `v1.4.4` source, tag, GitHub Release, and downloadable assets.
+- Produces: tested `v1.4.7` source, tag, GitHub Release, and downloadable assets.
 
 - [ ] **Step 1: Run the full Python suite; all tests must pass.**
 - [ ] **Step 2: Run `gradlew test assembleRelease`; expect BUILD SUCCESSFUL.**
-- [ ] **Step 3: Run `./packaging/build_windows.ps1 -Version 1.4.4 -FirmwareRoot D:\dotii\firmware`; both Windows artifacts must exist.**
-- [ ] **Step 4: Set `VERSION = "1.4.4"` and create Chinese `release-notes/v1.4.4.md`.**
-- [ ] **Step 5: Run `git diff --check`, verify non-zero artifacts, and commit `release: prepare v1.4.4`.**
-- [ ] **Step 6: Verify `gh auth status`, push the branch, create/push `v1.4.4`, and confirm the Release contains both Windows files and the mobile APK.**
+- [ ] **Step 3: Run `./packaging/build_windows.ps1 -Version 1.4.7 -FirmwareRoot D:\dotii\firmware`; both Windows artifacts must exist.**
+- [ ] **Step 4: Set `VERSION = "1.4.7"` and create Chinese `release-notes/v1.4.7.md`.**
+- [ ] **Step 5: Run `git diff --check`, verify non-zero artifacts, and commit `release: prepare v1.4.7`.**
+- [ ] **Step 6: Verify `gh auth status`, push the branch, create/push `v1.4.7`, and confirm the Release contains both Windows files and the mobile APK.**

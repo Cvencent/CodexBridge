@@ -12,6 +12,7 @@ FEATURES: tuple[str, ...] = (
     "word_bear",
     "quota",
     "control",
+    "queue",
 )
 
 MINIMAL: frozenset[str] = frozenset({"status", "text", "read_ack"})

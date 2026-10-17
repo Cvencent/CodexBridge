@@ -25,6 +25,11 @@ COMMANDS = {
     'approvals.list': ('approval', (), ()),
     'approval.resolve': ('approval', ('approval_id', 'decision'), ()),
     'approval.respond': ('approval', ('approval_id', 'response'), ()),
+    'queue.list': ('queue', ('thread_id',), ()),
+    'queue.enqueue': ('queue', ('thread_id', 'text'), ('model', 'effort')),
+    'queue.edit': ('queue', ('queue_id', 'text', 'expected_revision'), ('model', 'effort')),
+    'queue.delete': ('queue', ('queue_id', 'expected_revision'), ()),
+    'queue.steer': ('queue', ('queue_id', 'expected_revision'), ()),
 }
 
 
@@ -64,7 +69,7 @@ class CommandDispatcher:
             if field == 'response':
                 if not isinstance(value, dict) or len(json.dumps(value)) > 20000:
                     raise CommandError('invalid_params')
-            elif field in {'limit', 'message_limit', 'approval_id'}:
+            elif field in {'limit', 'message_limit', 'approval_id', 'expected_revision'}:
                 if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                     raise CommandError('invalid_params')
             elif not isinstance(value, str) or len(value) > 20000:
@@ -131,4 +136,14 @@ class CommandDispatcher:
             return {'pending_approvals': service.pending_approvals()}
         if method == 'approval.respond':
             return {'resolved': service.respond_approval(params['approval_id'], params['response'])}
+        if method == 'queue.list':
+            return service.queue_list(**params)
+        if method == 'queue.enqueue':
+            return service.queue_enqueue(**params)
+        if method == 'queue.edit':
+            return service.queue_edit(**params)
+        if method == 'queue.delete':
+            return service.queue_delete(**params)
+        if method == 'queue.steer':
+            return service.queue_steer(**params)
         return {'resolved': service.resolve_approval(params['approval_id'], params['decision'])}

@@ -244,6 +244,8 @@ read_ack
 voice
 word_bear
 quota
+control
+queue
 ```
 
 未知能力不会写入设备配置，也不会下发。`word_bear` 当前是已知的预留能力；本文尚未定义它的专用消息。
@@ -764,6 +766,75 @@ CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发�
 因为别人读过而再也看不到"任务还在跑"。
 
 已读广播只发给声明 `read_ack` 能力的设备；上报者自己不会收到自己造成的广播。
+
+## 11A. 待发送队列
+
+队列属于线程，不属于某台设备，由 CodexBridge 统一持有并持久化到
+`%LOCALAPPDATA%\CodexBridge\queues.json`。手机、ESP 和管理页面看到的是同一份 FIFO
+队列；线程空闲时 Bridge 立即把队首转成 `turn.start`，线程进行中时保持 `pending`，
+turn 结束后再派发下一项。手机不再自行决定 `steer` 或 `start`。
+
+### 11A.1 能力与方法
+
+队列命令要求 `queue` 能力。手机默认启用，硬件必须在 `bridge_auth_ok.capabilities`
+中声明后才启用；未声明 `queue` 的旧客户端继续使用 `turn.start` / `mode=steer`。
+
+| 方法 | 必需参数 | 可选参数 |
+| --- | --- | --- |
+| `queue.list` | `thread_id` | |
+| `queue.enqueue` | `thread_id`, `text` | `model`, `effort` |
+| `queue.edit` | `queue_id`, `text`, `expected_revision` | `model`, `effort` |
+| `queue.delete` | `queue_id`, `expected_revision` | |
+| `queue.steer` | `queue_id`, `expected_revision` | |
+
+HTTP 手机使用现有 `POST /api/companion/commands` 信封，TCP 设备使用现有
+`{"type":"command",...}` 信封。大结果继续使用 `command_chunk` 分片。
+
+### 11A.2 队列项
+
+```json
+{
+  "queue_id": "q_...",
+  "thread_id": "thread-123",
+  "text": "继续检查超时问题",
+  "model": "",
+  "effort": "",
+  "status": "pending",
+  "revision": 1,
+  "created_at": 1770000000.0,
+  "updated_at": 1770000000.0,
+  "created_by": "phone-a1b2c3",
+  "created_by_kind": "phone",
+  "error": ""
+}
+```
+
+`status` 为 `pending`、`dispatching`、`failed`、`dispatched`、`steered` 或 `deleted`。
+终态项不再出现在快照中，但必须广播相应移除事件。编辑、删除和引导必须携带
+`expected_revision`；不匹配返回 `queue_conflict`。`queue.enqueue` 不要求 revision，
+但相同 `request_id` 必须幂等。
+
+### 11A.3 队列事件
+
+手机 SSE 和设备的 `device_event` 共用以下事件：
+
+| 事件 | 含义 |
+| --- | --- |
+| `queue_snapshot` | 连接、重连或 `resync_required` 后的权威快照 |
+| `queue_item_added` | 新增队列项 |
+| `queue_item_updated` | 编辑、状态变化或 revision 变化 |
+| `queue_item_removed` | 派发、引导或删除后的移除，带 `reason` |
+| `queue_paused` | 派发失败后暂停该线程自动派发 |
+
+客户端按 `queue_id` 和 revision 合并，不能按事件到达顺序推断队列顺序。每个事件带
+全局 `revision`、`thread_id` 和 `server_time`。派发失败时项变为 `failed` 并暂停该线程；
+编辑或删除失败项后恢复派发。
+
+### 11A.4 上限与恢复
+
+- 每个线程最多 `100` 项，单个未完成项最多 `10000` 个字符。
+- 每次新增、编辑、删除和状态变化都原子落盘；Bridge 重启后重新载入，并在线程空闲时继续派发。
+- 队列使用 `request_id` 幂等缓存和线程级串行派发，避免重复 `turn.start`。
 
 ## 12. 错误与边界
 
