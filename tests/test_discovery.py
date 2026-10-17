@@ -25,6 +25,41 @@ class DiscoveryTest(unittest.TestCase):
         )
         self.assertEqual(result.capabilities, ["status", "tasks"])
 
+    def test_reply_without_registration_fields_is_approved(self):
+        result = parse_reply(
+            b'{"device":"dotii","device_id":"old","port":8765}',
+            "10.0.0.5",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.registration_state, "approved")
+        self.assertIsNone(result.registration_nonce)
+
+    def test_pending_reply_requires_a_valid_nonce(self):
+        missing = parse_reply(
+            b'{"device":"dotii","device_id":"new","port":8765,'
+            b'"registration_state":"pending"}',
+            "10.0.0.5",
+        )
+        too_short = parse_reply(
+            b'{"device":"dotii","device_id":"new","port":8765,'
+            b'"registration_state":"pending","registration_nonce":"short"}',
+            "10.0.0.5",
+        )
+        pending = parse_reply(
+            b'{"device":"dotii","device_id":"new","port":8765,'
+            b'"registration_state":"pending","registration_nonce":"r_0123456789abcdef"}',
+            "10.0.0.5",
+        )
+
+        self.assertIsNone(missing)
+        self.assertIsNone(too_short)
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending.registration_state, "pending")
+        self.assertEqual(pending.registration_nonce, "r_0123456789abcdef")
+
     def test_reply_without_device_id_is_ignored(self):
         self.assertIsNone(
             parse_reply(b'{"device":"dotii","port":8765}', "10.0.0.5")

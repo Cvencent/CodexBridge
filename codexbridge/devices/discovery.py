@@ -33,6 +33,8 @@ class DiscoveryResult:
     name: str | None
     port: int
     capabilities: list[str]
+    registration_state: str = "approved"
+    registration_nonce: str | None = None
 
 
 def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
@@ -61,6 +63,28 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
     if not isinstance(capabilities, list):
         capabilities = []
     capabilities = [item for item in capabilities if isinstance(item, str)]
+
+    registration_state = value.get("registration_state", "approved")
+    if not isinstance(registration_state, str) or registration_state not in {
+        "pending",
+        "approved",
+        "rejected",
+        "revoked",
+    }:
+        return None
+    registration_nonce = value.get("registration_nonce")
+    if registration_state == "pending":
+        if (
+            not isinstance(registration_nonce, str)
+            or not 16 <= len(registration_nonce) <= 64
+        ):
+            return None
+    elif registration_nonce is not None and (
+        not isinstance(registration_nonce, str)
+        or not 16 <= len(registration_nonce) <= 64
+    ):
+        return None
+
     return DiscoveryResult(
         host=host,
         device=device,
@@ -68,6 +92,8 @@ def parse_reply(payload: bytes, host: str) -> DiscoveryResult | None:
         name=name,
         port=port,
         capabilities=capabilities,
+        registration_state=registration_state,
+        registration_nonce=registration_nonce,
     )
 
 

@@ -38,6 +38,12 @@ class DeviceRecord:
     last_address: str | None = None
     client_id: str = ""
     token_hash: str = ""
+    # Private registration binding for hardware approval. These fields are
+    # persisted with the record but never exposed by the public device view.
+    registration_nonce: str | None = None
+    registration_address: str | None = None
+    registration_discovered_at: float | None = None
+    registration_error: str = ""
     # None means the device accepts unlimited text; set by the device's own
     # handshake or by the local per-device override.
     max_text_chars: int | None = UNLIMITED
@@ -75,6 +81,10 @@ class DeviceRecord:
             "last_address": self.last_address,
             "client_id": self.client_id,
             "token_hash": self.token_hash,
+            "registration_nonce": self.registration_nonce,
+            "registration_address": self.registration_address,
+            "registration_discovered_at": self.registration_discovered_at,
+            "registration_error": self.registration_error,
         }
 
     @classmethod
@@ -131,6 +141,27 @@ class DeviceRecord:
             if isinstance(token_hash_value, str) and len(token_hash_value) == 64
             else ""
         )
+        registration_nonce_value = value.get("registration_nonce")
+        registration_nonce = (
+            str(registration_nonce_value)
+            if isinstance(registration_nonce_value, str)
+            and 16 <= len(registration_nonce_value) <= 64
+            else None
+        )
+        registration_address_value = value.get("registration_address")
+        registration_address = (
+            str(registration_address_value)
+            if isinstance(registration_address_value, str)
+            and registration_address_value
+            else None
+        )
+        registration_discovered_value = value.get("registration_discovered_at")
+        registration_discovered_at = (
+            float(registration_discovered_value)
+            if isinstance(registration_discovered_value, (int, float))
+            and not isinstance(registration_discovered_value, bool)
+            else None
+        )
         return cls(
             device_id=str(value.get("device_id") or device_id),
             model=model,
@@ -154,6 +185,10 @@ class DeviceRecord:
             last_address=last_address,
             client_id=client_id,
             token_hash=token_hash,
+            registration_nonce=registration_nonce,
+            registration_address=registration_address,
+            registration_discovered_at=registration_discovered_at,
+            registration_error=str(value.get("registration_error") or "")[:64],
         )
 
 
@@ -469,6 +504,11 @@ class DeviceRegistry:
             if record.token is None:
                 record.token = secrets.token_urlsafe(TOKEN_BYTES)
                 self.save()
+            # Minting is an explicit approval path. Keep the in-memory state in
+            # sync with the credential instead of waiting for a reload.
+            record.registration_state = "approved"
+            record.registration_method = "admin_approval"
+            self.save()
             return record.token
 
     def migrate_legacy(self, legacy_path: Path) -> bool:

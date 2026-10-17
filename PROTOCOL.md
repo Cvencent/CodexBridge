@@ -211,6 +211,49 @@ CodexBridge 结束本次会话，不进入在线状态。
 `bridge_ready` 作为心跳，并继续携带本次会话已授予的能力。运行时权限变化通过
 `capabilities_update` 推送。
 
+### 5.4 硬件主动注册与批准
+
+硬件通过 UDP `8764` 应答发现请求，或主动通知身份。应答在原有字段上增加注册
+字段：
+
+```json
+{
+  "device": "dotii",
+  "device_id": "dotii-a1",
+  "name": "Desk",
+  "port": 8765,
+  "capabilities": ["status", "text", "tasks", "read_ack", "queue"],
+  "registration_state": "pending",
+  "registration_nonce": "r_7f5c0123456789abcdef"
+}
+```
+
+规则：
+
+- `registration_state` 缺省时按 `approved` 处理，兼容没有注册字段的旧固件。
+- `pending` 必须携带 16 到 64 字符的 `registration_nonce`。
+- nonce 绑定 `device_id + 来源地址 + 发现时间`，有效期 10 分钟；过期、地址变化
+  或重复使用都必须失败。
+- `pending` 设备只出现在待批准列表，不建立 TCP 业务会话，也不接收消息。
+- 已批准设备再次被发现时只刷新地址和 `last_seen`，状态保持 `approved`。
+
+批准后 CodexBridge 先建立一次性注册连接：
+
+```json
+{"type":"register_offer","registration_nonce":"r_7f5c0123456789abcdef","token":"<新设备令牌>","bridge":"CodexBridge"}
+```
+
+设备持久化令牌并返回：
+
+```json
+{"type":"register_ok","device_id":"dotii-a1","accepted":true}
+```
+
+设备随后关闭该连接；CodexBridge 将状态置为 `approved`，再建立正常
+`bridge_auth` 会话。注册失败时设备保留 `pending` 和错误原因，管理页可重新批准。
+拒绝返回并保持 `rejected`；撤销会清空令牌并保持 `revoked`，直到设备以新的
+nonce 重新发现。
+
 设备收到 `bridge_ready` 后会话进入在线状态，可以发送已授权事件，也可以接收
 CodexBridge 下发的消息。
 
@@ -944,6 +987,9 @@ SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `qu
 | `GET` | `/api/admin/devices` | 统一设备列表，含手机和硬件 |
 | `POST` | `/api/admin/devices/remove` | 移除设备 |
 | `POST` | `/api/admin/devices/capabilities` | 更新设备生效能力 |
+| `POST` | `/api/admin/devices/approve` | 批准待注册硬件并下发令牌 |
+| `POST` | `/api/admin/devices/reject` | 拒绝待注册硬件 |
+| `POST` | `/api/admin/devices/revoke` | 撤销已批准硬件并清空令牌 |
 | `GET` | `/api/admin/pairing?device_id=...` | 生成并返回硬件配对令牌 |
 
 ### 13.3 语音与常规设置

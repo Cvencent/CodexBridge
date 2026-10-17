@@ -23,6 +23,7 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
         buffer = bytearray()
         authenticated = False
         announced = False
+        registration_offered = False
 
         while not device._stopped.is_set():
             try:
@@ -42,6 +43,23 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
                 device._append_received(message)
 
                 message_type = message.get("type")
+                if message_type == "register_offer":
+                    if message.get("registration_nonce") != device.registration_nonce:
+                        self.request.sendall(encode({"type": "register_error", "code": "registration_nonce_invalid"}))
+                        return
+                    device._expected_token = str(message.get("token") or "")
+                    device.token = device._expected_token
+                    device.registration_accepted.set()
+                    self.request.sendall(
+                        encode(
+                            {
+                                "type": "register_ok",
+                                "device_id": device.device_id,
+                                "accepted": True,
+                            }
+                        )
+                    )
+                    return
                 if message_type == "bridge_auth":
                     if message.get("token") != device._expected_token:
                         return
@@ -61,9 +79,14 @@ class _FakeDeviceHandler(socketserver.BaseRequestHandler):
 class FakeDevice:
     def __init__(self, host: str = "127.0.0.1", device_id: str = "fake-device",
                  capabilities: list[str] | None = None,
-                 max_text_chars: int | None = None):
+                 max_text_chars: int | None = None,
+                 registration_state: str = "approved",
+                 registration_nonce: str | None = None):
         self.host = host
         self.device_id = device_id
+        self.registration_state = registration_state
+        self.registration_nonce = registration_nonce
+        self.token: str | None = None
         # A device announces its own capabilities and its own body budget; the
         # host must honour both without per-device branches.
         self.model = "dotii"
@@ -78,6 +101,7 @@ class FakeDevice:
         self._received_lock = threading.Lock()
         self.received: list[dict] = []
         self._stopped = threading.Event()
+        self.registration_accepted = threading.Event()
         self._server = _FakeDeviceServer(
             (host, 0),
             _FakeDeviceHandler,

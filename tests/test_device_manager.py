@@ -116,6 +116,117 @@ class DeviceManagerTest(unittest.TestCase):
         self.assertEqual(FakeSession.created.sent[0]["type"], "message")
         self.assertEqual(FakeSession.created.sent[0]["message_id"], "m1")
 
+    def test_pending_device_does_not_open_a_session(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="pending-1",
+            name="New Desk",
+            port=8765,
+            capabilities=["status", "text"],
+            registration_state="pending",
+            registration_nonce="r_0123456789abcdef",
+        )
+        self.manager.sync([result])
+
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline and "pending-1" in self.manager._sessions:
+            time.sleep(0.01)
+        self.assertNotIn("pending-1", self.manager._sessions)
+        record = self.registry.get("pending-1")
+        self.assertEqual(record.registration_state, "pending")
+        self.assertFalse(record.has_token)
+        self.assertEqual(record.last_address, "127.0.0.1")
+
+    def test_approve_sends_offer_before_opening_a_session(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="pending-1",
+            name="New Desk",
+            port=8765,
+            capabilities=["status", "text"],
+            registration_state="pending",
+            registration_nonce="r_0123456789abcdef",
+        )
+        self.manager.sync([result])
+        calls = []
+
+        def register_offer(host, port, token, **kwargs):
+            calls.append((host, port, token, kwargs))
+            return True
+
+        self.manager._send_register_offer = register_offer
+        self.assertTrue(self.manager.approve("pending-1"))
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "127.0.0.1")
+        self.assertEqual(calls[0][1], 8765)
+        self.assertEqual(calls[0][3]["device_id"], "pending-1")
+        self.assertEqual(
+            calls[0][3]["registration_nonce"],
+            "r_0123456789abcdef",
+        )
+        record = self.registry.get("pending-1")
+        self.assertEqual(record.registration_state, "approved")
+        self.assertTrue(record.has_token)
+
+    def test_approve_rejects_expired_or_rebound_nonce(self):
+        self.registry.upsert(
+            "pending-1",
+            model="dotii",
+            supported=["status"],
+            host="127.0.0.1",
+            port=8765,
+        )
+        record = self.registry.get("pending-1")
+        record.registration_state = "pending"
+        record.registration_nonce = "r_0123456789abcdef"
+        record.registration_address = "127.0.0.1"
+        record.registration_discovered_at = time.time() - 601.0
+        calls = []
+        self.manager._send_register_offer = lambda *args, **kwargs: calls.append(kwargs) or True
+
+        with self.assertRaisesRegex(ValueError, "registration_expired"):
+            self.manager.approve("pending-1")
+        self.assertEqual(calls, [])
+
+        record.registration_discovered_at = time.time()
+        record.registration_address = "10.0.0.9"
+        with self.assertRaisesRegex(ValueError, "registration_address_changed"):
+            self.manager.approve("pending-1")
+        self.assertEqual(calls, [])
+
+    def test_reject_and_revoke_clear_pending_credentials(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="pending-1",
+            name="New Desk",
+            port=8765,
+            capabilities=["status", "text"],
+            registration_state="pending",
+            registration_nonce="r_0123456789abcdef",
+        )
+        self.manager.sync([result])
+
+        self.assertTrue(self.manager.reject("pending-1"))
+        self.assertEqual(
+            self.registry.get("pending-1").registration_state,
+            "rejected",
+        )
+        self.manager.sync([result])
+        self.assertEqual(
+            self.registry.get("pending-1").registration_state,
+            "rejected",
+        )
+        self.assertTrue(self.manager.revoke("pending-1"))
+        self.assertEqual(
+            self.registry.get("pending-1").registration_state,
+            "revoked",
+        )
+        self.assertFalse(self.registry.get("pending-1").has_token)
+
     def test_heartbeat_arrives_before_device_session_timeout(self):
         self.assertLess(
             self.manager.heartbeat_seconds,

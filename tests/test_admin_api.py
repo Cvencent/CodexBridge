@@ -147,6 +147,71 @@ class AdminApiTest(unittest.TestCase):
         )
         self.assertEqual(self.registry.get("d1").max_text_chars, 512)
 
+    def test_device_registration_actions_call_manager(self):
+        calls = []
+
+        def registration_action(action, device_id):
+            calls.append((action, device_id))
+            return True
+
+        for action in ("approve", "reject", "revoke"):
+            body = json.dumps({"device_id": "pending-1"}).encode()
+            status, payload = handle_request(
+                "POST",
+                f"/api/admin/devices/{action}",
+                {},
+                body,
+                "127.0.0.1",
+                self.hub,
+                self.registry,
+                device_registration_action=registration_action,
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["device_id"], "pending-1")
+
+        self.assertEqual(
+            calls,
+            [
+                ("approve", "pending-1"),
+                ("reject", "pending-1"),
+                ("revoke", "pending-1"),
+            ],
+        )
+
+    def test_device_registration_action_reports_typed_failure(self):
+        def registration_action(action, device_id):
+            raise ValueError("registration_expired")
+
+        body = json.dumps({"device_id": "pending-1"}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/approve",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            device_registration_action=registration_action,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "registration_expired")
+
+    def test_device_registration_action_requires_device_id(self):
+        body = json.dumps({}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/approve",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            device_registration_action=lambda action, device_id: True,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "device_id_required")
+
     def test_remove_notifies_device_manager(self):
         removed = []
         body = json.dumps({"device_id": "d1"}).encode()

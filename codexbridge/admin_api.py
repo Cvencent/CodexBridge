@@ -42,6 +42,7 @@ def handle_request(
     open_logs: Callable[[], None] | None = None,
     companion_status: Callable[[], dict] | None = None,
     companion_action: Callable[[dict], dict] | None = None,
+    device_registration_action: Callable[[str, str], bool] | None = None,
 ):
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -152,6 +153,30 @@ def handle_request(
             if not ok:
                 return 400, {"ok": False, "error": message, "message": message}
             return 200, {"ok": True, "message": message}
+        if method == "POST" and path in {
+            "/api/admin/devices/approve",
+            "/api/admin/devices/reject",
+            "/api/admin/devices/revoke",
+        }:
+            payload = _json_body(body)
+            device_id = payload.get("device_id")
+            if not isinstance(device_id, str) or not device_id:
+                return 400, {"ok": False, "error": "device_id_required"}
+            if device_registration_action is None:
+                return 400, {"ok": False, "error": "registration_unavailable"}
+            action = path.rsplit("/", 1)[-1]
+            try:
+                changed = device_registration_action(action, device_id)
+            except ValueError as error:
+                return 409, {
+                    "ok": False,
+                    "error": str(error) or "registration_failed",
+                }
+            return 200, {
+                "ok": True,
+                "device_id": device_id,
+                "changed": bool(changed),
+            }
         if method == "POST" and path == "/api/admin/devices/remove":
             payload = _json_body(body)
             device_id = payload.get("device_id")
@@ -283,9 +308,11 @@ class AdminApi:
         open_logs: Callable[[], None] | None = None,
         companion_status: Callable[[], dict] | None = None,
         companion_action: Callable[[dict], dict] | None = None,
+        device_registration_action: Callable[[str, str], bool] | None = None,
     ):
         self.companion_status = companion_status
         self.companion_action = companion_action
+        self.device_registration_action = device_registration_action
         self.hub = hub
         self.registry = registry
         self.host = host
@@ -354,6 +381,7 @@ class AdminApi:
                             api.open_logs,
                             api.companion_status,
                             api.companion_action,
+                            api.device_registration_action,
                         )
                 if isinstance(payload, str):
                     encoded = payload.encode("utf-8")

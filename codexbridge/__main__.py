@@ -453,6 +453,15 @@ def main(argv: list[str] | None = None) -> int:
     def restart_process() -> None:
         restart_requested.set()
 
+    def device_registration_action(action: str, device_id: str) -> bool:
+        if action == "approve":
+            return manager.approve(device_id)
+        if action == "reject":
+            return manager.reject(device_id)
+        if action == "revoke":
+            return manager.revoke(device_id)
+        raise ValueError("registration_action_invalid")
+
     admin = AdminApi(
         hub,
         registry,
@@ -461,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         open_logs=open_logs,
         companion_status=companion_status,
         companion_action=companion_action,
+        device_registration_action=device_registration_action,
     )
     try:
         admin.start()

@@ -28,6 +28,41 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(device.received[1]["capabilities"], ["status", "text"])
         self.assertEqual(seen[0]["device_id"], "fake-device")
 
+    def test_registration_offer_is_one_shot_and_then_authenticates(self):
+        online = []
+        with FakeDevice(
+            registration_state="pending",
+            registration_nonce="r_0123456789abcdef",
+        ) as device:
+            device.expect_handshake("abcdefghijklmnop")
+            session = DeviceSession(
+                device.host,
+                device.port,
+                "abcdefghijklmnop",
+                device_id="fake-device",
+                on_online=lambda: online.append(True),
+                heartbeat_seconds=0.2,
+                timeout_seconds=1.0,
+                registration_nonce="r_0123456789abcdef",
+            )
+            thread = threading.Thread(target=session.run_once)
+            thread.start()
+            try:
+                device.registration_accepted.wait(2.0)
+            finally:
+                session.stop()
+                thread.join(timeout=2.0)
+
+        self.assertEqual(
+            [message["type"] for message in device.received],
+            ["register_offer", "bridge_auth", "bridge_ready"],
+        )
+        self.assertEqual(
+            device.received[0]["registration_nonce"],
+            "r_0123456789abcdef",
+        )
+        self.assertTrue(online)
+
     def test_device_event_reaches_callback(self):
         seen = []
         with FakeDevice() as device:

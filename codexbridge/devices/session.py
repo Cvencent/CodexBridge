@@ -10,6 +10,61 @@ from codexbridge import VERSION
 from codexbridge.protocol.messages import decode, encode
 
 
+def send_register_offer(
+    host: str,
+    port: int,
+    token: str,
+    *,
+    device_id: str,
+    registration_nonce: str,
+    timeout_seconds: float = 15.0,
+) -> bool:
+    """Store a hardware token over the one-shot registration connection."""
+    if len(token) < 16:
+        raise ValueError("token must be at least 16 characters")
+    if not device_id:
+        raise ValueError("device_id must not be empty")
+    if not 16 <= len(registration_nonce) <= 64:
+        raise ValueError("registration_nonce must be 16 to 64 characters")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    buffer = bytearray()
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout_seconds)
+        sock.sendall(
+            encode(
+                {
+                    "type": "register_offer",
+                    "registration_nonce": registration_nonce,
+                    "token": token,
+                    "bridge": "CodexBridge",
+                }
+            )
+        )
+        reply, closed = DeviceSession._next_message(
+            sock,
+            buffer,
+            time.monotonic() + timeout_seconds,
+        )
+        return (
+            not closed
+            and reply is not None
+            and reply.get("type") == "register_ok"
+            and reply.get("device_id") == device_id
+            and reply.get("accepted") is True
+        )
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
 class DeviceSession:
     def __init__(
         self,
@@ -24,6 +79,7 @@ class DeviceSession:
         on_offline: Callable[[], None] | None = None,
         heartbeat_seconds: float = 15.0,
         timeout_seconds: float = 15.0,
+        registration_nonce: str | None = None,
     ):
 
         if len(token) < 16:
@@ -43,6 +99,7 @@ class DeviceSession:
         self.on_device_info = on_device_info
         self.on_online = on_online
         self.on_offline = on_offline
+        self.registration_nonce = registration_nonce
         self._active_capabilities: set[str] = set()
         self.heartbeat_seconds = heartbeat_seconds
         self.timeout_seconds = timeout_seconds
@@ -67,6 +124,16 @@ class DeviceSession:
                 pass
 
     def run_once(self) -> None:
+        if self.registration_nonce is not None and not send_register_offer(
+            self.host,
+            self.port,
+            self.token,
+            device_id=self.device_id,
+            registration_nonce=self.registration_nonce,
+            timeout_seconds=self.timeout_seconds,
+        ):
+            return
+
         online = False
         buffer = bytearray()
         sock: socket.socket | None = None

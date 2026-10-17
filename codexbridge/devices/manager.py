@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 from collections.abc import Iterable
@@ -8,7 +9,7 @@ from typing import Any
 from codexbridge.devices.discovery import DiscoveryResult
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.protocol.capabilities import parse_max_text_chars
-from codexbridge.devices.session import DeviceSession
+from codexbridge.devices.session import DeviceSession, send_register_offer
 from codexbridge.hub import BridgeHub
 
 # The host heartbeat is a liveness ping, not a status channel. It must arrive
@@ -25,6 +26,19 @@ REDIAL_COOLDOWN_SECONDS = 10.0
 # there should refuse the socket long before this. Anything slower is a dead
 # host and the round should move on.
 CONNECT_TIMEOUT_SECONDS = 3.0
+
+# A pending discovery announcement is a request for approval, not a durable
+# credential. It expires so an address that is later reused cannot approve a
+# different device that happens to present the same nonce.
+REGISTRATION_TTL_SECONDS = 10 * 60.0
+
+
+class DeviceRegistrationError(ValueError):
+    """Typed registration failure that maps cleanly onto the admin API."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class DeviceManager:
@@ -47,6 +61,7 @@ class DeviceManager:
         self._lock = threading.RLock()
         self._stopping = threading.Event()
         self._redial_at: dict[str, float] = {}
+        self._send_register_offer = send_register_offer
 
     def sync(self, results: Iterable[DiscoveryResult]) -> None:
         if self._stopping.is_set():
@@ -127,6 +142,85 @@ class DeviceManager:
         for thread in threads:
             thread.join(timeout=1.0)
 
+    def approve(self, device_id: str) -> bool:
+        record = self.registry.get(device_id)
+        if record is None or record.kind != "hardware":
+            raise DeviceRegistrationError("device_not_found")
+        if record.registration_state == "approved" and record.token:
+            return True
+        if record.registration_state not in {"pending", "rejected", "revoked"}:
+            raise DeviceRegistrationError("registration_not_pending")
+        if not record.registration_nonce:
+            raise DeviceRegistrationError("registration_nonce_missing")
+        if not record.registration_address or not record.host or not record.port:
+            raise DeviceRegistrationError("registration_endpoint_missing")
+        if record.registration_address != record.host:
+            record.registration_error = "registration_address_changed"
+            self.registry.save()
+            raise DeviceRegistrationError("registration_address_changed")
+        now = time.time()
+        if (
+            record.registration_discovered_at is None
+            or now - record.registration_discovered_at > REGISTRATION_TTL_SECONDS
+        ):
+            raise DeviceRegistrationError("registration_expired")
+        token = record.token or secrets.token_urlsafe(24)
+        accepted = self._send_register_offer(
+            record.host,
+            record.port,
+            token,
+            device_id=device_id,
+            registration_nonce=record.registration_nonce,
+        )
+        if not accepted:
+            record.registration_error = "register_offer_failed"
+            self.registry.save()
+            return False
+
+        record.token = token
+        record.registration_state = "approved"
+        record.registration_nonce = None
+        record.registration_address = None
+        record.registration_discovered_at = None
+        record.registration_error = ""
+        self.registry.save()
+        self._sync_one(
+            DiscoveryResult(
+                host=record.host,
+                device=record.model,
+                device_id=device_id,
+                name=record.name,
+                port=record.port,
+                capabilities=sorted(record.supported),
+                registration_state="approved",
+            )
+        )
+        return True
+
+    def reject(self, device_id: str) -> bool:
+        record = self.registry.get(device_id)
+        if record is None or record.kind != "hardware":
+            raise DeviceRegistrationError("device_not_found")
+        record.registration_state = "rejected"
+        record.token = None
+        record.token_hash = ""
+        record.registration_error = ""
+        self.registry.save()
+        self.remove(device_id)
+        return True
+
+    def revoke(self, device_id: str) -> bool:
+        record = self.registry.get(device_id)
+        if record is None or record.kind != "hardware":
+            raise DeviceRegistrationError("device_not_found")
+        record.registration_state = "revoked"
+        record.token = None
+        record.token_hash = ""
+        record.registration_error = ""
+        self.registry.save()
+        self.remove(device_id)
+        return True
+
     def remove(self, device_id: str) -> None:
         with self._lock:
             session = self._sessions.pop(device_id, None)
@@ -161,6 +255,16 @@ class DeviceManager:
         )
         if legacy is not None and result.device_id != legacy_id:
             self.registry.remove(legacy_id)
+        if result.registration_state == "pending":
+            same_nonce = record.registration_nonce == result.registration_nonce
+            if not same_nonce or record.registration_state == "revoked":
+                record.registration_nonce = result.registration_nonce
+                record.registration_address = result.host
+                record.registration_discovered_at = time.time()
+                record.registration_error = ""
+                record.registration_state = "pending"
+                record.token = None
+                record.token_hash = ""
         with self._lock:
             alive = result.device_id in self._sessions
         if alive:
@@ -169,6 +273,9 @@ class DeviceManager:
             # registry file every round buys nothing.
             return
         record.last_seen = time.time()
+        if record.registration_state != "approved":
+            self.registry.save()
+            return
         self.registry.save()
         if not record.token:
             return
