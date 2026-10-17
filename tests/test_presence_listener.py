@@ -81,5 +81,36 @@ class PresenceListenerTest(unittest.TestCase):
         self.assertGreater(PRESENCE_DEDUPE_SECONDS, 0.0)
 
 
+    def test_a_port_held_by_another_process_recovers(self):
+        # An upgrade can leave the previous process holding the port for a
+        # moment. The listener must keep retrying, and must not shout once a
+        # second while it waits.
+        port = free_port()
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("127.0.0.1", port))
+        self.addCleanup(holder.close)
+        logs: list = []
+        results: list = []
+        listener = PresenceListener(
+            results.append, port=port, logger=logs.append
+        )
+        listener.start()
+        self.addCleanup(listener.stop)
+        time.sleep(1.5)
+        self.assertEqual([], results, "listener bound a port it did not own")
+        holder.close()
+
+        deadline = time.time() + 20.0
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            while time.time() < deadline and not results:
+                sock.sendto(identity(), ("127.0.0.1", port))
+                time.sleep(1.0)
+        self.assertTrue(results, "listener never recovered the port")
+        unavailable = [m for m in logs if "presence listener unavailable" in m]
+        self.assertLessEqual(len(unavailable), 1, "the retry loop is too noisy")
+        self.assertTrue([m for m in logs if "listener back on" in m],
+                        "recovery was not reported")
+
+
 if __name__ == "__main__":
     unittest.main()

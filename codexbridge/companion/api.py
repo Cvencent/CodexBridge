@@ -17,6 +17,7 @@ from codexbridge.codex.app_server import AppServerError
 from codexbridge.companion.service import CompanionService
 from codexbridge.companion.store import DEFAULT_PORT, LEGACY_PORT, CompanionStore
 from codexbridge.ports import validate_companion_port
+from codexbridge.net_gate import ExclusiveBindMixin
 from codexbridge.protocol.commands import CommandError
 from codexbridge.codex.desktop_ipc import DesktopIpcError
 
@@ -522,7 +523,6 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             self.app.service.unsubscribe(target)
 
 
-class _CompanionServer(ThreadingHTTPServer):
+class _CompanionServer(ExclusiveBindMixin, ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
     app: CompanionApi

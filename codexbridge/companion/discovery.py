@@ -9,6 +9,7 @@ from typing import Any
 
 from codexbridge import VERSION
 from codexbridge.companion.store import CompanionStore, DEFAULT_DISCOVERY_PORT
+from codexbridge.net_gate import configure_exclusive
 
 DISCOVERY_PORT = DEFAULT_DISCOVERY_PORT
 DISCOVERY_REQUEST = b"CODEXBRIDGE_COMPANION_DISCOVER"
@@ -110,7 +111,7 @@ class CompanionDiscovery:
 
     def _bind(self) -> socket.socket | None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        configure_exclusive(sock)
         try:
             sock.bind((self.host, self.port))
         except OSError as error:

@@ -13,6 +13,7 @@ from codexbridge.companion.store import DEFAULT_PORT
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.protocol.capabilities import parse_max_text_chars
 from codexbridge.hub import BridgeHub
+from codexbridge.net_gate import ExclusiveBindMixin
 from codexbridge.settings_page import SETTINGS_HTML
 from codexbridge.speech_source import (
     load_speech_config,
@@ -266,7 +267,7 @@ def _public_device(record, online: bool = False) -> dict:
     }
 
 
-class _AdminServer(ThreadingHTTPServer):
+class _AdminServer(ExclusiveBindMixin, ThreadingHTTPServer):
     daemon_threads = True
 
 
