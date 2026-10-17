@@ -8,6 +8,8 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from codexbridge.net_gate import configure_exclusive
+
 DISCOVERY_PORT = 8764
 
 # Repeated announcements from the same endpoint collapse into one dial.
@@ -170,24 +172,54 @@ class PresenceListener:
     def start(self) -> None:
         if self._thread is not None:
             return
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("", self.port))
-        except OSError as exc:
-            # Another program holds the discovery port. Broadcast discovery keeps
-            # working without this, so the bridge must still start.
-            self.logger(f"CodexBridge: presence listener unavailable: {exc}")
-            return
-        sock.settimeout(1.0)
-        self._sock = sock
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="presence-listener", daemon=True)
         self._thread.start()
 
-    def _run(self) -> None:
-        sock = self._sock
-        if sock is None:
-            return
+    def _bind_socket(self) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            configure_exclusive(sock)
+            sock.bind(("", self.port))
+        except OSError:
+            sock.close()
+            raise
+        sock.settimeout(1.0)
+        return sock
+
+    def _loop(self) -> None:
+        # A reboot or an upgrade can leave the port held for a moment. The fast
+        # wake path is worth retrying, but quietly: a foreign program that owns
+        # the port should not make us shout once a second forever.
+        delay = 1.0
+        warned = False
+        while not self._stop.is_set():
+            try:
+                sock = self._bind_socket()
+            except OSError as exc:
+                if not warned:
+                    # Another program holds the discovery port. Broadcast discovery
+                    # keeps working without this, so the bridge still starts.
+                    self.logger(f"CodexBridge: presence listener unavailable: {exc}")
+                    warned = True
+                self._stop.wait(delay)
+                delay = min(delay * 2.0, 15.0)
+                continue
+            if warned:
+                self.logger(f"CodexBridge: presence listener back on {self.port}")
+            warned = False
+            delay = 1.0
+            self._sock = sock
+            try:
+                self._run(sock)
+            finally:
+                self._sock = None
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _run(self, sock: socket.socket) -> None:
         seen: dict[str, float] = {}
         while not self._stop.is_set():
             try:

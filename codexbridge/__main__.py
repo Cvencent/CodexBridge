@@ -28,6 +28,7 @@ from codexbridge.companion import (
     CompanionStore,
 )
 from codexbridge.console import emit
+from codexbridge.net_gate import port_is_in_use
 from codexbridge.ports import (
     ADMIN_PORT,
     build_port_statuses,
@@ -461,7 +462,17 @@ def main(argv: list[str] | None = None) -> int:
         companion_status=companion_status,
         companion_action=companion_action,
     )
-    admin.start()
+    try:
+        admin.start()
+    except OSError as error:
+        # The admin port is the front door for the settings page, so an
+        # occupied port has to be explained rather than raised as a traceback.
+        if port_is_in_use("127.0.0.1", ADMIN_PORT):
+            emit(f"端口 {ADMIN_PORT} 已被另一个程序占用，CodexBridge 无法启动。请退出那个程序后重试。错误：{error}")
+        else:
+            emit(f"CodexBridge 无法监听端口 {ADMIN_PORT}：{error}")
+        _release_instance_lock()
+        return 1
     if companion_store.enabled:
         try:
             companion_service.start()

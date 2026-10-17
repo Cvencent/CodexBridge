@@ -84,8 +84,10 @@ class CompanionDiscoveryTests(unittest.TestCase):
             discovery.stop()
 
     def test_bind_retries_after_address_is_in_use(self) -> None:
+        # An upgrade can leave the old process holding the port for a moment.
+        # The listener must keep trying; a probe that lands in that gap only
+        # owes the caller a reset, not a dead discovery.
         holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         holder.bind(("127.0.0.1", 0))
         port = holder.getsockname()[1]
 
@@ -93,12 +95,13 @@ class CompanionDiscoveryTests(unittest.TestCase):
         discovery = CompanionDiscovery(store, host="127.0.0.1", port=port)
         discovery.start()
         time.sleep(0.1)
+        self.assertFalse(discovery.running)
         holder.close()
 
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client.settimeout(3.0)
+        client.settimeout(0.5)
         try:
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + 5.0
             reply = None
             while time.monotonic() < deadline:
                 client.sendto(DISCOVERY_REQUEST, ("127.0.0.1", port))
@@ -107,8 +110,12 @@ class CompanionDiscoveryTests(unittest.TestCase):
                     break
                 except socket.timeout:
                     continue
+                except OSError:
+                    # Windows reports an earlier lost probe as a reset here.
+                    continue
             self.assertIsNotNone(reply)
             self.assertIn(b"codexbridge-companion", reply or b"")
+            self.assertTrue(discovery.running)
         finally:
             client.close()
             discovery.stop()
