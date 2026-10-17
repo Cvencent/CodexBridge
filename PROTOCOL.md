@@ -1065,6 +1065,8 @@ PC -> 设备: {"type":"bridge_ready","bridge":"CodexBridge","version":"1.4.0","c
 PC -> 设备: {"type":"message","message_id":"task:t1","thread_id":"t1","kind":"task","status":"working","title":"Codex 任务","body":"正在处理","created_at":1234567890.0,"seq":0,"total":1}
 设备 -> PC: {"type":"read_ack","message_id":"task:t1"}
 PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read_at":1234567890.0}
+```
+
 ## 17. 手机伴侣接口
 
 手机端不实现设备 UDP/TCP 协议，而是使用 CodexBridge 直接托管的伴侣接口。手机与电脑在同一
@@ -1140,7 +1142,8 @@ SSE 每条事件为一行 `data:` JSON，可能的 `type`：`hello`、`turn_star
 `token_usage`、`thread_status`、`thread_name`、`thread_forked`、`threads_changed`、`resync_required`、
 `rate_limits`、`approval_request`、`approval_resolved`、`error`。手机端必须忽略未知 `type`。`turn_completed` 还携带电脑端 turn 的真实 `completed_at` 秒级时间戳、`read` 布尔值与 `error_message`（失败原因，成功时为空字符串）；手机端应使用前两者判断完成先后、给状态栏提醒去重，并在 `read=true` 时不再提醒，失败时直接展示 `error_message`。审批请求超过 `600` 秒未处理会在电脑端失效。
 
-Bridge 每 2 秒校准最近线程的外部变更，变化时发送 `threads_changed`（携带
+Bridge 有任务运行时每 2 秒、空闲时每 15 秒校准最近线程的外部变更，
+变化时发送 `threads_changed`（携带
 `thread_id`），并对观测期间发生的完成补发 `turn_completed`。首次扫描不会重放
 历史完成。客户端必须按 `thread_id` 与 `turn_id` 去重，并在 SSE 断开后重连。
 Windows 没有可用的桌面共享 App Server socket，Bridge 因此对桌面已知任务使用
@@ -1199,4 +1202,21 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
 - `GET /api/admin/devices` 同时返回手机和硬件；公共字段包含 `kind`、`transport`、`registration_state`、`registration_method`、`online`、`last_address`、`has_token`、`queued_count`，不包含任何令牌或令牌摘要。
 - `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"show_intermediate_events":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
-```
+
+### 17.6 读取缓存与新鲜度
+
+伴侣接口与后台校准共用同一份只读缓存，规则如下，设备端可以据此安排轮询节奏：
+
+- 同一参数的列表、线程正文、日志读取在有效期内不会再次访问 Codex；重复轮询的
+  成本为零次 Codex 往返。
+- 任务列表使用统一的 80 行宽页，`limit` 只在该页上切片，因此手机与电脑端不会
+  各自触发一次全量拉取。带 `search` 或 `cursor` 的请求仍单独取页。
+- 任何与该线程相关的变更（本端发起的 start/steer/interrupt、审批、桌面改名、
+  `turn_*` 事件）都会让该线程、其 fork 与其 origin 的缓存立即失效；
+  `agent_delta` 不触发失效，因为一轮回复每个 token 都会产生一次。
+- 对于 rollout 日志无法判定的行，Bridge 只读取一次 turn 快照并把结论保留
+  600 秒；日志一旦能判定就以日志为准。
+- App Server 进程重启会清空全部缓存。
+
+因此设备端不需要为了“怕看到旧数据”而缩短轮询间隔：状态变化会在下一次校准
+（运行时 2 秒、空闲时 15 秒）内被推送，未变化时缓存读取是常数时间。
