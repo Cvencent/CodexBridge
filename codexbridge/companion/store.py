@@ -22,11 +22,44 @@ PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
 PHONE_TOKEN_PREFIX = "cbp_"
 MAX_PHONES = 16
+# How long a phone may keep using a token it already holds after the same
+# installation pairs again. Re-pairing mints a new secret, and a phone whose
+# pair response was lost mid-write would otherwise be locked out for good:
+# every request answers 401, and it has no way to know it should re-pair.
+TOKEN_GRACE_SECONDS = 60 * 60.0
+# A restart can drop several pair responses in a row, so the allowance keeps
+# the last few secrets rather than only the previous one.
+TOKEN_GRACE_HISTORY = 4
 PHONE_CAPABILITIES = {'status', 'tasks', 'control', 'approval', 'queue'}
 
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _prior_tokens_from(value: object) -> tuple:
+    """Read the grace ledger, ignoring anything malformed."""
+    if not isinstance(value, list):
+        return ()
+    items = []
+    for entry in value:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        digest, expires = entry
+        if not isinstance(digest, str) or len(digest) != 64:
+            continue
+        if not isinstance(expires, (int, float)):
+            continue
+        items.append((digest, float(expires)))
+    return tuple(items[-TOKEN_GRACE_HISTORY:])
+
+
+def _accept_prior(record, digest: str, now: float) -> bool:
+    """True when ``digest`` is an allowed token the phone may still hold."""
+    for allowed, expires in record.prior_tokens:
+        if expires > now and hmac.compare_digest(allowed, digest):
+            return True
+    return False
 
 
 def _new_code() -> str:
@@ -49,6 +82,10 @@ class PhoneRecord:
     # Stable installation identity supplied by the phone. Older records keep
     # this empty and are migrated the first time their phone pairs again.
     client_id: str = ""
+    # Tokens this phone may still present, oldest first, each with the moment
+    # its allowance expires. The whole ledger is cleared as soon as the newest
+    # token is used, which is the proof the phone actually received it.
+    prior_tokens: tuple = ()
 
     def capabilities(self) -> set[str]:
         return self.enabled & PHONE_CAPABILITIES
@@ -218,6 +255,7 @@ class CompanionStore:
         if not isinstance(enabled, list) or any(not isinstance(item, str) for item in enabled):
             enabled = []
         client_id = value.get('client_id')
+        prior_tokens = _prior_tokens_from(value.get('prior_tokens'))
         return PhoneRecord(
             phone_id=phone_id,
             name=name if isinstance(name, str) else "",
@@ -226,6 +264,7 @@ class CompanionStore:
             last_seen=float(last_seen) if isinstance(last_seen, (int, float)) else 0.0,
             enabled=set(enabled) & PHONE_CAPABILITIES,
             client_id=client_id.strip()[:128] if isinstance(client_id, str) else "",
+            prior_tokens=prior_tokens,
         )
 
     def save(self) -> None:
@@ -247,6 +286,7 @@ class CompanionStore:
                         "last_seen": record.last_seen,
                         "enabled": sorted(record.capabilities()),
                         "client_id": record.client_id,
+                        "prior_tokens": [list(item) for item in record.prior_tokens],
                     }
                     for record in self.phones.values()
                 ],
@@ -460,6 +500,17 @@ class CompanionStore:
                 record.name = (name or "").strip()[:48]
 
             token = _new_token()
+            # The phone may still hold the token from its previous pair. If
+            # this response never arrived -- a dropped socket during a bridge
+            # restart is the common case -- the phone would keep presenting a
+            # secret this store no longer knows and every request would answer
+            # 401 with no way back. Honour the secrets it may be holding until
+            # one of them proves it reached the phone.
+            if record.token_hash:
+                ledger = list(record.prior_tokens)
+                ledger.append((record.token_hash, now + TOKEN_GRACE_SECONDS))
+                ledger = [item for item in ledger if item[1] > now]
+                record.prior_tokens = tuple(ledger[-TOKEN_GRACE_HISTORY:])
             record.token_hash = _hash_token(token)
             record.last_seen = now
             self.phones[phone_id] = record
@@ -474,12 +525,34 @@ class CompanionStore:
         if not isinstance(token, str) or not token:
             return None
         digest = _hash_token(token)
+        now = time.time()
         with self._lock:
             self._reload_locked()
             for record in self.phones.values():
                 if hmac.compare_digest(record.token_hash, digest):
+                    # The newest secret works, so the phone has it: every
+                    # allowance for an older one is now pointless.
+                    if record.prior_tokens:
+                        record.prior_tokens = ()
+                        self.save()
                     return record
+                if _accept_prior(record, digest, now):
+                    return record
+            self._expire_grace(now)
         return None
+
+    def _expire_grace(self, now: float) -> None:
+        """Drop allowances that ran out while nobody presented them."""
+        stale = []
+        for record in self.phones.values():
+            if not record.prior_tokens:
+                continue
+            kept = tuple(item for item in record.prior_tokens if item[1] > now)
+            if len(kept) != len(record.prior_tokens):
+                record.prior_tokens = kept
+                stale.append(record)
+        if stale:
+            self.save()
 
     def touch(self, phone_id: str) -> None:
         with self._lock:

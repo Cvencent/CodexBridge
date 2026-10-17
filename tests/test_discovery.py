@@ -1,8 +1,6 @@
 import socket
 import threading
 import unittest
-from unittest import mock
-
 from codexbridge.devices.discovery import (
     DISCOVERY_PORT,
     DISCOVERY_REQUEST,
@@ -83,16 +81,20 @@ class DiscoveryTest(unittest.TestCase):
         stop = threading.Event()
         ready = threading.Event()
         requests = []
-        responder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        responder.bind(("127.0.0.1", 0))
-        port = responder.getsockname()[1]
-        responder.settimeout(0.2)
+        port_box = [DISCOVERY_PORT]
 
-        def serve():
+        def responder():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # An ephemeral port: a bridge running on this machine owns the
+            # well-known discovery port exclusively, so a test that bound it
+            # would be competing with the product rather than testing it.
+            sock.bind(("127.0.0.1", 0))
+            port_box[0] = sock.getsockname()[1]
+            sock.settimeout(0.2)
             ready.set()
             while not stop.is_set():
                 try:
-                    payload, source = responder.recvfrom(1024)
+                    payload, source = sock.recvfrom(1024)
                 except socket.timeout:
                     continue
                 requests.append(payload)
@@ -100,19 +102,17 @@ class DiscoveryTest(unittest.TestCase):
                     b'{"device":"dotii","device_id":"a1","name":"Desk",'
                     b'"port":8765,"capabilities":["status","tasks"]}'
                 )
-                responder.sendto(reply, source)
+                sock.sendto(reply, source)
+            sock.close()
 
-        thread = threading.Thread(target=serve, daemon=True)
+        thread = threading.Thread(target=responder, daemon=True)
         thread.start()
         self.assertTrue(ready.wait(1.0))
         try:
-            with unittest.mock.patch(
-                "codexbridge.devices.discovery.DISCOVERY_PORT", port
-            ):
-                results = discover(timeout=1.0, targets=("127.0.0.1",))
+            results = discover(timeout=1.0, targets=("127.0.0.1",),
+                                 port=port_box[0])
         finally:
             stop.set()
             thread.join(timeout=1.0)
-            responder.close()
         self.assertEqual([result.device_id for result in results], ["a1"])
         self.assertEqual(requests, [DISCOVERY_REQUEST])

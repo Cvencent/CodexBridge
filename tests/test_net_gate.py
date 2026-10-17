@@ -16,10 +16,20 @@ from codexbridge.admin_api import _AdminServer
 from codexbridge.net_gate import ExclusiveBindMixin, configure_exclusive, port_is_in_use
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+def _free_port(kind: int = socket.SOCK_STREAM) -> int:
+    # Windows reserves TCP and UDP dynamic ports separately, so a number
+    # learned from a TCP probe can be refused for a UDP bind. Ask the
+    # protocol under test for its own free port.
+    for _attempt in range(8):
+        probe = socket.socket(socket.AF_INET, kind)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    raise AssertionError("no free loopback port")
 
 
 def _free_udp_port() -> int:
@@ -62,7 +72,7 @@ class NetGateTest(unittest.TestCase):
         self.assertFalse(port_is_in_use("127.0.0.1", port))
 
     def test_an_exclusive_datagram_socket_refuses_a_shared_bind(self):
-        port = _free_udp_port()
+        port = _free_port(socket.SOCK_DGRAM)
         holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addCleanup(holder.close)
         holder.bind(("127.0.0.1", port))
