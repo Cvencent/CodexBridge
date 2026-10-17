@@ -32,6 +32,17 @@ class AppServerError(RuntimeError):
     """Raised when the Codex app-server cannot satisfy a request."""
 
 
+class AppServerProtocolError(AppServerError):
+    """The app-server answered, so the pipe is healthy but the method failed.
+
+    A JSON-RPC error payload -- unknown method, bad params, a rejected
+    approval -- comes back from a live server. Restarting it fixes nothing
+    and costs a fresh process spawn, which is the most expensive thing a
+    device poll can do. Transport failures keep raising the plain
+    ``AppServerError`` so callers still reconnect on a dead pipe.
+    """
+
+
 def _as_number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -316,7 +327,8 @@ class AppServerClient:
                     detail = response.get("error")
                     if isinstance(detail, dict):
                         detail = detail.get("message", detail)
-                    raise AppServerError(f"App Server 请求失败 {method}：{detail}")
+                    raise AppServerProtocolError(
+                        f"App Server 请求失败 {method}：{detail}")
                 return response.get("result")
             finally:
                 with self._pending_lock:

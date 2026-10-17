@@ -18,6 +18,7 @@ from codexbridge.read_state import ReadStateStore
 from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
+    AppServerProtocolError,
     _resolve_codex_command,
     _turn_error,
     account_snapshot,
@@ -73,6 +74,16 @@ LOG_CACHE_SECONDS = 8.0
 # How many days of rollout folders to search for a thread's log.
 ROLLOUT_SCAN_DAYS = 3
 LOG_SCAN_LIMIT = 24
+# The listing page every caller shares. The background watcher reconciles 80
+# rows while a phone status needs a dozen, and because the read cache keys on
+# the request params, each caller paid for its own Codex round trip -- and the
+# watcher's forced refresh threw the shared entry away before any device could
+# reuse it. One wide page, sliced per caller, costs one fetch.
+LIST_PAGE_LIMIT = 80
+# How long a turn-read verdict may stand for a row the rollout log cannot
+# classify. The log stays the authority while it has anything to say, so this
+# only bounds the case where it is silent or unreadable.
+ROW_VERDICT_SECONDS = 600.0
 
 APPROVAL_KINDS: dict[str, str] = {
     "item/commandExecution/requestApproval": "command",
@@ -472,6 +483,11 @@ class CompanionService:
         # Threads whose turn has ended. Their body cannot change again
         # until a new turn starts, so their reads stay valid far longer.
         self._terminal_threads: set[str] = set()
+        # Rows whose turn read settled their state while the rollout log had
+        # nothing to say. Re-reading a 146 KB thread body for every such row on
+        # every poll was the dominant cost of the phone API; the verdict stands
+        # until the log shows that thread moving again.
+        self._row_verdicts: dict[str, tuple[str, int, float]] = {}
         self._observed_threads: dict[str, dict[str, Any]] | None = None
         self._poll_thread: threading.Thread | None = None
         self._untitled_threads: set[str] = set()
@@ -629,6 +645,7 @@ class CompanionService:
     def _reset_client(self) -> None:
         self._read_cache.clear()
         self._terminal_threads.clear()
+        self._row_verdicts.clear()
         with self._client_lock:
             client = self._client
             self._client = None
@@ -1050,6 +1067,11 @@ class CompanionService:
         for attempt in range(2):
             try:
                 return self._ensure_client().request(method, params)
+            except AppServerProtocolError as error:
+                # The server is alive and said no. Reconnecting spawns a whole
+                # Codex process (~1.5 s here) and the same method fails again
+                # on the fresh pipe, so report it once and keep the transport.
+                raise
             except AppServerError as error:
                 last_error = error
                 self._reset_client()
@@ -1088,6 +1110,7 @@ class CompanionService:
         if not thread_id:
             self._read_cache.clear()
             self._terminal_threads.clear()
+            self._row_verdicts.clear()
             return
         targets = {thread_id,
                    self._fork_for(thread_id),
@@ -1096,6 +1119,7 @@ class CompanionService:
         for target in targets:
             if target:
                 self._terminal_threads.discard(target)
+                self._row_verdicts.pop(target, None)
                 self._read_cache.invalidate_thread(target)
 
     def event_log(self) -> list[str]:
@@ -1478,17 +1502,22 @@ class CompanionService:
                            live=bool(self._log_status(thread_id)))
         return summary
 
-    def _row_status_from_turn(self, thread_id: str) -> str:
-        """Classify a row from its turn snapshot when the rollout log cannot."""
-        summary = self._read_thread_summary(thread_id)
-        if summary is None:
-            return ""
-        status = str(summary.get("status") or "")
-        # "idle" here only means the app-server has no live turn, which is also
-        # what it reports for a thread it never loaded, so it is not an answer.
-        if not status or status == "idle":
-            return ""
-        return status
+    def _row_verdict(self, thread_id: str) -> tuple[str, int] | None:
+        """Return a remembered turn-read verdict for a row, if still credible.
+
+        A settled thread keeps its verdict; a thread that started moving again
+        is told so by the rollout log, which wins here and clears the memo the
+        moment any change touches the thread. The TTL bounds the one case the
+        log cannot cover: a rollout this process cannot read at all.
+        """
+        entry = self._row_verdicts.get(thread_id)
+        if entry is None:
+            return None
+        status, completed_at, stamp = entry
+        if time.monotonic() - stamp > ROW_VERDICT_SECONDS:
+            self._row_verdicts.pop(thread_id, None)
+            return None
+        return status, completed_at
 
     def list_threads(
         self,
@@ -1497,8 +1526,30 @@ class CompanionService:
         cursor: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
+        # A plain listing is answered from one shared page. Fetching per caller
+        # meant the phone re-read the whole task list on every poll even though
+        # the watcher had refreshed the identical rows seconds earlier, because
+        # the read cache keys on the request params.
+        if not search and not cursor:
+            page = self._list_page(refresh=refresh)
+            want = max(1, min(int(limit or 40), 80))
+            rows = page["threads"]
+            return {
+                "threads": rows[:want] if len(rows) > want else rows,
+                "next_cursor": page.get("next_cursor"),
+            }
+        return self._list_page(limit=limit, search=search, cursor=cursor,
+                               refresh=refresh)
+
+    def _list_page(
+        self,
+        limit: int = LIST_PAGE_LIMIT,
+        search: str = "",
+        cursor: str | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
-            "limit": max(1, min(int(limit or 40), 80)),
+            "limit": max(1, min(int(limit or LIST_PAGE_LIMIT), 80)),
             "sortKey": "recency_at",
             "sortDirection": "desc",
             "sourceKinds": SOURCE_KINDS,
@@ -1561,15 +1612,28 @@ class CompanionService:
             # header reads the turn and says "failed". Ask the app-server for
             # the turn itself, but only for rows the log could not classify.
             if activity is None or not inferred:
-                read_status = self._row_status_from_turn(thread_id)
-                if read_status:
-                    summary["status"] = read_status
-                    if read_status in {"completed", "failed"}:
-                        detail = self._read_thread_summary(thread_id)
-                        if detail is not None:
-                            completed_at = int(detail.get("completed_at") or 0)
-                            if completed_at > int(summary.get("completed_at") or 0):
-                                summary["completed_at"] = completed_at
+                verdict = self._row_verdict(thread_id)
+                if verdict is None:
+                    detail = self._read_thread_summary(thread_id)
+                    read_status = ""
+                    settled_at = 0
+                    if detail is not None:
+                        candidate = str(detail.get("status") or "")
+                        # "idle" only means the app-server holds no live turn,
+                        # which is also what it says about a thread it never
+                        # loaded, so it is not a verdict worth remembering.
+                        if candidate and candidate != "idle":
+                            read_status = candidate
+                            settled_at = int(detail.get("completed_at") or 0)
+                    self._row_verdicts[thread_id] = (
+                        read_status, settled_at, time.monotonic())
+                    verdict = (read_status, settled_at)
+                if verdict is not None:
+                    read_status, settled_at = verdict
+                    if read_status:
+                        summary["status"] = read_status
+                    if settled_at > int(summary.get("completed_at") or 0):
+                        summary["completed_at"] = settled_at
             completed_at = int(summary.get("completed_at") or 0)
             if (
                 summary.get("status") in {"completed", "failed"}
