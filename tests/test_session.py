@@ -7,6 +7,15 @@ from tests.fake_device import FakeDevice
 
 
 class SessionTest(unittest.TestCase):
+    def test_default_heartbeat_arrives_before_device_timeout(self):
+        session = DeviceSession(
+            "127.0.0.1",
+            8765,
+            "abcdefghijklmnop",
+            device_id="fake-device",
+        )
+        self.assertLess(session.heartbeat_seconds, session.timeout_seconds)
+
     def test_unified_handshake_and_heartbeat(self):
         seen = []
         with FakeDevice() as device:
