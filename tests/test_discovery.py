@@ -48,10 +48,15 @@ class DiscoveryTest(unittest.TestCase):
         ready = threading.Event()
         requests = []
 
+        port_box = [DISCOVERY_PORT]
+
         def responder():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("127.0.0.1", DISCOVERY_PORT))
+            # An ephemeral port: a bridge running on this machine owns the
+            # well-known discovery port exclusively, so a test that bound it
+            # would be competing with the product rather than testing it.
+            sock.bind(("127.0.0.1", 0))
+            port_box[0] = sock.getsockname()[1]
             sock.settimeout(0.2)
             ready.set()
             while not stop.is_set():
@@ -71,7 +76,8 @@ class DiscoveryTest(unittest.TestCase):
         thread.start()
         self.assertTrue(ready.wait(1.0))
         try:
-            results = discover(timeout=1.0, targets=("127.0.0.1",))
+            results = discover(timeout=1.0, targets=("127.0.0.1",),
+                                 port=port_box[0])
         finally:
             stop.set()
             thread.join(timeout=1.0)

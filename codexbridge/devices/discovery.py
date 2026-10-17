@@ -102,7 +102,11 @@ def _broadcast_targets(sock: socket.socket) -> tuple[str, ...]:
 def discover(
     timeout: float = 3.0,
     targets: Iterable[str] | None = None,
+    port: int = DISCOVERY_PORT,
 ) -> list[DiscoveryResult]:
+    # ``port`` is overridable for the same reason PresenceListener's is: a
+    # live bridge owns the well-known port exclusively, and a test must not
+    # have to fight it to exercise the round trip.
     if timeout < 0:
         raise ValueError("timeout must not be negative")
 
@@ -121,7 +125,7 @@ def discover(
 
         for target in target_hosts:
             try:
-                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+                sock.sendto(DISCOVERY_REQUEST, (target, port))
             except OSError:
                 continue
 
