@@ -14,6 +14,7 @@ from codexbridge.companion.store import (
     PAIRING_CODE_TTL_SECONDS,
     CompanionStore,
 )
+from codexbridge.devices.registry import DeviceRegistry
 
 
 class CompanionStoreTests(unittest.TestCase):
@@ -28,7 +29,10 @@ class CompanionStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.path = Path(self.temp.name) / "companion.json"
-        self.store = CompanionStore(self.path)
+        self.devices_path = Path(self.temp.name) / "devices.json"
+        self.registry = DeviceRegistry(self.devices_path)
+        self.registry.load()
+        self.store = CompanionStore(self.path, registry=self.registry)
         self.store.load()
 
     def tearDown(self) -> None:
@@ -42,6 +46,81 @@ class CompanionStoreTests(unittest.TestCase):
             time.time() + PAIRING_CODE_TTL_SECONDS,
             delta=5,
         )
+
+    def test_paired_phone_is_synchronized_into_the_device_registry(self) -> None:
+        claimed = self.store.claim(
+            self.store.pairing_code()["code"],
+            "Pixel",
+            client_id="installation-1",
+        )
+        assert claimed is not None
+
+        record = self.registry.get(claimed["phone_id"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.kind, "phone")
+        self.assertEqual(record.transport, "companion_http")
+        self.assertEqual(record.registration_state, "approved")
+        self.assertEqual(record.registration_method, "pairing_code")
+        self.assertEqual(record.client_id, "installation-1")
+        self.assertEqual(record.token_hash, self.store.phones[claimed["phone_id"]].token_hash)
+        self.assertNotIn(claimed["token"], self.devices_path.read_text(encoding="utf-8"))
+
+    def test_capability_negotiation_and_touch_update_registry(self) -> None:
+        claimed = self.store.claim(
+            self.store.pairing_code()["code"], "Pixel"
+        )
+        assert claimed is not None
+        self.assertEqual(
+            self.store.negotiate(claimed["phone_id"], ["status", "queue"]),
+            ["queue", "status"],
+        )
+        self.store.phones[claimed["phone_id"]].last_seen = 0.0
+        self.store.touch(claimed["phone_id"])
+
+        record = self.registry.get(claimed["phone_id"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.enabled, {"status", "queue"})
+        self.assertGreater(record.last_seen or 0.0, 0.0)
+
+    def test_removing_phone_removes_unified_registry_record(self) -> None:
+        claimed = self.store.claim(
+            self.store.pairing_code()["code"], "Pixel"
+        )
+        assert claimed is not None
+
+        self.assertTrue(self.store.remove_phone(claimed["phone_id"]))
+
+        self.assertIsNone(self.registry.get(claimed["phone_id"]))
+
+    def test_load_merges_legacy_phone_records_into_registry(self) -> None:
+        payload = {
+            "version": 1,
+            "enabled": True,
+            "phones": [
+                {
+                    "phone_id": "phone-legacy",
+                    "name": "Legacy",
+                    "token_hash": "c" * 64,
+                    "created_at": 1.0,
+                    "last_seen": 2.0,
+                    "enabled": ["status", "queue"],
+                    "client_id": "old-install",
+                }
+            ],
+        }
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        store = CompanionStore(self.path, registry=self.registry)
+
+        store.load()
+
+        record = self.registry.get("phone-legacy")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.kind, "phone")
+        self.assertEqual(record.enabled, {"status", "queue"})
+        self.assertEqual(record.token_hash, "c" * 64)
 
     def test_same_installation_reuses_phone_id(self) -> None:
         first = self.store.claim(

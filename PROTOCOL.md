@@ -894,22 +894,61 @@ SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `qu
 忽略单条消息不等同于断开连接。鉴权失败、身份不一致或 TCP 关闭会结束会话；
 握手完成后的会话不会因为暂时收不到设备消息而被 PC 侧超时断开。
 
-## 13. 本机管理接口
+## 13. 统一设备与管理接口
 
-本节接口仅用于 CodexBridge 本机管理页面，不属于设备通用协议。管理服务默认
-监听 `127.0.0.1:8788`，并拒绝非回环来源。
+`DeviceRegistry` 是手机和硬件设备身份、注册状态与能力的唯一权威来源。
+手机仍通过配对码登记，硬件通过发现与后续的注册批准流程登记；两者进入同一份
+`devices.json`（版本 `2`），管理页和内部事件只使用同一份公共设备视图。
 
-### 13.1 状态与设备
+### 13.1 统一设备记录与公开视图
+
+内部记录保留硬件令牌和手机令牌摘要，但公共视图绝不返回 `token` 或
+`token_hash`，只返回 `has_token`。`kind` 取值 `phone` / `hardware`，
+`transport` 取值 `companion_http` / `device_tcp`，`registration_state`
+取值 `pending` / `approved` / `rejected` / `revoked`。手机配对成功后为
+`approved + pairing_code`；硬件无令牌时为 `pending`，批准后为
+`approved`。
+
+`GET /api/admin/devices` 返回统一列表，每项字段为：
+
+```json
+{
+  "device_id": "phone-a1b2c3",
+  "kind": "phone",
+  "transport": "companion_http",
+  "name": "Pixel",
+  "model": "Android",
+  "registration_state": "approved",
+  "registration_method": "pairing_code",
+  "online": true,
+  "last_seen": 1234567890.0,
+  "last_address": "192.168.1.23",
+  "has_token": true,
+  "supported": ["status", "tasks", "control", "approval", "queue"],
+  "enabled": ["status", "tasks", "control", "approval", "queue"],
+  "max_text_chars": null,
+  "queued_count": 2
+}
+```
+
+`GET /api/admin/companion` 继续保留 `phones` 字段，但它只从统一设备视图派生，
+不再形成第二份手机列表。旧版 `companion.json` 中的 `phones` 会在启动时合并进
+统一注册表，升级后原 `phone_id`、令牌摘要、`client_id`、能力和最近在线时间保持
+不变；旧文件保留用于回滚。
+
+### 13.2 状态与设备操作
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/admin/status` | 版本与设备数量 |
-| `GET` | `/api/admin/devices` | 设备列表、在线状态、`supported`、`enabled` |
+| `GET` | `/api/admin/devices` | 统一设备列表，含手机和硬件 |
 | `POST` | `/api/admin/devices/remove` | 移除设备 |
 | `POST` | `/api/admin/devices/capabilities` | 更新设备生效能力 |
-| `GET` | `/api/admin/pairing?device_id=...` | 生成并返回配对令牌 |
+| `GET` | `/api/admin/pairing?device_id=...` | 生成并返回硬件配对令牌 |
 
-### 13.2 语音与常规设置
+### 13.3 语音与常规设置
+
+### 13.4 语音与常规设置
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -923,7 +962,7 @@ SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `qu
 `Content-Type: application/json`。API Key 不会通过 GET 返回；留空表示保留已
 保存的 Key，使用 `clear_api_key: true` 才清除。
 
-### 13.3 Dotii 管理中心快照接口
+### 13.5 Dotii 管理中心快照接口
 
 Dotii 管理中心默认监听 `127.0.0.1:8787`，它与通用设备 TCP 协议并行存在：
 
@@ -941,6 +980,7 @@ Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、
 ## 14. 安全要求
 
 - 每台设备使用独立配对令牌，长度至少 `16` 字符。
+- 硬件明文令牌和手机令牌摘要写入私有注册表，但不得出现在管理 API、事件或日志中。
 - TCP `8765` 和 UDP `8764` 只在可信局域网内使用，不要暴露到公网。
 - 本机管理 API 只监听回环地址，非回环请求返回 `403`。
 - 设备 ID、令牌、能力、消息文本和音频都有明确长度或大小边界。
@@ -1108,7 +1148,8 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
 桌面跨客户端 IPC 是 Bridge 内部适配协议，不是设备接入协议。
 设备不得依赖桌面的命名管道、私有消息版本或 conversationState 结构。
 
-- `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机。
+- `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机；手机列表由统一设备注册表派生。
+- `GET /api/admin/devices` 同时返回手机和硬件；公共字段包含 `kind`、`transport`、`registration_state`、`registration_method`、`online`、`last_address`、`has_token`、`queued_count`，不包含任何令牌或令牌摘要。
 - `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"show_intermediate_events":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 ```

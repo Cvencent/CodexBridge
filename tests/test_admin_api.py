@@ -57,7 +57,15 @@ class AdminApiTest(unittest.TestCase):
         self.assertGreaterEqual(len(payload["token"]), 16)
         self.assertEqual(self.registry.get("d2").token, payload["token"])
 
-    def test_devices_list_hides_token(self):
+    def test_devices_list_hides_private_tokens(self):
+        self.registry.mint_token("d1")
+        self.registry.upsert_phone(
+            "phone-1",
+            name="Pixel",
+            token_hash="a" * 64,
+            supported=["status", "queue"],
+            enabled=["status", "queue"],
+        )
         status, payload = handle_request(
             "GET",
             "/api/admin/devices",
@@ -68,7 +76,14 @@ class AdminApiTest(unittest.TestCase):
             self.registry,
         )
         self.assertEqual(status, 200)
-        self.assertNotIn("token", json.dumps(payload))
+        rendered = json.dumps(payload)
+        self.assertNotIn('"token":', rendered)
+        self.assertNotIn('"token_hash":', rendered)
+        self.assertNotIn("a" * 64, rendered)
+        by_id = {item["device_id"]: item for item in payload["devices"]}
+        self.assertEqual(by_id["d1"]["kind"], "hardware")
+        self.assertEqual(by_id["phone-1"]["kind"], "phone")
+        self.assertTrue(by_id["phone-1"]["has_token"])
 
     def test_capabilities_update_filters_unknown(self):
         body = json.dumps({"device_id": "d1", "enabled": ["status", "nope"]}).encode()

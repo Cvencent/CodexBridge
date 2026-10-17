@@ -31,6 +31,13 @@ class DeviceRecord:
     supported: set[str] = field(default_factory=set)
     enabled: set[str] = field(default_factory=set)
     last_seen: float | None = None
+    kind: str = "hardware"
+    transport: str = "device_tcp"
+    registration_state: str = "pending"
+    registration_method: str = "admin_approval"
+    last_address: str | None = None
+    client_id: str = ""
+    token_hash: str = ""
     # None means the device accepts unlimited text; set by the device's own
     # handshake or by the local per-device override.
     max_text_chars: int | None = UNLIMITED
@@ -43,6 +50,10 @@ class DeviceRecord:
     # that only wakes on its access point's traffic interval.
     host: str | None = None
     port: int | None = None
+
+    @property
+    def has_token(self) -> bool:
+        return bool(self.token or self.token_hash)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +68,13 @@ class DeviceRecord:
             "customized": self.customized,
             "host": self.host,
             "port": self.port,
+            "kind": self.kind,
+            "transport": self.transport,
+            "registration_state": self.registration_state,
+            "registration_method": self.registration_method,
+            "last_address": self.last_address,
+            "client_id": self.client_id,
+            "token_hash": self.token_hash,
         }
 
     @classmethod
@@ -81,6 +99,38 @@ class DeviceRecord:
         )
         supported = normalize(value.get("supported") or [])
         max_text_chars = parse_max_text_chars(value.get("max_text_chars"))
+        kind = str(value.get("kind") or "hardware")
+        if kind not in {"phone", "hardware"}:
+            kind = "hardware"
+        transport = str(value.get("transport") or (
+            "companion_http" if kind == "phone" else "device_tcp"
+        ))
+        if transport not in {"companion_http", "device_tcp"}:
+            transport = "companion_http" if kind == "phone" else "device_tcp"
+        registration_state = str(value.get("registration_state") or "")
+        if registration_state not in {"pending", "approved", "rejected", "revoked"}:
+            registration_state = "approved" if token else "pending"
+        registration_method = str(value.get("registration_method") or "")
+        if registration_method not in {"pairing_code", "admin_approval"}:
+            registration_method = "pairing_code" if kind == "phone" else "admin_approval"
+        last_address_value = value.get("last_address")
+        last_address = (
+            str(last_address_value)
+            if isinstance(last_address_value, str) and last_address_value
+            else None
+        )
+        client_id_value = value.get("client_id")
+        client_id = (
+            str(client_id_value).strip()[:128]
+            if isinstance(client_id_value, str)
+            else ""
+        )
+        token_hash_value = value.get("token_hash")
+        token_hash = (
+            str(token_hash_value)
+            if isinstance(token_hash_value, str) and len(token_hash_value) == 64
+            else ""
+        )
         return cls(
             device_id=str(value.get("device_id") or device_id),
             model=model,
@@ -97,6 +147,13 @@ class DeviceRecord:
             customized=bool(value.get("customized", False)),
             host=host,
             port=port,
+            kind=kind,
+            transport=transport,
+            registration_state=registration_state,
+            registration_method=registration_method,
+            last_address=last_address,
+            client_id=client_id,
+            token_hash=token_hash,
         )
 
 
@@ -126,6 +183,7 @@ class DeviceRegistry:
         self._lock = threading.RLock()
 
     def load(self) -> None:
+        migrated = False
         with self._lock:
             if self.path is None or not self.path.exists():
                 return
@@ -134,6 +192,8 @@ class DeviceRegistry:
             except (OSError, json.JSONDecodeError):
                 return
 
+            version = raw.get("version") if isinstance(raw, dict) else None
+            migrated = version != 2
             raw_devices = raw.get("devices", raw) if isinstance(raw, dict) else raw
             if isinstance(raw_devices, list):
                 raw_devices = {
@@ -149,6 +209,8 @@ class DeviceRegistry:
                 if isinstance(value, dict):
                     loaded[str(device_id)] = DeviceRecord.from_dict(str(device_id), value)
             self._devices = loaded
+        if migrated:
+            self.save()
 
     def save(self) -> None:
         with self._lock:
@@ -156,7 +218,7 @@ class DeviceRegistry:
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "version": 1,
+                "version": 2,
                 "devices": {
                     device_id: record.to_dict()
                     for device_id, record in self._devices.items()
@@ -217,6 +279,11 @@ class DeviceRegistry:
                         if supported is not None
                         else default_for(model)
                     ),
+                    kind="hardware",
+                    transport="device_tcp",
+                    registration_state=("approved" if token else "pending"),
+                    registration_method="admin_approval",
+                    last_address=None if host is ... else host,
                 )
                 self._devices[device_id] = record
                 return record
@@ -228,8 +295,11 @@ class DeviceRegistry:
                 record.name = name
             if token is not None:
                 record.token = token
+                record.registration_state = "approved"
             if host is not ...:
                 record.host = host
+                if host:
+                    record.last_address = host
             if port is not ...:
                 record.port = port
             if supported is not None:
@@ -250,6 +320,119 @@ class DeviceRegistry:
                     record.supported | set(MINIMAL)
                 )
             return record
+
+    def upsert_phone(
+        self,
+        device_id: str,
+        *,
+        name: str | None = None,
+        token_hash: str = "",
+        supported: Iterable[str] | None = None,
+        enabled: Iterable[str] | None = None,
+        last_seen: float | None = None,
+        client_id: str = "",
+        model: str = "Android",
+    ) -> DeviceRecord:
+        with self._lock:
+            record = self._devices.get(device_id)
+            declared = normalize(supported or [])
+            if record is None:
+                record = DeviceRecord(
+                    device_id=device_id,
+                    model=model,
+                    name=name,
+                    supported=declared,
+                    enabled=(
+                        normalize(enabled)
+                        if enabled is not None
+                        else set(declared)
+                    ),
+                    last_seen=last_seen,
+                    kind="phone",
+                    transport="companion_http",
+                    registration_state="approved",
+                    registration_method="pairing_code",
+                    client_id=str(client_id or "")[:128],
+                    token_hash=str(token_hash or ""),
+                    customized=True,
+                )
+                self._devices[device_id] = record
+                return record
+
+            record.kind = "phone"
+            record.transport = "companion_http"
+            record.registration_state = "approved"
+            record.registration_method = "pairing_code"
+            record.model = model
+            if name is not None:
+                record.name = name
+            if token_hash:
+                record.token_hash = str(token_hash)
+            if supported is not None:
+                record.supported = declared
+            if enabled is not None:
+                record.enabled = normalize(enabled)
+            if last_seen is not None:
+                record.last_seen = last_seen
+            if client_id:
+                record.client_id = str(client_id)[:128]
+            return record
+
+    def public(
+        self,
+        device_id: str,
+        *,
+        online: bool = False,
+        queued_count: int = 0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                raise KeyError(device_id)
+            return self._public_locked(record, online=online, queued_count=queued_count)
+
+    def public_all(
+        self,
+        *,
+        online_ids: Iterable[str] | None = None,
+        queued_counts: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        online_set = set(online_ids or ())
+        counts = queued_counts or {}
+        with self._lock:
+            return [
+                self._public_locked(
+                    record,
+                    online=record.device_id in online_set,
+                    queued_count=max(0, int(counts.get(record.device_id, 0) or 0)),
+                )
+                for record in self._devices.values()
+            ]
+
+    @staticmethod
+    def _public_locked(
+        record: DeviceRecord,
+        *,
+        online: bool,
+        queued_count: int,
+    ) -> dict[str, Any]:
+        return {
+            "device_id": record.device_id,
+            "kind": record.kind,
+            "transport": record.transport,
+            "name": record.name,
+            "model": record.model,
+            "registration_state": record.registration_state,
+            "registration_method": record.registration_method,
+            "online": bool(online),
+            "last_seen": record.last_seen,
+            "last_address": record.last_address,
+            "has_token": record.has_token,
+            "supported": sorted(record.supported),
+            "enabled": sorted(record.enabled),
+            "max_text_chars": record.max_text_chars,
+            "queued_count": int(queued_count),
+        }
 
     def remove(self, device_id: str) -> bool:
         with self._lock:

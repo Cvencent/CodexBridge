@@ -71,8 +71,10 @@ class CompanionStore:
         path: Path | None,
         port: int = DEFAULT_PORT,
         discovery_port: int = DEFAULT_DISCOVERY_PORT,
+        registry: object | None = None,
     ) -> None:
         self.path = Path(path) if path is not None else None
+        self.registry = registry
         self.port = DEFAULT_PORT if port == LEGACY_PORT else port
         self.discovery_port = discovery_port
         self.enabled = True
@@ -99,6 +101,7 @@ class CompanionStore:
             return
         with self._lock:
             migrated = self._apply_payload(payload)
+            self._sync_all_to_registry()
         if migrated:
             self.save()
 
@@ -194,6 +197,7 @@ class CompanionStore:
                 if record is not None
             }
         recovered = any(phone_id not in disk_phone_ids for phone_id in before)
+        self._sync_all_to_registry()
         if migrated or recovered:
             self.save()
 
@@ -272,6 +276,7 @@ class CompanionStore:
             if record is None:
                 raise ValueError('phone_id')
             record.enabled = set(supported) & PHONE_CAPABILITIES
+            self._sync_phone_to_registry(record)
             self.save()
             return sorted(record.capabilities())
 
@@ -314,14 +319,68 @@ class CompanionStore:
             # displayed list matches the durable file instead of stale
             # in-memory state.
             self._reload_locked()
+            phones = self._registry_phone_views()
+            if phones is None:
+                phones = [record.public() for record in self.phones.values()]
             return {
                 "enabled": self.enabled,
                 "show_intermediate_events": self.show_intermediate_events,
                 "port": self.port,
                 "discovery_port": self.discovery_port,
-                "phones": [record.public() for record in self.phones.values()],
+                "phones": phones,
                 "pairing_expires_at": self._code_expires_at if self.enabled else 0,
             }
+
+    def _registry_phone_views(self) -> list[dict] | None:
+        if self.registry is None:
+            return None
+        try:
+            rows = self.registry.public_all()
+        except (AttributeError, TypeError, ValueError):
+            return None
+        phones = []
+        for row in rows:
+            if row.get("kind") != "phone":
+                continue
+            phones.append(
+                {
+                    "phone_id": row.get("device_id"),
+                    "name": row.get("name") or "",
+                    "last_seen": row.get("last_seen") or 0.0,
+                    "enabled": row.get("enabled") or [],
+                    "kind": "phone",
+                    "transport": "companion_http",
+                    "registration_state": row.get("registration_state"),
+                    "has_token": bool(row.get("has_token")),
+                }
+            )
+        return phones
+
+    def _sync_phone_to_registry(self, record: PhoneRecord) -> None:
+        if self.registry is None:
+            return
+        self.registry.upsert_phone(
+            record.phone_id,
+            name=record.name,
+            token_hash=record.token_hash,
+            supported=sorted(record.capabilities()),
+            enabled=sorted(record.capabilities()),
+            last_seen=record.last_seen,
+            client_id=record.client_id,
+        )
+        self.registry.save()
+
+    def _sync_all_to_registry(self) -> None:
+        if self.registry is None:
+            return
+        for record in self.phones.values():
+            self._sync_phone_to_registry(record)
+
+    def _remove_from_registry(self, phone_id: str) -> None:
+        if self.registry is None:
+            return
+        if self.registry.remove(phone_id):
+            self.registry.save()
 
     # --------------------------------------------------------------- pairing
     def pairing_code(self, regenerate: bool = False) -> dict:
@@ -373,6 +432,7 @@ class CompanionStore:
                     existing = matches[0]
                     for duplicate in matches[1:]:
                         self.phones.pop(duplicate.phone_id, None)
+                        self._remove_from_registry(duplicate.phone_id)
                     existing.client_id = stable_id
 
             if existing is None and len(self.phones) >= MAX_PHONES:
@@ -383,6 +443,7 @@ class CompanionStore:
                     key=lambda item: (bool(item.client_id), item.created_at),
                 )
                 self.phones.pop(oldest.phone_id, None)
+                self._remove_from_registry(oldest.phone_id)
 
             if existing is None:
                 phone_id = "phone-" + secrets.token_hex(6)
@@ -402,6 +463,7 @@ class CompanionStore:
             record.token_hash = _hash_token(token)
             record.last_seen = now
             self.phones[phone_id] = record
+            self._sync_phone_to_registry(record)
             self._code = ""
             self._code_expires_at = 0.0
             self._code_attempts = 0
@@ -428,6 +490,7 @@ class CompanionStore:
             if time.time() - record.last_seen < 60:
                 return
             record.last_seen = time.time()
+            self._sync_phone_to_registry(record)
             self.save()
 
     def remove_phone(self, phone_id: str) -> bool:
@@ -435,5 +498,6 @@ class CompanionStore:
             self._reload_locked()
             removed = self.phones.pop(phone_id, None) is not None
             if removed:
+                self._remove_from_registry(phone_id)
                 self.save()
             return removed

@@ -24,6 +24,111 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(reloaded.get("d1").model, "dotii")
         self.assertEqual(reloaded.get("d1").enabled, {"status", "text", "read_ack"})
 
+    def test_version_one_hardware_record_migrates_to_unified_fields(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "devices": {
+                        "d1": {
+                            "device_id": "d1",
+                            "model": "dotii",
+                            "token": "hardware-token-abcdef",
+                            "supported": ["status", "text"],
+                        },
+                        "d2": {
+                            "device_id": "d2",
+                            "model": "dotii",
+                            "supported": ["status"],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.registry.load()
+
+        approved = self.registry.get("d1")
+        self.assertEqual(approved.kind, "hardware")
+        self.assertEqual(approved.transport, "device_tcp")
+        self.assertEqual(approved.registration_state, "approved")
+        self.assertTrue(approved.has_token)
+        pending = self.registry.get("d2")
+        self.assertEqual(pending.registration_state, "pending")
+        self.assertFalse(pending.has_token)
+
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8"))["version"],
+            2,
+        )
+
+    def test_phone_and_hardware_public_views_hide_private_tokens(self):
+        self.registry.upsert(
+            "d1",
+            model="dotii",
+            token="hardware-token-abcdef",
+            supported=["status"],
+        )
+        self.registry.upsert_phone(
+            "phone-1",
+            name="Pixel",
+            token_hash="a" * 64,
+            supported=["status", "queue"],
+            enabled=["status", "queue"],
+        )
+
+        hardware = self.registry.public("d1")
+        phone = self.registry.public("phone-1")
+
+        self.assertEqual(hardware["kind"], "hardware")
+        self.assertTrue(hardware["has_token"])
+        self.assertEqual(phone["kind"], "phone")
+        self.assertEqual(phone["transport"], "companion_http")
+        self.assertEqual(phone["registration_method"], "pairing_code")
+        self.assertTrue(phone["has_token"])
+        rendered = json.dumps([hardware, phone])
+        self.assertNotIn("hardware-token-abcdef", rendered)
+        self.assertNotIn("a" * 64, rendered)
+        self.assertNotIn('"token"', rendered)
+        self.assertNotIn('"token_hash"', rendered)
+
+    def test_unified_fields_round_trip_in_version_two(self):
+        self.registry.upsert_phone(
+            "phone-1",
+            name="Pixel",
+            token_hash="b" * 64,
+            supported=["status", "queue"],
+            enabled=["status", "queue"],
+            last_seen=123.0,
+            client_id="install-1",
+        )
+        self.registry.save()
+
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 2)
+        reloaded = DeviceRegistry(self.path)
+        reloaded.load()
+
+        phone = reloaded.get("phone-1")
+        self.assertEqual(phone.kind, "phone")
+        self.assertEqual(phone.transport, "companion_http")
+        self.assertEqual(phone.registration_state, "approved")
+        self.assertEqual(phone.registration_method, "pairing_code")
+        self.assertEqual(phone.client_id, "install-1")
+        self.assertEqual(phone.token_hash, "b" * 64)
+
+    def test_public_all_marks_online_records(self):
+        self.registry.upsert("d1", model="dotii")
+        self.registry.upsert("d2", model="dotii")
+
+        rows = self.registry.public_all(online_ids={"d2"}, queued_counts={"d2": 3})
+
+        by_id = {row["device_id"]: row for row in rows}
+        self.assertFalse(by_id["d1"]["online"])
+        self.assertTrue(by_id["d2"]["online"])
+        self.assertEqual(by_id["d2"]["queued_count"], 3)
+
     def test_enabled_drops_unknown_capability(self):
         self.registry.upsert("d1", model="dotii")
         self.registry.set_enabled("d1", ["status", "nope"])

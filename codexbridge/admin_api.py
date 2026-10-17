@@ -99,10 +99,7 @@ def handle_request(
             sessions = getattr(hub, "_sessions", {})
             return 200, {
                 "ok": True,
-                "devices": [
-                    _public_device(record, record.device_id in sessions)
-                    for record in registry._devices.values()
-                ],
+                "devices": registry.public_all(online_ids=sessions),
             }
         if method == "GET" and path == "/api/admin/pairing":
             values = query.get("device_id", [])

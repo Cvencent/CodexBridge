@@ -384,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
     manager = DeviceManager(registry, hub)
     codex_state = _CodexState()
 
-    companion_store = CompanionStore(data_dir / "companion.json")
+    companion_store = CompanionStore(data_dir / "companion.json", registry=registry)
     companion_store.load()
     companion_service = CompanionService(
         data_dir,
