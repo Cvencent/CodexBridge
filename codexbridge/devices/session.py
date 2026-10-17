@@ -22,6 +22,7 @@ class DeviceSession:
         on_device_info: Callable[[dict], Iterable[str]] | None = None,
         on_online: Callable[[], None] | None = None,
         on_offline: Callable[[], None] | None = None,
+        on_heartbeat: Callable[[], None] | None = None,
         heartbeat_seconds: float = 5.0,
         timeout_seconds: float = 15.0,
     ):
@@ -43,6 +44,7 @@ class DeviceSession:
         self.on_device_info = on_device_info
         self.on_online = on_online
         self.on_offline = on_offline
+        self.on_heartbeat = on_heartbeat
         self._active_capabilities: set[str] = set()
         self.heartbeat_seconds = heartbeat_seconds
         self.timeout_seconds = timeout_seconds
@@ -112,6 +114,8 @@ class DeviceSession:
                         self.send(self._ready_message(self._active_capabilities))
                     except OSError:
                         return
+                    if self.on_heartbeat is not None:
+                        self.on_heartbeat()
                     next_heartbeat = now + self.heartbeat_seconds
 
                 readable, _, _ = select.select(
