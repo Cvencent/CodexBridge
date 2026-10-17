@@ -2,11 +2,15 @@ package com.codexbridge.mobile
 
 import android.app.Application
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.codexbridge.mobile.data.Account
 import com.codexbridge.mobile.data.ApiClient
 import com.codexbridge.mobile.data.ApiException
+import com.codexbridge.mobile.data.ConnectionRoute
+import com.codexbridge.mobile.data.ConnectionSelector
 import com.codexbridge.mobile.data.ApprovalRequest
 import com.codexbridge.mobile.data.DiscoveredBridge
 import com.codexbridge.mobile.data.Discovery
@@ -40,6 +44,9 @@ enum class AppScreen { Pair, Threads, Chat, Settings }
 data class UiState(
     val screen: AppScreen = AppScreen.Pair,
     val baseUrl: String = "",
+    val lanUrl: String = "",
+    val wanUrl: String = "",
+    val activeRouteRole: String = "",
     val bridgeName: String = "",
     val bridgeVersion: String = "",
     val phoneId: String = "",
@@ -85,6 +92,13 @@ data class UiState(
 
     val chatLoading: Boolean
         get() = busy && messages.isEmpty()
+
+    val activeRouteLabel: String
+        get() = when (activeRouteRole) {
+            "wan" -> "外网"
+            "lan" -> "内网"
+            else -> ""
+        }
 }
 
 private data class ReconciledThreadDetail(
@@ -99,6 +113,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private var api: ApiClient? = null
+    private var routeRefreshJob: Job? = null
     private var streamJob: Job? = null
     private var pollJob: Job? = null
     private var threadsJob: Job? = null
@@ -131,7 +146,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     },
                 )
             }
-            refreshThreadsNow()
+            refreshConnectionRoute()
             val threadId = _state.value.activeThread?.thread_id
             if (_state.value.screen == AppScreen.Chat && !threadId.isNullOrBlank()) {
                 observeThread(threadId)
@@ -140,12 +155,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
-        val base = settings.baseUrl
+        val base = settings.lastSuccessfulUrl.ifBlank { settings.baseUrl }
+        val lanUrl = settings.lanUrl
+        val wanUrl = settings.wanUrl
         val paired = settings.isPaired
         val pendingThreads = mergePendingThreads(emptyList())
         _state.update {
             it.copy(
                 baseUrl = base,
+                lanUrl = lanUrl,
+                wanUrl = wanUrl,
+                activeRouteRole = when {
+                    base.isBlank() -> ""
+                    base == lanUrl -> "lan"
+                    base == wanUrl -> "wan"
+                    else -> ""
+                },
                 bridgeName = settings.bridgeName,
                 bridgeVersion = settings.bridgeVersion,
                 phoneId = settings.phoneId,
@@ -162,9 +187,54 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (paired) {
             api = ApiClient(base, settings.token)
             CompletionNotificationService.start(appContext)
-            refresh()
             startThreadsRefresh()
+            refreshConnectionRoute()
+            refresh()
         }
+    }
+
+    fun refreshConnectionRoute() {
+        val current = _state.value
+        if (!current.paired || routeRefreshJob?.isActive == true) return
+        routeRefreshJob = viewModelScope.launch {
+            val candidates = ConnectionRoute.candidatesFor(
+                legacyUrl = settings.baseUrl,
+                lanUrl = settings.lanUrl,
+                wanUrl = settings.wanUrl,
+                onWifi = isOnWifi(),
+            )
+            val selected = ConnectionSelector.select(candidates) { endpoint ->
+                ApiClient(endpoint.url, settings.token).ping()
+            }
+            if (selected != null) {
+                val previous = _state.value.baseUrl
+                settings.lastSuccessfulUrl = selected.url
+                settings.baseUrl = selected.url
+                val role = selected.endpoint.role.name.lowercase()
+                if (previous != selected.url || api == null || _state.value.activeRouteRole != role) {
+                    api = ApiClient(selected.url, settings.token)
+                    _state.update { state ->
+                        state.copy(
+                            baseUrl = selected.url,
+                            activeRouteRole = role,
+                            connected = true,
+                        )
+                    }
+                    val threadId = _state.value.activeThread?.thread_id
+                    if (_state.value.screen == AppScreen.Chat && !threadId.isNullOrBlank()) {
+                        observeThread(threadId)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun isOnWifi(): Boolean {
+        val manager = appContext.getSystemService(ConnectivityManager::class.java) ?: return true
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
     }
 
     // -------------------------------------------------------------- pairing
@@ -188,30 +258,38 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(baseUrl = base, error = null) }
     }
 
-    fun pair(baseUrl: String, code: String) {
+    fun pair(lanUrl: String, wanUrl: String, code: String) {
         if (_state.value.busy) return
+        val enteredLan = lanUrl.trim()
+        val enteredWan = wanUrl.trim()
+        val enteredCandidates = ConnectionRoute.candidates(
+            lanUrl = enteredLan,
+            wanUrl = enteredWan,
+            onWifi = isOnWifi(),
+        )
         _state.update { it.copy(busy = true, error = null, notice = null) }
         viewModelScope.launch {
             try {
-                val entered = ApiClient(baseUrl)
-                val ping = entered.ping()
-                val client = if (ping.port in 1..65535) {
-                    ApiClient(ApiClient.withPort(entered.base, ping.port))
-                } else {
-                    entered
-                }
+                val paired = ConnectionSelector.select(enteredCandidates) { endpoint ->
+                    val candidate = ApiClient(endpoint.url)
+                    candidate.ping().takeIf { it.ok && it.service == "codexbridge-companion" }
+                } ?: throw ApiException("无法连接电脑，请检查地址和网络")
+                val client = ApiClient(paired.url)
+                val ping = client.ping()
                 val response = withContext(Dispatchers.IO) {
                     client.pair(code.trim(), phoneName(), settings.installationId)
                 }
                 if (!response.ok || response.token.isBlank()) {
                     throw ApiException("配对失败，请重新生成配对码")
                 }
-                val resolved = if (response.bridge.port in 1..65535) {
-                    ApiClient(ApiClient.withPort(client.base, response.bridge.port))
-                } else {
-                    client
-                }
+                val resolved = client
+                val resolvedLan = if (enteredLan.isBlank()) "" else ConnectionRoute.endpointForConfiguredRoute(enteredLan)
+                val resolvedWan = if (enteredWan.isBlank()) "" else ConnectionRoute.endpointForConfiguredRoute(enteredWan)
+                val activeRole = if (resolvedLan.isNotBlank() && resolved.base == resolvedLan) "lan" else "wan"
                 settings.baseUrl = resolved.base
+                settings.lanUrl = resolvedLan
+                settings.wanUrl = resolvedWan
+                settings.lastSuccessfulUrl = resolved.base
                 settings.token = response.token
                 settings.phoneId = response.phone_id
                 settings.bridgeName = response.bridge.name.ifBlank { ping.name }
@@ -222,6 +300,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         busy = false,
                         paired = true,
                         baseUrl = resolved.base,
+                        lanUrl = settings.lanUrl,
+                        wanUrl = settings.wanUrl,
+                        activeRouteRole = activeRole,
                         phoneId = response.phone_id,
                         bridgeName = response.bridge.name.ifBlank { ping.name },
                         bridgeVersion = response.bridge.version.ifBlank { ping.version },
@@ -337,6 +418,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             .onFailure {
                 _state.update { it.copy(refreshing = false, manualRefreshing = false) }
+                refreshConnectionRoute()
             }
     }
 
@@ -467,18 +549,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun observeThread(threadId: String) {
-        val client = api ?: return
         streamJob?.cancel()
         streamJob = viewModelScope.launch {
             while (true) {
+                val client = api ?: break
+                var streamFailed = false
                 client.events(threadId).collect { event ->
                     if (event.type == "stream_error") {
+                        streamFailed = true
                         _state.update { it.copy(connected = false) }
                     } else {
                         _state.update { it.copy(connected = true) }
                         applyEvent(event)
                     }
                 }
+                if (streamFailed || !_state.value.connected) refreshConnectionRoute()
                 delay(3000)
             }
         }
@@ -486,25 +571,28 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         pollJob = viewModelScope.launch {
             while (true) {
                 delay(4000)
-                runCatching { client.thread(threadId) }.onSuccess { detail ->
-                    val reconciled = reconcileThreadDetail(
-                        detail,
-                        _state.value.activeThread?.status.orEmpty(),
-                    )
-                    _state.update { state ->
-                        state.copy(
-                            activeThread = if (state.activeThread?.thread_id == threadId) reconciled.thread else state.activeThread,
-                            threads = state.threads.map { thread ->
-                                if (thread.thread_id == threadId) reconciled.thread else thread
-                            },
-                            messages = detail.messages,
-                            task = reconciled.task,
-                            approvals = detail.pending_approvals,
-                            working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
-                            messageCount = detail.message_count,
+                val client = api ?: continue
+                runCatching { client.thread(threadId) }
+                    .onSuccess { detail ->
+                        val reconciled = reconcileThreadDetail(
+                            detail,
+                            _state.value.activeThread?.status.orEmpty(),
                         )
+                        _state.update { state ->
+                            state.copy(
+                                activeThread = if (state.activeThread?.thread_id == threadId) reconciled.thread else state.activeThread,
+                                threads = state.threads.map { thread ->
+                                    if (thread.thread_id == threadId) reconciled.thread else thread
+                                },
+                                messages = detail.messages,
+                                task = reconciled.task,
+                                approvals = detail.pending_approvals,
+                                working = reconciled.thread.status in ACTIVE_TASK_STATUSES,
+                                messageCount = detail.message_count,
+                            )
+                        }
                     }
-                }
+                    .onFailure { refreshConnectionRoute() }
             }
         }
     }
@@ -688,6 +776,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun setDarkTheme(enabled: Boolean) {
         settings.darkTheme = enabled
         _state.update { it.copy(darkTheme = enabled) }
+    }
+
+    fun updateConnectionRoutes(lanUrl: String, wanUrl: String) {
+        val requestedLan = lanUrl.trim()
+        val requestedWan = wanUrl.trim()
+        if (requestedLan.isBlank() && requestedWan.isBlank()) {
+            _state.update { it.copy(error = "内网地址和外网地址至少要填写一个") }
+            return
+        }
+        val normalizedLan = if (requestedLan.isBlank()) "" else runCatching {
+            ApiClient.normalizeBase(requestedLan)
+        }.getOrElse { settings.lanUrl }
+        val normalizedWan = if (requestedWan.isBlank()) "" else runCatching {
+            ApiClient.normalizeBase(requestedWan)
+        }.getOrElse { settings.wanUrl }
+        settings.lanUrl = normalizedLan
+        settings.wanUrl = normalizedWan
+        _state.update { it.copy(lanUrl = normalizedLan, wanUrl = normalizedWan, error = null, notice = "连接地址已保存") }
+        refreshConnectionRoute()
     }
 
     fun setDiscoveryPort(port: Int) {

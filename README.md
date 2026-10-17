@@ -52,7 +52,7 @@ Android 手机端应用源码与成品 APK 位于本仓库 [mobile/](mobile/READ
 
 ``text
 mobile/android/    Kotlin + Jetpack Compose 工程
-mobile/release/    CodexBridgeMobile-0.2.9-release.apk 及校验文件
+mobile/release/    CodexBridgeMobile-0.3.5-release.apk 及校验文件
 ``
 
 ## Development
