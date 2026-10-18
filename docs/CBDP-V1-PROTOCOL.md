@@ -3168,6 +3168,27 @@ AUDIO_BEGIN / AUDIO_CHUNK / AUDIO_END
 调用模型。`voice` 和 `audio` 可以分别开启；只有 audio 的设备可以上传音频但
 不显示语音命令入口。
 
+### 19.5 Bridge 实现补充（v1.0 实现后追加）
+
+以下语义在 Bridge 首次落地 SEND / AUDIO 上行事务后明确，供 ESP 与手机端对齐：
+
+- `AUDIO_BEGIN` 必填 `tx_id`；音频格式字段缺省为 `16000 Hz`、单声道、
+  `16-bit` PCM。Bridge 必须按 `max_audio_bytes` 限制累积，超限返回
+  `PAYLOAD_TOO_LARGE` 并丢弃该事务。
+- `AUDIO_CHUNK` 的 `offset` 必须与已接收字节数连续；乱序或缺口返回
+  `INVALID_PARAM`，不得拼接出损坏音频。
+- `AUDIO_END` 后 Bridge 执行 STT，把识别文本按
+  `AUDIO_* -> SEND_* semantics -> turn.start / turn.steer` 提交，并在
+  `RESULT` 中携带 `transcript`。识别失败返回 `UPSTREAM_UNAVAILABLE`，不得
+  静默丢弃。
+- `SEND_END` 和 `AUDIO_END` 必须绑定设备当前选中的会话。设备未选择会话时
+  Bridge 必须返回 `ERROR(INVALID_STATE, NO_ACTIVE_THREAD)`，不得既不创建
+  turn 也不回错误。
+- 上游 Codex 或 STT 调用不得在该设备的 socket 读取线程内同步执行；Bridge
+  必须把这类工作交给每设备工作线程，保持读循环持续排空音频分片和心跳。
+- `AUDIO_BEGIN` 需要 `audio` 能力；未声明或未启用时返回
+  `CAPABILITY_NOT_ENABLED`。
+
 ## 20. 审批协议
 
 ### 20.1 APPROVAL_REQUEST
