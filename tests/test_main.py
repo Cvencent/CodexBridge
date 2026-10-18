@@ -299,6 +299,30 @@ class UnifiedDeviceAdminTest(unittest.TestCase):
         self.assertEqual(record.registration_state, "approved")
         self.assertTrue(record.has_token)
 
+    def test_deleted_hardware_is_rediscovered_as_pending(self):
+        self._discover_pending_hardware()
+        self.manager._send_register_offer = lambda *args, **kwargs: True
+        self.assertTrue(self.manager.approve("dotii-a1"))
+        self.assertTrue(self.registry.get("dotii-a1").has_token)
+
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/devices/remove",
+            {},
+            b'{"device_id": "dotii-a1"}',
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            on_device_removed=self.manager.remove,
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertIsNone(self.registry.get("dotii-a1"))
+
+        self._discover_pending_hardware()
+        rediscovered = self.registry.get("dotii-a1")
+        self.assertEqual(rediscovered.registration_state, "pending")
+        self.assertFalse(rediscovered.has_token)
+
 
 class CompanionActionTest(unittest.TestCase):
     def test_show_intermediate_events_action_updates_store(self):

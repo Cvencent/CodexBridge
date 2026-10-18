@@ -37,6 +37,7 @@ APP_JS = r"""
     approve: "/api/admin/devices/approve",
     reject: "/api/admin/devices/reject",
     revoke: "/api/admin/devices/revoke",
+    removeDevice: "/api/admin/devices/remove",
     capabilities: "/api/admin/devices/capabilities",
     companion: "/api/admin/companion",
     general: "/api/admin/settings/general",
@@ -406,6 +407,7 @@ APP_JS = r"""
     } else if (model.registrationState === "approved" && model.kind === "hardware") {
       wrap.appendChild(actionButton("详情", "open-drawer", model.deviceId));
       wrap.appendChild(actionButton("保存能力", "quick-save", model.deviceId, "button-primary"));
+      wrap.appendChild(actionButton("删除设备", "remove-hardware", model.deviceId, "button-danger"));
     } else if (model.registrationState === "approved") {
       wrap.appendChild(actionButton("详情", "open-drawer", model.deviceId));
       wrap.appendChild(actionButton("解除手机", "remove-phone", model.deviceId, "button-danger"));
@@ -790,6 +792,8 @@ APP_JS = r"""
       if (reject) reject.hidden = model.registrationState !== "pending";
       const revoke = $('[data-action="drawer-revoke"]', footer);
       if (revoke) revoke.hidden = !(model.kind === "hardware" && model.registrationState === "approved");
+      const removeHardware = $('[data-action="drawer-remove-hardware"]', footer);
+      if (removeHardware) removeHardware.hidden = !(model.kind === "hardware" && model.registrationState === "approved");
       const remove = $('[data-action="drawer-remove-phone"]', footer);
       if (remove) remove.hidden = !(model.kind === "phone" && model.registrationState === "approved");
     }
@@ -844,6 +848,7 @@ APP_JS = r"""
       zone.appendChild(actionButton("拒绝", "drawer-reject", model.deviceId, "button-danger"));
     } else if (model.registrationState === "approved" && model.kind === "hardware") {
       zone.appendChild(actionButton("撤销", "drawer-revoke", model.deviceId, "button-danger"));
+      zone.appendChild(actionButton("删除设备", "drawer-remove-hardware", model.deviceId, "button-danger"));
     } else if (model.registrationState === "approved") {
       zone.appendChild(actionButton("解除手机", "drawer-remove-phone", model.deviceId, "button-danger"));
     } else {
@@ -997,6 +1002,35 @@ APP_JS = r"""
       if (state.selectedDeviceId === deviceId) closeDrawer({ force: true });
     } catch (error) {
       toast("解除失败：" + userMessage(error), "error");
+    } finally {
+      setBusy(button, false);
+    }
+  }
+
+  async function removeHardware(deviceId, button) {
+    const model = deviceById(deviceId);
+    if (!model) return;
+    const confirmed = await confirmAction({
+      title: "删除设备",
+      message: "删除“" + model.name + "”后，CodexBridge 会忘记当前配对记录。设备仍在广播时会重新出现在待批准列表，需要再次批准。",
+      confirmLabel: "删除设备"
+    });
+    if (!confirmed) return;
+    setBusy(button, true, "删除中...");
+    try {
+      await api(API.removeDevice, {
+        method: "POST",
+        body: { device_id: deviceId }
+      });
+      toast("已删除设备“" + model.name + "”，等待设备重新发现。", "success");
+      await loadDevices({ silent: true });
+      if (state.selectedDeviceId === deviceId) {
+        const refreshed = deviceById(deviceId);
+        if (refreshed) renderDrawer(refreshed);
+        else closeDrawer({ force: true, silent: true });
+      }
+    } catch (error) {
+      toast("删除失败：" + userMessage(error), "error");
     } finally {
       setBusy(button, false);
     }
@@ -1705,6 +1739,10 @@ APP_JS = r"""
       case "remove-phone":
       case "drawer-remove-phone":
         removePhone(deviceId || state.selectedDeviceId, target);
+        break;
+      case "remove-hardware":
+      case "drawer-remove-hardware":
+        removeHardware(deviceId || state.selectedDeviceId, target);
         break;
       case "quick-save":
         quickSaveCapabilities(deviceId, target);

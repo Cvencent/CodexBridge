@@ -226,7 +226,7 @@ MARKUP = r"""
     <section id="drawer-queue-section" class="drawer-section" hidden><h3>运行</h3><div class="summary-row"><span>活动线程队列</span><strong id="drawer-queue-count">0 项</strong></div><div class="form-actions"><button class="button" type="button" data-action="drawer-open-queue">查看线程队列</button></div></section>
     <section class="drawer-section"><h3>危险区</h3><div id="drawer-danger" class="button-row"></div></section>
   </div>
-  <div class="drawer-footer"><div class="button-row"><button class="button button-primary" type="button" data-action="drawer-save">保存能力</button><button class="button" type="button" data-action="drawer-close">关闭</button><button class="button button-danger" type="button" data-action="drawer-reject" hidden>拒绝</button><button class="button button-danger" type="button" data-action="drawer-revoke" hidden>撤销</button><button class="button button-danger" type="button" data-action="drawer-remove-phone" hidden>解除手机</button></div></div>
+  <div class="drawer-footer"><div class="button-row"><button class="button button-primary" type="button" data-action="drawer-save">保存能力</button><button class="button" type="button" data-action="drawer-close">关闭</button><button class="button button-danger" type="button" data-action="drawer-reject" hidden>拒绝</button><button class="button button-danger" type="button" data-action="drawer-revoke" hidden>撤销</button><button class="button button-danger" type="button" data-action="drawer-remove-hardware" hidden>删除设备</button><button class="button button-danger" type="button" data-action="drawer-remove-phone" hidden>解除手机</button></div></div>
 </aside>
 
 <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">

@@ -43,6 +43,17 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn('actionButton("拒绝"', pending_branch.group(0))
         self.assertIn('actionButton("详情", "open-drawer"', pending_branch.group(0))
 
+    def test_approved_hardware_can_be_deleted_for_rediscovery(self):
+        hardware_branch = re.search(
+            r'else if \(model\.registrationState === "approved" && model\.kind === "hardware"\) \{[\s\S]*?\n    \}',
+            SETTINGS_HTML,
+        )
+        self.assertIsNotNone(hardware_branch)
+        self.assertIn('actionButton("删除设备"', hardware_branch.group(0))
+        self.assertIn('"remove-hardware"', hardware_branch.group(0))
+        self.assertIn('/api/admin/devices/remove', SETTINGS_HTML)
+        self.assertIn('data-action="drawer-remove-hardware"', SETTINGS_HTML)
+
     def test_device_filters_are_restored_from_session_storage(self):
         self.assertIn("codexbridge.deviceFilter", SETTINGS_HTML)
         self.assertIn("sessionStorage.getItem", SETTINGS_HTML)
