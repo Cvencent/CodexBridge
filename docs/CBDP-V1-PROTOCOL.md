@@ -181,9 +181,11 @@ Bridge 在手机 Companion HTTP 端口（默认 `8568`）上同时提供 CBDP v1
 
 手机端接入规则如下：
 
-- 三条路径都复用手机配对阶段取得的凭据，不再单独做一次 CBDP AUTH。
-  Bridge 用该凭据派生 CBDP 会话的 HMAC key，完成 HELLO/WELCOME 后即可
-  直接发送订阅和命令。
+- 三条路径都先用 HTTP `Authorization: Bearer <配对凭据>` 完成传输层鉴权。
+  会话建立后仍执行标准 CBDP 状态机：`HELLO -> WELCOME -> AUTH -> AUTH_OK`。
+  也就是说 HTTP 鉴权与会话鉴权是两个独立层次，缺一不可。
+- Bridge 用同一个配对凭据作为 CBDP AUTH 的 HMAC key。客户端必须按 11.5
+  计算 `auth_proof`，携带完整 32 字节，不能跳过 AUTH 直接发送订阅或命令。
 - WebSocket 的每个 binary message 可以包含一个或多个完整 CBDP 帧；接收方
   按 `header_len + payload_len` 切分，不能按 message 边界猜测。
 - SSE 的 `event:` 固定为 `cbdp`，`data:` 是完整 CBDP 帧的标准 Base64。
@@ -3188,6 +3190,48 @@ AUDIO_BEGIN / AUDIO_CHUNK / AUDIO_END
   必须把这类工作交给每设备工作线程，保持读循环持续排空音频分片和心跳。
 - `AUDIO_BEGIN` 需要 `audio` 能力；未声明或未启用时返回
   `CAPABILITY_NOT_ENABLED`。
+
+### 19.6 v1.0 实现后修正（2026-10-18）
+
+本节记录 Bridge 首次落地后发现的实现错误与协议澄清。标注为“修正”的条目是
+对 8.4 / 8.7 / 8.12 / 17.1.1 既有定义的严格回归，不改变线格式版本，
+`major = 1`、`minor = 0`。设备端与手机端应按本节检查自己的编码表。
+
+1. **音频 TLV 编号修正。** 8.7 的音频字段编号为：`codec = 0x0073`、
+   `sample_rate = 0x0074`、`channels = 0x0075`、`bits_per_sample = 0x0076`、
+   `duration_ms = 0x0077`、`transcript = 0x0078`、`sha256 = 0x0079`、
+   `audio_format = 0x007A`。任何把 `sha256` 编到 `0x00B8` 的实现都错了：
+   `0x00B8` 是 `retransmit_timeout_ms`。`total_bytes = 0x0047`，
+   `offset = 0x0048`。
+2. **`objects` 数组必须带计数前缀。** `0x00A1` 的值区按 8.12 是
+   `u16 count`，之后是 `count` 个 `object`（元素 tag 固定 `0x00A0`）。
+   空数组编码为 `00 00`。只拼接元素、不写计数的实现会让客户端解析为空。
+   同理，`options`（`0x0081`）和 `model_capabilities`（`0x019E`）也使用
+   `u16 count` + 同 tag 元素的数组编码。
+3. **`next_cursor` 是不透明 u64。** Bridge 可以把上游的 opaque 字符串游标
+   映射为会话内稳定的 u64；客户端只负责回传该值，不得解释其内部含义。
+   `next_cursor = 0` 表示没有下一页。
+4. **`SEND_END` / `AUDIO_END` 的 `total_bytes` 若携带则必须与 Bridge 实际
+   接收字节数一致；`sha256` 若携带则必须是 32 字节且与实际负载匹配。
+   不一致返回 `INVALID_PARAM`。两者仍是可选字段。
+5. **线程选择器。** `SEND_*` / `AUDIO_*` 可以在 `BEGIN` 携带
+   `thread_ref`、`thread_id` 或 `use_active_thread=1`。显式 `thread_id` 优先
+   于 `thread_ref`，二者都缺省时才使用 Bridge 当前选中的会话。没有可用会话
+   时返回 `ERROR(INVALID_STATE, NO_ACTIVE_THREAD)`。
+6. **结果对象必须含客户端渲染所需字段。** `thread` 对象携带 `thread_ref`、
+   `thread_id`、`title`、`status`、`owner_state`，并在可用时携带 `model_name`、
+   `cwd`、`summary`、`updated_at_ms`。`message` 对象携带 `message_ref`、
+   `thread_ref`、`message_id`、`kind`、`status`、`body`，并在可用时携带
+   `turn_ref`、`created_at_ms`。`model` 对象的 `model_capabilities` 数组按
+   8.12 编码，kind=0 表示 reasoning effort。
+7. **Companion 端口鉴权澄清。** 3.1.1 中“HELLO/WELCOME 后不再单独 AUTH”
+   的表述不成立，已改为：HTTP 传输层先校验 `Authorization: Bearer`，之后
+   会话内仍执行标准 `HELLO -> WELCOME -> AUTH -> AUTH_OK`。两层缺一不可。
+8. **能力发现。** Companion 端口在 `GET /cbdp/v1` 返回 CBDP 能力对象，并在
+   `GET /api/companion/ping` 的 `cbdp_v1` 字段同步返回，客户端无需靠
+   `401/404` 探测。对象含 `protocol`、`version`、`version_major`、
+   `version_minor`、`transport`、`paths`、`auth`、`auth_mode`、`enabled`、
+   `port`。
 
 ## 20. 审批协议
 

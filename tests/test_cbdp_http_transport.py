@@ -187,6 +187,26 @@ class CbdpHttpTransportTests(unittest.TestCase):
         self.assertEqual(response.status, 401, payload)
         self.assertEqual(payload["error"], "unauthorized")
 
+    def test_companion_port_advertises_cbdp_without_loopback(self) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", "/cbdp/v1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode())
+        connection.close()
+        self.assertEqual(response.status, 200, payload)
+        self.assertEqual(payload["version_major"], 1)
+        self.assertEqual(payload["paths"]["websocket"], "/cbdp/v1/ws")
+        self.assertIn("Bearer", payload["auth"])
+
+    def test_ping_on_companion_port_advertises_cbdp(self) -> None:
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", "/api/companion/ping")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode())
+        connection.close()
+        self.assertEqual(response.status, 200, payload)
+        self.assertEqual(payload["cbdp_v1"]["version_major"], 1)
+
     def test_ws_route_exists_and_requires_upgrade(self) -> None:
         paired = self.pair()
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)

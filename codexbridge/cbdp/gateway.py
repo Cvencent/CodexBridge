@@ -37,10 +37,38 @@ from codexbridge.cbdp.constants import (
     TAG_NAME,
     TAG_METHOD_ID,
     TAG_POLICY_VERSION,
+    TAG_PROJECT_ID,
+    TAG_PROJECT_REF,
     TAG_PROFILE,
     TAG_QUEUE_DEPTH,
     TAG_REQUEST_ID,
+    TAG_THREAD_ID,
+    TAG_THREAD_REF,
+    TAG_MESSAGE_ID,
+    TAG_MESSAGE_REF,
+    TAG_KIND,
+    TAG_TITLE,
+    TAG_STATUS,
     TAG_REVISION,
+    TAG_UPDATED_AT_MS,
+    TAG_THREAD_STATE,
+    TAG_OWNER_STATE,
+    TAG_MODEL_NAME,
+    TAG_CREATED_AT_MS,
+    TAG_OBJECT,
+    TAG_OBJECTS,
+    TAG_OBJECT_COUNT,
+    TAG_OBJECT_TYPE,
+    TAG_NEXT_CURSOR,
+    TAG_CWD,
+    TAG_PROMPT,
+    TAG_EXPIRES_AT_MS,
+    TAG_APPROVAL_KIND,
+    TAG_APPROVAL_DETAIL,
+    TAG_ONLINE,
+    TAG_MODEL_CAPABILITIES,
+    TAG_MODEL_CAPABILITY_KIND,
+    TAG_MODEL_CAPABILITY_VALUE,
     TAG_SESSION_ID,
     TAG_SERVER_NONCE,
     TAG_SERVER_TIME_MS,
@@ -67,6 +95,10 @@ from codexbridge.cbdp.constants import (
     TAG_BITS_PER_SAMPLE,
     TAG_TOTAL_BYTES,
     TAG_TRANSCRIPT,
+    TAG_USE_ACTIVE_THREAD,
+    TAG_SHA256,
+    TAG_BODY,
+    TAG_TURN_REF,
     TAG_VERSION_MINOR,
     TAG_WRITER_LEASE_SECONDS,
     TYPE_ACK,
@@ -105,6 +137,7 @@ from codexbridge.cbdp.tlv import (
     decode_u64,
     decode_utf8,
     encode_tlvs,
+    encode_array,
     require_tlv,
     i64,
     u8,
@@ -170,6 +203,55 @@ DISPATCH_METHODS = {
     "queue.add": "queue.enqueue",
     "queue.update": "queue.edit",
 }
+
+
+def _thread_state(status: str) -> int:
+    return {
+        "idle": 0,
+        "working": 1,
+        "running": 1,
+        "waiting_user": 1,
+        "queued": 1,
+        "starting": 1,
+        "completed": 2,
+        "failed": 3,
+        "interrupted": 4,
+        "archived": 5,
+    }.get(str(status or ""), 6)
+
+
+def _message_kind(kind: str) -> int:
+    return {
+        "user": 0,
+        "user_text": 0,
+        "agent": 1,
+        "assistant": 1,
+        "assistant_text": 1,
+        "commentary": 2,
+        "reasoning": 2,
+        "command": 3,
+        "tool": 3,
+        "fileChange": 4,
+        "file_change": 4,
+        "plan": 4,
+        "error": 5,
+        "approval": 6,
+        "notice": 7,
+        "system": 7,
+    }.get(str(kind or ""), 7)
+
+
+def _message_status(status: str) -> int:
+    return {
+        "pending": 0,
+        "working": 1,
+        "streaming": 1,
+        "starting": 0,
+        "completed": 2,
+        "done": 2,
+        "failed": 3,
+        "interrupted": 4,
+    }.get(str(status or ""), 0)
 
 
 PARAM_TAGS = {
@@ -266,6 +348,13 @@ class CbdpGateway:
         self._send = None
         self._outgoing_seq = 0
         self._transactions: dict[bytes, dict] = {}
+        # CBDP carries paging cursors as opaque u64. The upstream app-server
+        # returns an opaque string, so keep a reversible per-session table
+        # instead of hashing it (a hash would break the next page request).
+        self._cursor_map: dict[int, str] = {}
+        self._cursor_reverse: dict[str, int] = {}
+        self._cursor_seq = 0
+        self._ref_external: dict[tuple[str, int], str] = {}
         self._lock = threading.RLock()
 
     def bind_transport(self, send):
@@ -274,6 +363,13 @@ class CbdpGateway:
     def begin_session(self):
         with self._lock:
             self._generation += 1
+            self._cursor_map.clear()
+            self._cursor_reverse.clear()
+            self._cursor_seq = 0
+            # A new connection cannot resume the previous connection's
+            # SEND/AUDIO transactions; leaving them would make the next
+            # AUDIO_BEGIN with the same tx_id fail as a conflict forever.
+            self._transactions.clear()
             self.session = SessionState(generation=self._generation)
             return self.session
 
@@ -733,6 +829,7 @@ class CbdpGateway:
         except CBDPError as error:
             return self._error(request_id, error.name)
         device_id = str(self.session.device_id or "")
+        params = self._restore_cursor(method, params)
         request = {
             "type": "command",
             "request_id": f"cbdp:{device_id}:{request_id}",
@@ -787,19 +884,354 @@ class CbdpGateway:
             params["thread_id"] = ""
         return params
 
+    def _restore_cursor(self, method, params):
+        """Translate a CBDP u64 *command* cursor back to the upstream cursor."""
+
+        if "cursor" not in params or method not in {
+            "threads.list", "thread.read", "approvals.list",
+            "projects.list", "thread.search", "events.since",
+        }:
+            return params
+        restored = self._decode_cursor(params.get("cursor"))
+        if restored is None:
+            params.pop("cursor", None)
+        else:
+            params["cursor"] = restored
+        return params
+
+    def _thread_from_ref(self, ref: int) -> str:
+        """Resolve a CBDP thread_ref through the persistent reference registry."""
+
+        if not ref:
+            return ""
+        ref = int(ref)
+        if self.references is not None:
+            try:
+                external = self.references.external_id("thread", ref)
+            except Exception:
+                external = ""
+            if external:
+                with self._lock:
+                    self._ref_external[("thread", ref)] = str(external)
+                return str(external)
+        with self._lock:
+            return self._ref_external.get(("thread", ref), "")
+
+    def _request_thread(self, frame) -> str:
+        """Resolve an explicit thread selector carried on a SEND/AUDIO frame."""
+
+        if TAG_THREAD_ID in frame.header:
+            try:
+                return decode_utf8(frame.header[TAG_THREAD_ID])
+            except CBDPError:
+                return ""
+        if TAG_THREAD_REF in frame.header:
+            try:
+                ref = decode_u32(frame.header[TAG_THREAD_REF])
+            except CBDPError:
+                return ""
+            return self._thread_from_ref(int(ref))
+        return ""
+
+    def _active_thread_id(self, device_id: str) -> str:
+        if self.active_thread is None:
+            return ""
+        try:
+            return str(self.active_thread(device_id) or "")
+        except Exception:
+            return ""
+
+    def _transaction_thread(self, transaction) -> str:
+        thread_id = str(transaction.get("thread_id") or "")
+        if thread_id:
+            return thread_id
+        ref = int(transaction.get("thread_ref") or 0)
+        if ref:
+            return self._thread_from_ref(ref)
+        return ""
+
     def _result_fields(self, result):
         if not isinstance(result, dict):
             return {}
         fields = {}
         thread_id = result.get("thread_id")
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        if not thread_id and thread:
+            thread_id = thread.get("thread_id")
         if isinstance(thread_id, str) and thread_id:
             fields[0x0022] = utf8(thread_id)
+            thread_ref = self._ref("thread", thread_id)
+            if thread_ref:
+                fields[TAG_THREAD_REF] = u32(thread_ref)
+        status = thread.get("status") if thread else result.get("status")
+        if isinstance(status, str) and status:
+            fields[TAG_STATUS] = u16(_thread_state(status))
         turn_id = result.get("turn_id") or result.get("id")
         if isinstance(turn_id, str) and turn_id:
             fields[0x0024] = utf8(turn_id)
         if result.get("ok") is True:
             fields[0x0064] = u8(1)
+        # 17.1.1 requires status.read to carry `online`; the upstream snapshot
+        # reports connection state instead, so project it onto the wire field.
+        online = result.get("online")
+        if online is None:
+            connection = result.get("connection")
+            if isinstance(connection, dict):
+                transport = str(connection.get("transport") or "")
+                online = transport not in {"", "unstarted", "offline"}
+        if online is not None:
+            fields[TAG_ONLINE] = u8(1 if online else 0)
+        objects = self._result_objects(result)
+        if objects is not None:
+            fields[TAG_OBJECTS] = encode_array(TAG_OBJECT, objects)
+            fields[TAG_OBJECT_COUNT] = u16(len(objects))
+        cursor = self._encode_cursor(result.get("next_cursor"))
+        if cursor is not None:
+            fields[TAG_NEXT_CURSOR] = u64(cursor)
         return fields
+
+    def _encode_cursor(self, value) -> int | None:
+        """Map an opaque upstream cursor onto a stable per-session u64."""
+
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            number = int(value)
+            return number if number > 0 else None
+        text = str(value)
+        if not text:
+            return None
+        if text.isdigit():
+            number = int(text)
+            return number if number > 0 else None
+        with self._lock:
+            existing = self._cursor_reverse.get(text)
+            if existing is not None:
+                return existing
+            self._cursor_seq += 1
+            token = self._cursor_seq
+            self._cursor_map[token] = text
+            self._cursor_reverse[text] = token
+            return token
+
+    def _decode_cursor(self, value):
+        """Turn a CBDP u64 cursor back into the upstream opaque cursor."""
+
+        if value is None:
+            return None
+        with self._lock:
+            return self._cursor_map.get(int(value))
+
+    def _result_objects(self, result):
+        """Encode protocol 8.4 object arrays for the methods that require them."""
+
+        objects: list[tuple[int, bytes]] = []
+        if isinstance(result.get("threads"), list):
+            for row in result["threads"]:
+                encoded = self._encode_thread_object(row)
+                if encoded is not None:
+                    objects.append(encoded)
+            return objects
+        if isinstance(result.get("models"), list):
+            for row in result["models"]:
+                encoded = self._encode_model_object(row)
+                if encoded is not None:
+                    objects.append(encoded)
+            return objects
+        if isinstance(result.get("projects"), list):
+            for row in result["projects"]:
+                encoded = self._encode_project_object(row)
+                if encoded is not None:
+                    objects.append(encoded)
+            return objects
+        approvals = result.get("pending_approvals")
+        if isinstance(approvals, list):
+            for row in approvals:
+                encoded = self._encode_approval_object(row)
+                if encoded is not None:
+                    objects.append(encoded)
+            return objects
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        read_thread_id = str(thread.get("thread_id") or result.get("thread_id") or "")
+        if isinstance(result.get("messages"), list) and read_thread_id:
+            thread_object = self._encode_thread_object(thread or {"thread_id": read_thread_id})
+            if thread_object is not None:
+                objects.append(thread_object)
+            for row in result["messages"]:
+                encoded = self._encode_message_object(row, read_thread_id)
+                if encoded is not None:
+                    objects.append(encoded)
+            return objects
+        return None
+
+    def _encode_thread_object(self, row):
+        if not isinstance(row, dict):
+            return None
+        thread_id = str(row.get("thread_id") or row.get("id") or "")
+        if not thread_id:
+            return None
+        fields = {
+            TAG_OBJECT_TYPE: u8(0),
+            TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
+            TAG_THREAD_ID: utf8(thread_id),
+            TAG_TITLE: utf8(str(row.get("title") or row.get("name") or "")),
+            TAG_STATUS: u16(_thread_state(str(row.get("status") or ""))),
+            TAG_REVISION: u64(int(row.get("revision") or 0)),
+            TAG_OWNER_STATE: u8(
+                {"unmanaged": 0, "observed": 1, "claimed": 2, "managed": 3}.get(
+                    str(row.get("owner_state") or "unmanaged"), 0
+                )
+            ),
+        }
+        model = str(row.get("model") or "")
+        if model:
+            fields[TAG_MODEL_NAME] = utf8(model)
+        cwd = str(row.get("cwd") or "")
+        if cwd:
+            fields[TAG_CWD] = utf8(cwd)
+        summary = str(row.get("preview") or row.get("summary") or "")
+        if summary:
+            fields[TAG_SUMMARY] = utf8(summary)
+        updated = int(float(row.get("updated_at") or row.get("recency_at") or 0) * 1000)
+        if updated:
+            fields[TAG_UPDATED_AT_MS] = i64(updated)
+            fields[TAG_CREATED_AT_MS] = i64(updated)
+        return encode_tlvs(fields.items())
+
+    def _encode_model_object(self, row):
+        if not isinstance(row, dict):
+            return None
+        name = str(row.get("model") or row.get("id") or "")
+        if not name:
+            return None
+        fields = {
+            TAG_OBJECT_TYPE: u8(9),
+            TAG_MODEL_NAME: utf8(name),
+            TAG_TITLE: utf8(str(row.get("display_name") or name)),
+        }
+        efforts = [
+            str(item.get("effort") or "")
+            for item in row.get("efforts") or []
+            if isinstance(item, dict) and str(item.get("effort") or "")
+        ]
+        capabilities = [
+            encode_tlvs(
+                {
+                    TAG_MODEL_CAPABILITY_KIND: u8(0),
+                    TAG_MODEL_CAPABILITY_VALUE: utf8(effort),
+                }.items()
+            )
+            for effort in efforts
+        ]
+        fields[TAG_MODEL_CAPABILITIES] = encode_array(
+            TAG_MODEL_CAPABILITIES, capabilities
+        )
+        return encode_tlvs(fields.items())
+
+    def _encode_project_object(self, row):
+        if not isinstance(row, dict):
+            return None
+        project_id = str(row.get("project_id") or "")
+        name = str(row.get("name") or "")
+        if not project_id and not name:
+            return None
+        fields = {
+            TAG_OBJECT_TYPE: u8(10),
+            TAG_PROJECT_REF: u32(self._ref("project", project_id or name)),
+            TAG_PROJECT_ID: utf8(project_id),
+            TAG_TITLE: utf8(name),
+        }
+        cwd = str(row.get("cwd") or "")
+        if cwd:
+            fields[TAG_CWD] = utf8(cwd)
+        updated = int(float(row.get("updated_at") or 0) * 1000)
+        if updated:
+            fields[TAG_UPDATED_AT_MS] = i64(updated)
+        return encode_tlvs(fields.items())
+
+    def _encode_message_object(self, row, thread_id: str = ""):
+        if not isinstance(row, dict):
+            return None
+        message_id = str(row.get("message_id") or row.get("id") or "")
+        if not message_id:
+            return None
+        thread_id = str(row.get("thread_id") or thread_id or "")
+        fields = {
+            TAG_OBJECT_TYPE: u8(2),
+            TAG_MESSAGE_REF: u32(self._ref("message", message_id)),
+            TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
+            TAG_MESSAGE_ID: utf8(message_id),
+            TAG_KIND: u8(_message_kind(str(row.get("kind") or ""))),
+            TAG_STATUS: u16(_message_status(str(row.get("status") or ""))),
+        }
+        body = str(row.get("text") or "")
+        if body:
+            fields[TAG_BODY] = utf8(body)
+        turn_id = str(row.get("turn_id") or "")
+        if turn_id:
+            fields[TAG_TURN_REF] = u32(self._ref("turn", turn_id))
+        created = int(float(row.get("created_at") or 0) * 1000)
+        if created:
+            fields[TAG_CREATED_AT_MS] = i64(created)
+        return encode_tlvs(fields.items())
+
+    def _encode_approval_object(self, row):
+        if not isinstance(row, dict):
+            return None
+        approval_id = row.get("request_id", row.get("approval_id", row.get("id")))
+        if approval_id is None:
+            return None
+        approval_id = str(approval_id)
+        thread_id = str(row.get("thread_id") or "")
+        turn_id = str(row.get("turn_id") or "")
+        fields = {
+            TAG_OBJECT_TYPE: u8(3),
+            TAG_APPROVAL_REF: u32(self._ref("approval", approval_id)),
+            TAG_APPROVAL_ID: utf8(approval_id),
+            TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
+            TAG_TURN_REF: u32(self._ref("turn", turn_id)),
+            TAG_APPROVAL_KIND: u8(
+                {"command": 0, "file": 1, "permissions": 2, "mcp": 3, "input": 4}.get(
+                    str(row.get("kind") or ""), 5
+                )
+            ),
+            TAG_PROMPT: utf8(str(row.get("command") or row.get("reason") or "")),
+        }
+        detail = str(row.get("reason") or "")
+        if detail:
+            fields[TAG_APPROVAL_DETAIL] = utf8(detail)
+        cwd = str(row.get("cwd") or "")
+        if cwd:
+            fields[TAG_CWD] = utf8(cwd)
+        created = int(float(row.get("created_at") or 0) * 1000)
+        if created:
+            fields[TAG_CREATED_AT_MS] = i64(created)
+        expires = int(float(row.get("expires_at") or 0) * 1000)
+        if expires:
+            fields[TAG_EXPIRES_AT_MS] = i64(expires)
+        options = row.get("options")
+        if isinstance(options, list) and options:
+            encoded = [
+                encode_tlvs(
+                    {
+                        TAG_DECISION: u8(int(item.get("decision") or 0)),
+                        TAG_PROMPT: utf8(str(item.get("prompt") or "")),
+                    }.items()
+                )
+                for item in options
+                if isinstance(item, dict)
+            ]
+            fields[TAG_OPTIONS] = encode_array(TAG_OPTIONS, encoded)
+        return encode_tlvs(fields.items())
+
+    def _ref(self, kind, external_id):
+        if self.references is None or not external_id:
+            return 0
+        ref = int(self.references.ref_for(kind, external_id))
+        if ref:
+            with self._lock:
+                self._ref_external[(str(kind), ref)] = str(external_id)
+        return ref
 
     def _result(self, request_id, method_id, fields):
         header = {
@@ -816,15 +1248,58 @@ class CbdpGateway:
             )
         )
 
+    def _begin_transaction(self, tx_id, frame) -> bool:
+        """Accept a BEGIN, tolerating a retry of an empty in-flight transaction.
+
+        A client that lost the previous response may replay the same
+        ``tx_id``/``idem`` pair. Retrying before any payload arrived is safe;
+        reusing a ``tx_id`` mid-upload or with a different ``idem`` is not.
+        """
+
+        idem = bytes(frame.header.get(0x002B, b""))
+        existing = self._transactions.get(tx_id)
+        if existing is None:
+            return True
+        if existing.get("bytes"):
+            return False
+        if idem and existing.get("idem") != idem:
+            return False
+        return True
+
     def _handle_send_begin(self, frame):
         try:
             tx_id = decode_u32(require_tlv(frame.header, 0x002D))
             request_id = tx_id
         except CBDPError as error:
             return self._error(0, error.name)
-        if tx_id in self._transactions:
+        if not self._begin_transaction(tx_id, frame):
             return self._error(request_id, "IDEMPOTENCY_CONFLICT")
-        self._transactions[tx_id] = {"parts": {}, "bytes": 0, "kind": "text"}
+        self._transactions[tx_id] = {
+            "parts": {},
+            "bytes": 0,
+            "kind": "text",
+            "idem": bytes(frame.header.get(0x002B, b"")),
+            "total_bytes": (
+                decode_u32(frame.header[TAG_TOTAL_BYTES])
+                if TAG_TOTAL_BYTES in frame.header
+                else 0
+            ),
+            "thread_ref": (
+                decode_u32(frame.header[TAG_THREAD_REF])
+                if TAG_THREAD_REF in frame.header
+                else 0
+            ),
+            "thread_id": (
+                decode_utf8(frame.header[TAG_THREAD_ID])
+                if TAG_THREAD_ID in frame.header
+                else ""
+            ),
+            "use_active_thread": bool(
+                decode_u8(frame.header[TAG_USE_ACTIVE_THREAD])
+                if TAG_USE_ACTIVE_THREAD in frame.header
+                else 0
+            ),
+        }
         return None
 
     def _handle_send_chunk(self, frame):
@@ -851,6 +1326,14 @@ class CbdpGateway:
         transaction = self._transactions.pop(tx_id, None)
         if transaction is None or transaction.get("kind") != "text":
             return self._error(tx_id, "INVALID_STATE")
+        declared = int(transaction.get("total_bytes") or 0)
+        if TAG_TOTAL_BYTES in frame.header:
+            try:
+                declared = decode_u32(frame.header[TAG_TOTAL_BYTES])
+            except CBDPError:
+                return self._error(tx_id, "INVALID_PARAM")
+        if declared and declared != transaction["bytes"]:
+            return self._error(tx_id, "INVALID_PARAM")
         data = b"".join(transaction["parts"][key] for key in sorted(transaction["parts"]))
         try:
             text = data.decode("utf-8")
@@ -860,12 +1343,9 @@ class CbdpGateway:
         if commands is None:
             return self._error(tx_id, "UPSTREAM_UNAVAILABLE")
         device_id = str(self.session.device_id or "")
-        thread_id = ""
-        if self.active_thread is not None:
-            try:
-                thread_id = str(self.active_thread(device_id) or "")
-            except Exception:
-                thread_id = ""
+        thread_id = self._transaction_thread(transaction) or self._request_thread(frame)
+        if not thread_id:
+            thread_id = self._active_thread_id(device_id)
         if not thread_id:
             # The device must not be left showing "sending to the computer"
             # forever: a text reply with no selected conversation is an
@@ -910,12 +1390,34 @@ class CbdpGateway:
             bits = decode_u8(frame.header.get(TAG_BITS_PER_SAMPLE, u8(16)))
         except CBDPError as error:
             return self._error(self._request_id(frame), error.name)
-        if tx_id in self._transactions:
+        if not self._begin_transaction(tx_id, frame):
             return self._error(request_id, "IDEMPOTENCY_CONFLICT")
         self._transactions[tx_id] = {
             "kind": "audio",
             "parts": {},
             "bytes": 0,
+            "idem": bytes(frame.header.get(0x002B, b"")),
+            "total_bytes": (
+                decode_u32(frame.header[TAG_TOTAL_BYTES])
+                if TAG_TOTAL_BYTES in frame.header
+                else 0
+            ),
+            "sha256": frame.header.get(TAG_SHA256, b""),
+            "thread_ref": (
+                decode_u32(frame.header[TAG_THREAD_REF])
+                if TAG_THREAD_REF in frame.header
+                else 0
+            ),
+            "thread_id": (
+                decode_utf8(frame.header[TAG_THREAD_ID])
+                if TAG_THREAD_ID in frame.header
+                else ""
+            ),
+            "use_active_thread": bool(
+                decode_u8(frame.header[TAG_USE_ACTIVE_THREAD])
+                if TAG_USE_ACTIVE_THREAD in frame.header
+                else 0
+            ),
             "sample_rate": int(sample_rate),
             "channels": int(channels),
             "bits": int(bits),
@@ -950,6 +1452,23 @@ class CbdpGateway:
         transaction = self._transactions.pop(tx_id, None)
         if transaction is None or transaction.get("kind") != "audio":
             return self._error(tx_id, "INVALID_STATE")
+        declared = int(transaction.get("total_bytes") or 0)
+        if TAG_TOTAL_BYTES in frame.header:
+            try:
+                declared = decode_u32(frame.header[TAG_TOTAL_BYTES])
+            except CBDPError:
+                return self._error(tx_id, "INVALID_PARAM")
+        if declared and declared != transaction["bytes"]:
+            return self._error(tx_id, "INVALID_PARAM")
+        if TAG_SHA256 in frame.header:
+            digest = frame.header[TAG_SHA256]
+            if len(digest) != 32:
+                return self._error(tx_id, "INVALID_PARAM")
+            combined = b"".join(
+                transaction["parts"][key] for key in sorted(transaction["parts"])
+            )
+            if hashlib.sha256(combined).digest() != digest:
+                return self._error(tx_id, "INVALID_PARAM")
         try:
             data = b"".join(
                 transaction["parts"][key] for key in sorted(transaction["parts"])
@@ -968,12 +1487,9 @@ class CbdpGateway:
                 self._error(tx_id, "UPSTREAM_UNAVAILABLE")
                 return
             device_id = str(self.session.device_id or "")
-            thread_id = ""
-            if self.active_thread is not None:
-                try:
-                    thread_id = str(self.active_thread(device_id) or "")
-                except Exception:
-                    thread_id = ""
+            thread_id = self._transaction_thread(transaction)
+            if not thread_id:
+                thread_id = self._active_thread_id(device_id)
             if not thread_id:
                 self._error(tx_id, "INVALID_STATE", "NO_ACTIVE_THREAD")
                 return

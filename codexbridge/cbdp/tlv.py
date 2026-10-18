@@ -59,6 +59,30 @@ def encode_tlvs(fields: Iterable[tuple[int, bytes]]) -> bytes:
     return b"".join(encoded)
 
 
+def encode_array(element_tag: int, elements: Iterable[bytes]) -> bytes:
+    """Encode an ``array`` value: u16 count followed by wrapped elements.
+
+    Protocol 8.12 requires every array element to be a complete
+    ``element_tag + u16 length + value`` TLV. Callers pass only the element
+    value; the wrapper is applied here.
+    """
+
+    if not isinstance(element_tag, int) or isinstance(element_tag, bool):
+        raise CBDPError("INVALID_FRAME")
+    if not 0 <= element_tag <= 0xFFFF:
+        raise CBDPError("INVALID_FRAME")
+    encoded: list[bytes] = []
+    for value in elements:
+        if not isinstance(value, (bytes, bytearray)):
+            raise CBDPError("INVALID_FRAME")
+        if len(value) > 0xFFFF:
+            raise CBDPError("INVALID_FRAME")
+        encoded.append(struct.pack(">HH", element_tag, len(value)) + bytes(value))
+    if len(encoded) > 0xFFFF:
+        raise CBDPError("INVALID_FRAME")
+    return struct.pack(">H", len(encoded)) + b"".join(encoded)
+
+
 def decode_tlvs(
     data: bytes,
     *,
@@ -90,6 +114,39 @@ def decode_tlvs(
         result[tag] = bytes(data[offset:end])
         offset = end
     return result
+
+
+def decode_array(
+    data: bytes,
+    expected_tag: int | None = None,
+    *,
+    max_elements: int = 4096,
+) -> list[tuple[int, bytes]]:
+    """Decode an ``array`` value: u16 count followed by wrapped elements."""
+
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+        raise CBDPError("INVALID_FRAME")
+    count = struct.unpack_from(">H", data, 0)[0]
+    if count > max_elements:
+        raise CBDPError("INVALID_FRAME")
+    offset = 2
+    limit = len(data)
+    elements: list[tuple[int, bytes]] = []
+    for _ in range(count):
+        if limit - offset < 4:
+            raise CBDPError("INVALID_FRAME")
+        tag, length = struct.unpack_from(">HH", data, offset)
+        offset += 4
+        end = offset + length
+        if end > limit:
+            raise CBDPError("INVALID_FRAME")
+        if expected_tag is not None and tag != expected_tag:
+            raise CBDPError("INVALID_FRAME")
+        elements.append((tag, bytes(data[offset:end])))
+        offset = end
+    if offset != limit:
+        raise CBDPError("INVALID_FRAME")
+    return elements
 
 
 def require_tlv(fields: Mapping[int, bytes], tag: int) -> bytes:

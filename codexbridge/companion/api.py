@@ -351,8 +351,12 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     "requires_pairing": True,
                     "port": self.app.store.port,
                     "discovery_port": self.app.store.discovery_port,
+                    "cbdp_v1": self.app.cbdp_capabilities(),
                 },
             )
+            return
+        if path == "/cbdp/v1":
+            self._send_json(200, {"ok": True, **self.app.cbdp_capabilities()})
             return
         if path == "/api/companion/events":
             device = self._authorize(query)
