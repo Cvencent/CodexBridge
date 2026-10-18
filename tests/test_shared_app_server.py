@@ -12,12 +12,16 @@ class SharedServerTests(unittest.TestCase):
     def test_injected_shared_client_is_not_closed_by_source(self):
         with tempfile.TemporaryDirectory() as folder:
             client = Mock()
-            source = CodexAppServerSource(
-                Path(folder),
-                Path(folder),
-                client=client,
-                owns_client=False,
-            )
+            with patch(
+                "codexbridge.codex.app_server._resolve_codex_command",
+                side_effect=AssertionError("injected client must not resolve Codex CLI"),
+            ):
+                source = CodexAppServerSource(
+                    Path(folder),
+                    Path(folder),
+                    client=client,
+                    owns_client=False,
+                )
             source.close()
             client.close.assert_not_called()
 

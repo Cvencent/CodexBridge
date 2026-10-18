@@ -795,7 +795,12 @@ class CodexAppServerSource:
         # at the moment a turn started. Without the log, a long-running task
         # looks finished to a device no matter how much work it is doing.
         self.activity = activity or RolloutActivity()
-        self.command = _resolve_codex_command(codex_command, runtime_folder)
+        client_command = getattr(client, "command", []) if client is not None else None
+        self.command = (
+            list(client_command)
+            if isinstance(client_command, (list, tuple))
+            else (_resolve_codex_command(codex_command, runtime_folder) if client is None else [])
+        )
         self.client = client or AppServerClient(self.command, cwd)
         self._owns_client = bool(owns_client)
         self.account: dict[str, Any] = account_snapshot({}, {})
