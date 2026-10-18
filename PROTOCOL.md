@@ -1054,6 +1054,15 @@ Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、
 - 新能力加入能力清单，由 `supported ∩ enabled` 决定是否启用。
 - 不增加协议版本分支、并行握手或旧设备专用通道。
 - 不兼容变更必须在设备固件、CodexBridge 和测试中同步完成。
+- CBDP 设备的业务事件（`message`、`read_state` 等）一律从 Event Spine
+  出站为完整 `DELTA`，携带 `event_id`、`global_seq`、`topic_id`、
+  `topic_seq`、`revision` 和非零传输 `seq`。旧 JSON 行协议的兼容翻译只
+  适用于旧设备，不得为 CBDP 设备合成缺少这些字段的 `DELTA`。
+- 设备注册表同时服务旧 JSON 与 CBDP 设备，`supported`/`enabled` 使用
+  CBDP v1 的 9.2 能力名；旧固件的 `quota` 等价于 CBDP 位 `42`
+  （`account`）。`protocol = cbdp` 的设备默认启用其声明的全部能力，
+  不再用旧型号默认集合裁剪。
+- 收到对端主动发来的 `ERROR` 时不得回发新的 `ERROR`，避免错误回环。
 
 ## 16. 最小接入示例
 

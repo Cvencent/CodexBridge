@@ -31,6 +31,7 @@ from codexbridge.cbdp.constants import (
     TAG_OBJECT_COUNT,
     TAG_NEXT_CURSOR,
     TAG_THREAD_REF,
+    TAG_TOPIC_ID,
     TAG_STATUS,
     TAG_ONLINE,
     TAG_ECHO,
@@ -46,6 +47,7 @@ from codexbridge.cbdp.constants import (
     TYPE_AUDIO_CHUNK,
     TYPE_AUDIO_END,
     TYPE_AUTH_OK,
+    TYPE_CLOSE,
     TYPE_COMMAND,
     TYPE_HELLO,
     TYPE_RESULT,
@@ -586,6 +588,11 @@ class CbdpGatewayTests(unittest.TestCase):
         thread_fields = decode_tlvs(objects[0][1])
         self.assertEqual(thread_fields[0x003F], u8(0))
         self.assertEqual(decode_u16(thread_fields[0x0044]), 1)
+        # The device subscribes to this stable topic to receive thread DELTAs.
+        self.assertEqual(
+            decode_u32(thread_fields[TAG_TOPIC_ID]),
+            self.refs.topic_for("t1"),
+        )
         self.assertEqual(decode_u16(result.header[TAG_OBJECT_COUNT]), 1)
 
     def test_thread_list_result_carries_opaque_cursor_and_roundtrips_it(self):
@@ -1182,6 +1189,34 @@ class CbdpGatewayTests(unittest.TestCase):
         )
         return session
 
+    def test_peer_error_is_acknowledged_without_echoing_an_error(self):
+        self._authenticated()
+        self.sent.clear()
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_ERROR,
+                flags=FLAG_RESPONSE,
+                code=0x0005,  # INVALID_FRAME reported by the device
+                header={TAG_REQUEST_ID: u32(0)},
+            )
+        )
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.gateway.last_peer_error, (0x0005, 0))
+
+    def test_peer_close_is_not_answered(self):
+        self._authenticated()
+        self.sent.clear()
+        self.gateway.handle_frame(Frame(message_type=TYPE_CLOSE, flags=FLAG_REQUEST))
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.gateway.session_closed)
+
+    def test_subscription_check_is_per_device(self):
+        self._authenticated()
+        self.gateway.subscriptions.subscribe("someone-else", 0x10000001, 1, QOS_STATE)
+        self.assertFalse(self.gateway.has_subscription(0x10000001, 1))
+        self.gateway.subscriptions.subscribe("dev-1", 0x10000001, 1, QOS_STATE)
+        self.assertTrue(self.gateway.has_subscription(0x10000001, 1))
+
     def test_deliver_event_targets_the_matching_scope(self):
         self._authenticated()
         self.gateway.subscriptions.subscribe("dev-1", 0x10000001, 1, QOS_STATE)
@@ -1193,6 +1228,14 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].message_type, 0x0A)
         self.assertEqual(self.sent[0].header[0x0037], (0x0301).to_bytes(2, "big"))
+        # Protocol 15.7: a DELTA must carry the full event envelope and a real
+        # transport sequence, not the reduced compatibility shape.
+        self.assertEqual(self.sent[0].topic_id, 0x10000001)
+        self.assertNotEqual(self.sent[0].seq, 0)
+        self.assertEqual(len(self.sent[0].header[0x0029]), 16)
+        self.assertEqual(len(self.sent[0].header[0x0034]), 8)
+        self.assertEqual(len(self.sent[0].header[0x0035]), 8)
+        self.assertEqual(len(self.sent[0].header[0x0036]), 8)
 
     def test_deliver_event_without_matching_scope_is_not_sent(self):
         self._authenticated()

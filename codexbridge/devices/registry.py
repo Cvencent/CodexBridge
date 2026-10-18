@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codexbridge.cbdp.capabilities import UNIMPLEMENTED_CAPABILITIES
 from codexbridge.protocol.capabilities import (
     MINIMAL,
     UNLIMITED,
@@ -20,6 +21,25 @@ from codexbridge.protocol.capabilities import (
 )
 
 TOKEN_BYTES = 24
+
+
+def _default_enabled(model: str, protocol: str, supported: Iterable[str]) -> set[str]:
+    """Derive the initial ``enabled`` policy for one device.
+
+    Legacy JSON firmware starts from the model defaults so a new capability
+    does not silently become active. A CBDP v1 device declares its own complete
+    capability bitmap, so clipping it against the legacy model table would
+    strip ``subscribe_*``, ``multi_page``, ``device_config`` and friends before
+    the gateway ever sees them. Enable what the device declared and let the
+    unimplemented-capability filter apply on the wire.
+    """
+
+    declared = set(supported)
+    if protocol == "cbdp":
+        # An unimplemented capability is allocated but must never be declared
+        # or relied on in this round (protocol 1.1).
+        return declared - UNIMPLEMENTED_CAPABILITIES
+    return default_for(model) & (declared | set(MINIMAL))
 
 
 @dataclass
@@ -178,7 +198,7 @@ class DeviceRecord:
             enabled=(
                 normalize(value["enabled"])
                 if "enabled" in value
-                else default_for(model) & (supported | set(MINIMAL))
+                else _default_enabled(model, protocol, supported)
             ),
             last_seen=last_seen,
             max_text_chars=max_text_chars,
@@ -319,7 +339,11 @@ class DeviceRegistry:
                     host=None if host is ... else host,
                     port=None if port is ... else port,
                     enabled=(
-                        default_for(model) & (declared | set(MINIMAL))
+                        _default_enabled(
+                            model,
+                            protocol if protocol in {"legacy_json", "cbdp"} else "legacy_json",
+                            declared,
+                        )
                         if supported is not None
                         else default_for(model)
                     ),
@@ -355,16 +379,20 @@ class DeviceRegistry:
                     # Re-derive from the (possibly upgraded) declaration. A
                     # device that starts advertising `audio` should not need a
                     # host-side checkbox change to begin using it.
-                    record.enabled = default_for(record.model) & (
-                        record.supported | set(MINIMAL)
+                    record.enabled = _default_enabled(
+                        record.model,
+                        record.protocol,
+                        record.supported,
                     )
             if (
                 previous_model == "unknown"
                 and model != "unknown"
                 and previous_enabled == default_for(previous_model)
             ):
-                record.enabled = default_for(model) & (
-                    record.supported | set(MINIMAL)
+                record.enabled = _default_enabled(
+                    model,
+                    record.protocol,
+                    record.supported,
                 )
             return record
 

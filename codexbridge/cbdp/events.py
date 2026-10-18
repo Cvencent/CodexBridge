@@ -26,7 +26,9 @@ _SUMMARY_EVENTS = frozenset(
         0x0102,
         0x0103,
         0x0104,
-        0x0302,
+        # 0x0302 (message.updated) and 0x0304 (message.deleted) live on the
+        # thread topic, so they must share 0x0301's thread scope; otherwise a
+        # device subscribed to the thread would silently miss updates.
         0x0303,
         0x0601,
         0x0602,
@@ -41,6 +43,7 @@ _THREAD_EVENTS = frozenset(
         0x0204,
         0x0205,
         0x0301,
+        0x0302,
         0x0304,
         0x0401,
         0x0402,
@@ -162,6 +165,51 @@ class EventSpine:
             self._topic_revision[topic_id] = revision
             self.ring.append(event)
             return event
+
+    def latest_event(self, predicate, limit=4096):
+        """Return the newest committed event satisfying ``predicate``.
+
+        Used to re-deliver an event that is already represented in the journal
+        (for example the connect-time replay of unread messages). Looking the
+        event up instead of appending a new one keeps ``global_seq`` /
+        ``topic_seq`` authoritative and avoids creating gaps for other
+        subscribers. The scan is bounded; a miss simply means "not retained".
+        """
+
+        limit = max(1, min(int(limit), 65536))
+        with self._lock:
+            if self._connection is None:
+                for event in reversed(self.ring):
+                    try:
+                        if predicate(event):
+                            return event
+                    except Exception:  # noqa: BLE001
+                        continue
+                return None
+            rows = self._connection.execute(
+                "SELECT event_id, global_seq, topic_id, topic_seq, revision, "
+                "event_type, qos, payload, created_at_ms FROM events "
+                "ORDER BY global_seq DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        for row in rows:
+            event = Event(
+                event_id=bytes.fromhex(row[0]),
+                global_seq=int(row[1]),
+                topic_id=int(row[2]),
+                topic_seq=int(row[3]),
+                revision=int(row[4]),
+                event_type=int(row[5]),
+                qos=int(row[6]),
+                payload=decode_tlvs(row[7] or b""),
+                created_at_ms=int(row[8]),
+            )
+            try:
+                if predicate(event):
+                    return event
+            except Exception:  # noqa: BLE001 - a bad predicate matches nothing
+                continue
+        return None
 
     def events_since(self, cursor, topic_id=0, limit=256):
         cursor = max(0, int(cursor))

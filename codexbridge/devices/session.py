@@ -11,6 +11,7 @@ from codexbridge.cbdp.capabilities import capability_bitmap
 from codexbridge.cbdp.constants import (
     HEADER_SIZE,
     MAGIC,
+    TYPE_DELTA,
     TYPE_PING,
     TYPE_PONG,
 )
@@ -101,6 +102,10 @@ def send_register_offer(
 class CbdpDeviceSession:
     """CBDP v1 session driver used after a CBDP discovery result."""
 
+    # The hub uses this marker to deliver committed events through the Event
+    # Spine instead of the legacy JSON compatibility translator.
+    is_cbdp = True
+
     def __init__(
         self,
         host: str,
@@ -144,6 +149,19 @@ class CbdpDeviceSession:
         self._heartbeat_seconds = heartbeat_seconds
         self._reassembler = FrameReassembler(self._max_frame_bytes)
 
+    def send_event(self, event) -> None:
+        """Send one committed Event Spine event as a protocol-valid DELTA.
+
+        Using the gateway's own encoder guarantees the frame carries
+        ``event_id``/``global_seq``/``topic_seq``/``revision``, the real
+        ``topic_id`` and a non-zero transport ``seq``. The compatibility
+        translator must not synthesise DELTA frames for CBDP sessions.
+        """
+
+        if self.gateway is None:
+            raise RuntimeError("CBDP gateway not configured")
+        self._send_frame(self.gateway.delta_frame(event))
+
     def send(self, message: dict) -> None:
         """Send a legacy-shaped message through the CBDP compatibility path.
 
@@ -158,6 +176,12 @@ class CbdpDeviceSession:
             request_id=self._take_request_id(),
         )
         for frame in to_cbdp(message, context):
+            if frame.message_type == TYPE_DELTA:
+                # CBDP DELTA frames are committed Event Spine events. The
+                # compatibility translator is stateless and cannot supply the
+                # required event envelope, so it must never put a DELTA on the
+                # wire. Business events reach this session via send_event().
+                continue
             self._send_frame(frame)
 
     def stop(self) -> None:
@@ -332,6 +356,9 @@ class CbdpDeviceSession:
                 self._socket.sendall(payload)
 
 class DeviceSession:
+    # Legacy UTF-8 JSON line protocol: the hub keeps sending it legacy shapes.
+    is_cbdp = False
+
     def __init__(
         self,
         host: str,

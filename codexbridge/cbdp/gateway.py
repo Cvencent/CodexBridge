@@ -520,6 +520,29 @@ class CbdpGateway:
             header=header,
         )
 
+    def delta_frame(self, event):
+        """Return the wire DELTA for one committed event.
+
+        Public wrapper used by sessions that must emit a committed event
+        outside the subscription replay path (for example the legacy
+        compatibility fan-out that predates subscriptions). It advances the
+        per-connection transport sequence exactly like ``deliver_event``.
+        """
+
+        return self._delta_frame(event)
+
+    def has_subscription(self, topic_id, scope):
+        """Whether this gateway's own device subscribed to the topic/scope."""
+
+        session = self.session
+        if session is None or not session.device_id:
+            return False
+        return self.subscriptions.has_subscription_for(
+            session.device_id,
+            int(topic_id),
+            int(scope),
+        )
+
     def deliver_event(self, event):
         """Send one EventSpine event to every matching live subscription.
 
@@ -535,10 +558,7 @@ class CbdpGateway:
             int(event.global_seq),
             int(event.qos),
         )
-        if not self.subscriptions.has_subscription(
-            int(event.topic_id),
-            scope,
-        ):
+        if not self.has_subscription(int(event.topic_id), scope):
             return None
         frame = self._delta_frame(event)
         # Fragmentation is a transport concern: the session splits any logical
@@ -1221,6 +1241,9 @@ class CbdpGateway:
             TAG_OBJECT_TYPE: u8(0),
             TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
             TAG_THREAD_ID: utf8(thread_id),
+            # Stable topic for this thread. A panel subscribes to it to receive
+            # the thread's DELTA events; without it the device can only guess.
+            TAG_TOPIC_ID: u32(self._topic(thread_id)),
             TAG_TITLE: utf8(_wire_text(row.get("title") or row.get("name"), text_limit)),
             TAG_STATUS: u16(_thread_state(str(row.get("status") or ""))),
             TAG_REVISION: u64(int(row.get("revision") or 0)),
@@ -1372,6 +1395,16 @@ class CbdpGateway:
             ]
             fields[TAG_OPTIONS] = encode_array(TAG_OPTIONS, encoded)
         return encode_tlvs(fields.items())
+
+    def _topic(self, thread_id):
+        """Stable topic_id for a thread, or 0 when references are unavailable."""
+
+        if self.references is None or not thread_id:
+            return 0
+        try:
+            return int(self.references.topic_for(thread_id))
+        except (AttributeError, ValueError, OverflowError):
+            return 0
 
     def _ref(self, kind, external_id):
         if self.references is None or not external_id:

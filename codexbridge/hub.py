@@ -47,6 +47,7 @@ from codexbridge.cbdp.constants import (
 )
 
 from codexbridge.cbdp.capabilities import capability_bitmap
+from codexbridge.cbdp.events import event_scope
 from codexbridge.cbdp.projection import (
     EVENT_MESSAGE_APPENDED,
     EVENT_MESSAGE_UPDATED,
@@ -287,7 +288,7 @@ class BridgeHub:
             payload[TAG_TURN_ID] = utf8(turn_id)
         if record.message_id:
             payload[TAG_MESSAGE_ID] = utf8(str(record.message_id))
-        self._append_event(
+        return self._append_event(
             self._cbdp_topic(record.thread_id),
             EVENT_MESSAGE_APPENDED if appended else EVENT_MESSAGE_UPDATED,
             QOS_CRITICAL if appended else QOS_STATE,
@@ -408,13 +409,16 @@ class BridgeHub:
                 # Same words on the same screen: the periodic snapshot must not
                 # turn into periodic radio traffic and device wake-ups.
                 return
+            event = None
             if self.event_spine is not None:
-                self._append_message_event(record, appended=previous is None)
+                event = self._append_message_event(
+                    record, appended=previous is None
+                )
             capability = KIND_CAPABILITY.get(record.kind)
             if capability is None:
                 return
             payload = {"type": "message", **self._message_payload(record)}
-            self._broadcast_messages(payload, capability)
+            self._broadcast_messages(payload, capability, event=event)
             if record.kind in {"task", "result"}:
                 # The badge counts are aggregate state, not a chat message.
                 # Push them as soon as a task enters or leaves the terminal
@@ -843,6 +847,21 @@ class BridgeHub:
             return set()
         return effective(record.supported, record.enabled)
 
+    def has_capability(self, device_id: str, capability: str) -> bool:
+        """Capability check that understands legacy aliases.
+
+        ``quota`` is the legacy name for CBDP bit 42 (``account``). Streams
+        that were historically gated on the legacy name must not disappear
+        just because a CBDP device declares the canonical wire name.
+        """
+
+        capabilities = self.capabilities_for(device_id)
+        if capability in capabilities:
+            return True
+        if capability == "quota":
+            return "account" in capabilities
+        return False
+
     def note_policy_changed(self, device_id: str) -> None:
         """Publish an explicit device-policy transition after registry updates."""
 
@@ -934,10 +953,26 @@ class BridgeHub:
     def replay_state(self, device_id: str) -> None:
         with self._lock:
             state = self.state_for(device_id)
-        for message in state["messages"]:
-            self._send(device_id, {"type": "message", **message})
-        for read_state in state["read_state"]:
-            self._send(device_id, {"type": "read_state", **read_state})
+        with self._lock:
+            session = self._sessions.get(device_id)
+        if getattr(session, "is_cbdp", False):
+            for message in state["messages"]:
+                event = self._cbdp_event_for_message(
+                    str(message.get("message_id") or "")
+                )
+                if event is not None:
+                    self._deliver_cbdp_event(session, event)
+            for read_state in state["read_state"]:
+                event = self._cbdp_event_for_message(
+                    str(read_state.get("message_id") or ""), read=True
+                )
+                if event is not None:
+                    self._deliver_cbdp_event(session, event)
+        else:
+            for message in state["messages"]:
+                self._send(device_id, {"type": "message", **message})
+            for read_state in state["read_state"]:
+                self._send(device_id, {"type": "read_state", **read_state})
 
         # Devices that render a task summary (for example the home-screen pet)
         # pull codex_state on their own schedule. A short-lived session can
@@ -997,7 +1032,9 @@ class BridgeHub:
                     notify=False,
                 )
 
-    def _broadcast_read_state(self, payload: dict, exclude: str = "") -> None:
+    def _broadcast_read_state(
+        self, payload: dict, exclude: str = "", event=None
+    ) -> None:
         with self._lock:
             targets = [
                 session
@@ -1006,6 +1043,10 @@ class BridgeHub:
                 and "read_ack" in self.capabilities_for(device_id)
             ]
         for session in targets:
+            if getattr(session, "is_cbdp", False):
+                if event is not None:
+                    self._deliver_cbdp_event(session, event)
+                continue
             self._send_to(session, payload)
 
     def _broadcast_codex_state(self) -> None:
@@ -1061,7 +1102,7 @@ class BridgeHub:
         thread_id = str(event.get("thread_id") or "")
         source = str(event.get("source") or "")
         if message_id:
-            self._append_read_event(message_id, thread_id, source)
+            event = self._append_read_event(message_id, thread_id, source)
             self._broadcast_read_state(
                 {
                     "type": "read_state",
@@ -1070,6 +1111,7 @@ class BridgeHub:
                     "read_at": time.time(),
                 },
                 exclude=source,
+                event=event,
             )
             self._retract_companion_badge(thread_id)
             self._broadcast_codex_state()
@@ -1090,7 +1132,9 @@ class BridgeHub:
                     source=source,
                     notify=False,
                 )
-                self._append_read_event(covered_id, thread_id, source)
+                event = self._append_read_event(covered_id, thread_id, source)
+            else:
+                event = None
             self._broadcast_read_state(
                 {
                     "type": "read_state",
@@ -1099,6 +1143,7 @@ class BridgeHub:
                     "read_at": time.time(),
                 },
                 exclude=source,
+                event=event,
             )
         self._retract_companion_badge(thread_id)
         self._broadcast_codex_state()
@@ -1114,7 +1159,7 @@ class BridgeHub:
             TAG_DEVICE_REF: u32(self._cbdp_ref("device", source)),
             TAG_READ_AT_MS: i64(int(time.time() * 1000)),
         }
-        self._append_event(
+        return self._append_event(
             self._cbdp_topic(thread_id),
             0x0303,
             QOS_STATE,
@@ -1124,26 +1169,84 @@ class BridgeHub:
     def _broadcast(self, payload: dict, capability: str) -> None:
         with self._lock:
             for device_id, session in self._sessions.items():
-                if capability in self.capabilities_for(device_id):
+                if self.has_capability(device_id, capability):
                     self._send_to(
                         session,
                         self._apply_budget(payload, self.budget_for(device_id)),
                     )
 
-    def _broadcast_messages(self, payload: dict, capability: str) -> None:
-        """Fan one record out, but only to devices allowed to see it."""
+    def _broadcast_messages(
+        self, payload: dict, capability: str, event=None
+    ) -> None:
+        """Fan one record out, but only to devices allowed to see it.
+
+        A CBDP session receives the committed Event Spine event as a DELTA
+        carrying event_id/global_seq/topic_id/topic_seq/revision and a real
+        transport seq. The legacy compatibility translator must never
+        synthesise DELTA frames for a CBDP device.
+        """
         with self._lock:
             targets = [
                 (device_id, session)
                 for device_id, session in list(self._sessions.items())
-                if capability in self.capabilities_for(device_id)
+                if self.has_capability(device_id, capability)
                 and self._message_visible(device_id, payload)
             ]
         for device_id, session in targets:
+            if getattr(session, "is_cbdp", False):
+                # A CBDP device must never receive a synthesised DELTA. If the
+                # event spine is unavailable the frame is dropped instead.
+                if event is not None:
+                    self._deliver_cbdp_event(session, event)
+                continue
             self._send_to(
                 session,
                 self._apply_budget(payload, self.budget_for(device_id)),
             )
+
+    def _cbdp_event_for_message(self, message_id: str, read: bool = False):
+        """Find the committed event that already represents this message."""
+
+        if not message_id or self.event_spine is None:
+            return None
+        message_ref = self._cbdp_ref("message", message_id)
+        wanted = {EVENT_MESSAGE_APPENDED, EVENT_MESSAGE_UPDATED}
+        event_type = 0x0303 if read else None
+
+        def matches(event) -> bool:
+            if event_type is not None:
+                if int(event.event_type) != event_type:
+                    return False
+            elif int(event.event_type) not in wanted:
+                return False
+            payload = event.payload
+            raw_id = payload.get(TAG_MESSAGE_ID)
+            if raw_id is not None:
+                try:
+                    return raw_id.decode("utf-8") == message_id
+                except UnicodeDecodeError:
+                    return False
+            raw_ref = payload.get(TAG_MESSAGE_REF)
+            if raw_ref is not None and message_ref:
+                return int.from_bytes(raw_ref, "big") == message_ref
+            return False
+
+        return self.event_spine.latest_event(matches)
+
+    @staticmethod
+    def _deliver_cbdp_event(session, event) -> None:
+        """Send one committed event unless the subscription path already did."""
+
+        gateway = getattr(session, "gateway", None)
+        if gateway is not None and gateway.has_subscription(
+            int(event.topic_id), event_scope(int(event.event_type))
+        ):
+            # deliver_event() already emitted the subscription copy.
+            return
+        try:
+            session.send_event(event)
+        except (OSError, RuntimeError):
+            return
 
     def _send_error(self, device_id: str, code: str) -> None:
         self._send(

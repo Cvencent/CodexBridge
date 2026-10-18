@@ -166,6 +166,36 @@ class CbdpCompatTests(unittest.TestCase):
         self.assertEqual(legacy["type"], "read_state")
         self.assertEqual(legacy["read_by"], ["dev-1"])
 
+    def test_cbdp_session_never_wire_encodes_a_compat_delta(self):
+        # The compatibility translator still produces the reduced shape for
+        # legacy callers, but a CBDP session must drop it: the real business
+        # event is emitted through send_event() with the full envelope.
+        from codexbridge.devices.session import CbdpDeviceSession
+
+        class _Gateway:
+            references = self.refs
+
+        session = CbdpDeviceSession(
+            "127.0.0.1",
+            8765,
+            "x" * 16,
+            device_id="dev-1",
+            gateway=_Gateway(),
+        )
+        sent = []
+        session._send_frame = sent.append
+        session.send(
+            {
+                "type": "message",
+                "message_id": "m1",
+                "thread_id": "t1",
+                "kind": "assistant_text",
+                "status": "completed",
+                "body": "hi",
+            }
+        )
+        self.assertEqual(sent, [])
+
     def test_cbdp_result_maps_back_to_command_result(self):
         from codexbridge.cbdp.frame import Frame
 

@@ -111,10 +111,15 @@ PROFILE_BUDGETS = {
 }
 
 
+# Older firmwares call CBDP bit 42 "quota"; the wire name is "account".
+CAPABILITY_ALIASES = {"quota": "account"}
+
+
 def capability_bitmap(names: Iterable[str]) -> int:
     bitmap = 0
     for name in names:
-        bit = CAPABILITY_BITS.get(str(name))
+        key = str(name)
+        bit = CAPABILITY_BITS.get(CAPABILITY_ALIASES.get(key, key))
         if bit is not None:
             bitmap |= 1 << bit
     return bitmap

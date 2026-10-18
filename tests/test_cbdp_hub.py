@@ -53,14 +53,33 @@ class _Registry:
 class _Record:
     profile = 2
     last_seen = 1.5
-    supported = {"status", "text"}
-    enabled = {"status", "text"}
+    supported = {"status", "text", "results"}
+    enabled = {"status", "text", "results"}
     max_text_chars = 4096
 
 
 class _Session:
     gateway = None
     profile = 1
+    is_cbdp = False
+
+    def send(self, message):
+        pass
+
+
+class _CbdpSession(_Session):
+    is_cbdp = True
+
+    def __init__(self):
+        self.gateway = None
+        self.sent_events = []
+        self.sent_messages = []
+
+    def send(self, message):
+        self.sent_messages.append(message)
+
+    def send_event(self, event):
+        self.sent_events.append(event)
 
 
 class CbdpHubEventTests(unittest.TestCase):
@@ -84,6 +103,16 @@ class CbdpHubEventTests(unittest.TestCase):
 
     def _events(self, event_type):
         return [event for event in self.events.events_since(0) if event.event_type == event_type]
+
+    def test_message_events_share_the_thread_topic_and_scope(self):
+        from codexbridge.cbdp.events import event_scope
+
+        # message.appended/updated/deleted all live on the thread topic, so a
+        # device subscribed to that thread must receive all of them.
+        for event_type in (0x0301, 0x0302, 0x0304):
+            self.assertEqual(event_scope(event_type), 1)
+        # message.read is a summary-scope marker.
+        self.assertEqual(event_scope(0x0303), 0)
 
     def test_message_event_contains_protocol_required_fields_and_types(self):
         self.hub.publish(
@@ -110,6 +139,43 @@ class CbdpHubEventTests(unittest.TestCase):
         self.assertEqual(payload[TAG_BODY_REF], b"content:m1")
         self.assertEqual(decode_i64(payload[TAG_CREATED_AT_MS]), 2000)
         self.assertEqual(decode_i64(payload[TAG_UPDATED_AT_MS]), 2000)
+
+    def test_cbdp_session_receives_committed_event_not_compat_delta(self):
+        self.registry.records["dev-1"] = _Record()
+        session = _CbdpSession()
+        self.hub.attach("dev-1", session)
+        self.addCleanup(self.hub.detach, "dev-1")
+
+        self.hub.publish(
+            MessageRecord(
+                message_id="m1",
+                thread_id="t1",
+                kind="result",
+                status="completed",
+                title="Answer",
+                body="hello",
+                created_at=2.0,
+            )
+        )
+
+        # The CBDP session must get the committed Event Spine record (which
+        # carries event_id/global_seq/topic_seq/revision and the real topic),
+        # never a synthesised compatibility message.
+        self.assertEqual(len(session.sent_events), 1)
+        event = session.sent_events[0]
+        self.assertEqual(event.topic_id, self.refs.topic_for("t1"))
+        self.assertGreater(event.global_seq, 0)
+        self.assertGreater(event.topic_seq, 0)
+        self.assertGreater(event.revision, 0)
+        self.assertEqual(len(event.event_id), 16)
+        # No compatibility "message"/"read_state" envelope may be synthesised
+        # for a CBDP session; aggregate state messages are still allowed.
+        self.assertFalse(
+            any(
+                item.get("type") in {"message", "read_state"}
+                for item in session.sent_messages
+            )
+        )
 
     def test_unchanged_message_fingerprint_does_not_append_twice(self):
         record = MessageRecord(

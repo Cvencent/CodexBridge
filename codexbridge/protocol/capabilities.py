@@ -1,6 +1,10 @@
 from collections.abc import Iterable
 
+# Legacy JSON devices and CBDP v1 devices share one device registry, so the
+# vocabulary must cover both. The CBDP names are the canonical wire names from
+# docs/CBDP-V1-PROTOCOL.md 9.2; legacy-only names stay for older firmware.
 FEATURES: tuple[str, ...] = (
+    # Legacy JSON + CBDP shared
     "status",
     "text",
     "tasks",
@@ -9,10 +13,55 @@ FEATURES: tuple[str, ...] = (
     "audio",
     "read_ack",
     "voice",
-    "word_bear",
-    "quota",
     "control",
     "queue",
+    # Legacy-only names still reported by older firmware
+    "word_bear",
+    "quota",
+    # CBDP v1 capability names (bitmap bits 0-63, implemented subset)
+    "telemetry",
+    "subscribe_live",
+    "subscribe_thread",
+    "subscribe_summary",
+    "writer_lease",
+    "multi_page",
+    "tls",
+    "device_config",
+    "command_status",
+    "queue_manage",
+    "guidance",
+    "message_edit",
+    "message_delete",
+    "thread_manage",
+    "structured_input",
+    "attachment",
+    "draft",
+    "thread_search",
+    "thread_lifecycle",
+    "thread_fork",
+    "thread_settings",
+    "message_revision",
+    "item_stream",
+    "plan",
+    "reasoning_summary",
+    "tool_events",
+    "mcp",
+    "account",
+    "context_usage",
+    "read_unread",
+    "project_manage",
+    "notice",
+    "server_request",
+    "input_capabilities",
+    "queue_priority",
+    "message_reference",
+    "model_switch",
+    "cross_device_active",
+    "resume",
+    "file_reference",
+    "image_input",
+    "audio_input",
+    "events_since",
 )
 
 MINIMAL: frozenset[str] = frozenset({"status", "text", "read_ack"})

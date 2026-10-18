@@ -140,6 +140,21 @@ class SubscriptionManager:
                 for item in self._subscriptions.values()
             )
 
+    def has_subscription_for(self, device_id, topic_id, scope):
+        """Whether one specific device subscribed to this topic and scope.
+
+        ``has_subscription`` answers a global question used by tests and
+        diagnostics; delivery must be per device, otherwise one subscriber
+        makes the gateway emit a frame to every session.
+        """
+
+        with self._lock:
+            return (
+                str(device_id),
+                int(topic_id),
+                int(scope),
+            ) in self._subscriptions
+
     def drop_device(self, device_id):
         with self._lock:
             for key in [key for key in self._subscriptions if key[0] == str(device_id)]:

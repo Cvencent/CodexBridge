@@ -164,6 +164,44 @@ class RegistryTest(unittest.TestCase):
             {"status", "text", "tasks", "results", "read_ack"},
         )
 
+    def test_cbdp_device_keeps_declared_capabilities_enabled(self):
+        record = self.registry.upsert(
+            "d1",
+            model="dotii",
+            protocol="cbdp",
+            supported=[
+                "status",
+                "text",
+                "tasks",
+                "results",
+                "read_ack",
+                "subscribe_live",
+                "subscribe_summary",
+                "multi_page",
+                "device_config",
+                "account",
+                "events_since",
+            ],
+        )
+        self.assertIn("subscribe_live", record.enabled)
+        self.assertIn("subscribe_summary", record.enabled)
+        self.assertIn("multi_page", record.enabled)
+        self.assertIn("device_config", record.enabled)
+        self.assertIn("account", record.enabled)
+        self.assertIn("events_since", record.enabled)
+
+    def test_legacy_device_keeps_model_defaults(self):
+        record = self.registry.upsert(
+            "d1",
+            model="dotii",
+            protocol="legacy_json",
+            supported=["status", "text", "tasks", "subscribe_live"],
+        )
+        self.assertEqual(
+            record.enabled,
+            {"status", "text", "tasks", "read_ack"},
+        )
+
     def test_migrate_legacy_bridge_json(self):
         legacy = Path(self.tmp.name) / "bridge.json"
         legacy.write_text(json.dumps({"host": "192.168.1.23", "port": 8765, "token": "abcdefghijklmnop"}))

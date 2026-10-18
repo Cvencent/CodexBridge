@@ -1299,6 +1299,14 @@ WELCOME 或 CAPABILITY_UPDATE 把最终生效值通知设备。profile 不是权
 | `62` | `thread_goal` | 读取、设置和清除线程目标 | `[本轮不实现]` |
 | `63` | `experimental_ext` | 使用实验性标准扩展号或实验语义 | `[本轮不实现]` |
 
+**两套词表的统一（v1.0 实现修正）：** Bridge 的设备注册表同时保存旧 JSON
+设备与 CBDP 设备，因此 `supported`/`enabled` 必须使用本表 9.2 的 CBDP 名称。
+旧固件仍在使用的 `quota` 是 CBDP 位 `42`（`account`）的别名，Bridge 必须按别名
+映射，不能把它当作未知能力丢弃。对 `protocol = cbdp` 的设备，首次登记的
+`enabled` 默认取设备声明的完整集合（再减去 1.1 的 `[本轮不实现]` 能力），不得
+再用旧型号的 legacy 默认集合裁剪；否则 `subscribe_*`、`multi_page`、
+`device_config` 等位会在 AUTH_OK 之前被剪掉，设备永远无法建立订阅。
+
 ### 9.3 能力求交
 
 最终能力必须由三方求交：
@@ -1716,6 +1724,11 @@ resync。对象 ref 不得与 topic_id 混用。
 Bridge 分配 topic_id 时必须保证同一 Bridge 数据库代际内稳定。设备持久化
 订阅时可以同时保存 `topic_id` 和对象 ref。数据库代际变化后必须重新快照。
 
+**线程对象必须带 `topic_id`。** `threads.list` / `thread.read` 返回的 thread 对象
+（`object_type = 0`）必须携带该线程的稳定 `topic_id`（tag `0x0030`）。面板类
+设备没有其他途径得知线程 topic，只能从该字段取得后再发送 `SUBSCRIBE(topic_id,
+scope = thread)`；缺失时设备无法订阅线程消息。
+
 ### 15.2 scope
 
 | 值 | 名称 | 事件范围 | 历史 |
@@ -1847,6 +1860,13 @@ DELTA(
 
 设备按 `topic_id + topic_seq` 去重。`revision` 必须单调递增。收到旧 revision
 时必须忽略，收到超出预期的 revision 时必须请求 resync。
+
+**实现要求（不因传输 profile 放宽）：** `event_id`、`global_seq`、`topic_seq`、
+`revision` 和真实 `topic_id` 对 `DELTA` 是必填的。`seq` 必须按 13.1 分配非零
+传输序号，使该帧可被 ACK/重传覆盖。兼容翻译层只能裁剪业务字段，不得省略上
+述事件信封字段，也不得用 `topic_id = 0` 或 `seq = 0` 代替。`topic_id = 0`
+仅用于控制主题；事件不得借用它。接收方若收到缺少事件信封的 `DELTA`，应按
+`INVALID_FRAME` 处理。
 
 ### 15.8 ACK 与 cursor
 
@@ -3446,7 +3466,9 @@ request_id 时返回。错误消息不得包含令牌、cookie、私钥、完整
 
 ### 21.3 错误分类
 
-- 帧或编码错误：返回 `INVALID_FRAME`，可以继续连接。
+- 帧或编码错误：返回 `INVALID_FRAME`，可以继续连接。接收方收到对方主动发来的
+  `ERROR` 时，不得再回一个 `ERROR`（尤其不得改写成 `UNSUPPORTED_FEATURE`）；
+  记录该错误并按错误语义继续或结束即可，否则会形成错误回环。
 - 鉴权错误：返回 `UNAUTHORIZED` 或 `AUTH_EXPIRED`，然后关闭连接。
 - 能力错误：拒绝该操作，连接保持。
 - 上游错误：返回 `UPSTREAM_UNAVAILABLE`，连接保持。
@@ -3557,6 +3579,12 @@ writer lease 记录。
 | `approval_request` | `approval.requested` |
 | `approval_resolved` | `approval.resolved` |
 | `error` | `ERROR` / `notice.created` |
+
+**兼容网关不生成 DELTA 信封。** 网关把旧 JSON 消息翻译成 CBDP 时，`message`
+和 `read_state` 必须复用 Event Spine 的已提交事件（同一 `event_id`、
+`global_seq`、`topic_seq`、`revision` 和真实 `topic_id`），而不是另造一个只有
+`event_type`/`event_payload` 的 `DELTA`。因此统一规则是：**凡是发给 CBDP
+设备的业务事件，都从 Event Spine 出站；兼容翻译只适用于旧 JSON 行协议设备。**
 
 ### 24.3 字段映射
 
