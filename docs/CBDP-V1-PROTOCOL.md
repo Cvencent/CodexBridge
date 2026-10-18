@@ -167,6 +167,37 @@ minor 变化：只允许增加可选字段、可选能力或新消息类型。
 
 所有端口都允许在管理中配置。端口变化不改变线协议。
 
+### 3.1.1 手机 Companion 端口上的 CBDP（v1.0 实现后追加）
+
+Bridge 在手机 Companion HTTP 端口（默认 `8568`）上同时提供 CBDP v1 和旧
+`/api/companion/*` 接口。两种路径共用同一个 Bridge 权威状态，不建立第二套
+事件或业务存储。
+
+| 路径 | 传输 | 方向 | 鉴权 |
+|---|---|---|---|
+| `/cbdp/v1/ws` | WebSocket binary | 双向 | HTTP `Authorization: Bearer <配对凭据>` |
+| `/cbdp/v1/events` | HTTP + SSE | Bridge 到客户端 | HTTP `Authorization: Bearer <配对凭据>` |
+| `POST /cbdp/v1/frame` | HTTP binary body | 客户端到 Bridge | HTTP `Authorization: Bearer <配对凭据>` |
+
+手机端接入规则如下：
+
+- 三条路径都复用手机配对阶段取得的凭据，不再单独做一次 CBDP AUTH。
+  Bridge 用该凭据派生 CBDP 会话的 HMAC key，完成 HELLO/WELCOME 后即可
+  直接发送订阅和命令。
+- WebSocket 的每个 binary message 可以包含一个或多个完整 CBDP 帧；接收方
+  按 `header_len + payload_len` 切分，不能按 message 边界猜测。
+- SSE 的 `event:` 固定为 `cbdp`，`data:` 是完整 CBDP 帧的标准 Base64。
+  `id:` 是帧的 cursor；断线重连时用 `Last-Event-ID` 作为 `RESYNC.cursor`。
+- SSE 只能承载 Bridge 到客户端方向。客户端发往 Bridge 的帧必须走同一
+  HTTP 连接上的 `POST /cbdp/v1/frame`（完整 CBDP 帧作为 body）。
+- WebSocket 与 SSE 路径使用同一个 gateway、事件主链、订阅管理器、writer
+  lease 和引用注册表；会话断开时 Bridge 必须清理该设备的订阅。
+- 管理接口 `GET /api/admin/companion` 返回 `cbdp_v1` 能力对象，包含协议版本、
+  路径、鉴权方式、端口和启用状态。新客户端据此选择协议，不要先用 401/404
+  探测。
+- 普通 JSON 响应和 SSE 响应都会返回 `Connection: close`。这是正常的传输
+  生命周期，客户端应按退避重新连接，不得把它当成业务错误。
+
 ### 3.2 传输语义
 
 同一逻辑消息在不同 transport 上必须保持相同的字段语义和事件编号：

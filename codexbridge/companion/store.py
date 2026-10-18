@@ -566,7 +566,16 @@ class CompanionStore:
             self._sync_phone_to_registry(record)
             self.save()
 
+    def get_phone(self, phone_id: str) -> PhoneRecord | None:
+        """Return one live phone record, refreshing from disk first."""
+        if not isinstance(phone_id, str) or not phone_id:
+            return None
+        with self._lock:
+            self._reload_locked()
+            return self.phones.get(phone_id)
+
     def remove_phone(self, phone_id: str) -> bool:
+        """Remove one paired phone and its registry projection."""
         with self._lock:
             self._reload_locked()
             removed = self.phones.pop(phone_id, None) is not None

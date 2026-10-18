@@ -25,6 +25,24 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(response.getheader("Connection"), "close")
         connection.close()
 
+    def test_stopping_the_api_ends_an_open_sse_stream(self):
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(
+            "GET",
+            "/api/companion/events",
+            headers={"Authorization": "Bearer " + paired["token"]},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.api.stop()
+        # The stream must reach EOF promptly after stop instead of staying
+        # half-open until a TCP timeout. The initial hello event is expected.
+        remaining = response.read()
+        self.assertIn(b"hello", remaining)
+        connection.close()
+
     def test_sse_does_not_keep_old_capabilities_after_negotiation(self):
         code = self.store.pairing_code()['code']
         _, paired = self.request('POST', '/api/companion/pair', {'code': code})

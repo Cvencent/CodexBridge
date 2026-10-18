@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import base64
 import queue
+import select
 import socket
+import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,9 +23,22 @@ from codexbridge.ports import validate_companion_port
 from codexbridge.net_gate import ExclusiveBindMixin
 from codexbridge.protocol.commands import CommandError
 from codexbridge.codex.desktop_ipc import DesktopIpcError
+from codexbridge.cbdp.http_transport import (
+    WebSocketError,
+    CbdpHttpBroker,
+    decode_ws_frame,
+    encode_ws_frame,
+    frame_cursor,
+    websocket_accept_key,
+)
+from codexbridge.cbdp.tlv import CBDPError
 
 MAX_BODY_BYTES = 64 * 1024
 SSE_HEARTBEAT_SECONDS = 15.0
+# The SSE loops wait on their queue in short slices so a Companion stop is
+# observed within about a second instead of waiting for the full heartbeat
+# timeout. Heartbeats are still emitted only after SSE_HEARTBEAT_SECONDS.
+SSE_WAIT_SLICE_SECONDS = 1.0
 SSE_MAX_SECONDS = 60 * 60
 PAIR_WINDOW_SECONDS = 600
 PAIR_MAX_PER_WINDOW = 20
@@ -39,6 +55,7 @@ class CompanionApi:
         host: str = "0.0.0.0",
         port: int | None = None,
         logger=None,
+        cbdp_broker: CbdpHttpBroker | None = None,
     ) -> None:
         self.service = service
         self.store = store
@@ -47,11 +64,15 @@ class CompanionApi:
         if self.port == LEGACY_PORT:
             self.port = DEFAULT_PORT
         self._logger = logger
+        self.cbdp_broker = cbdp_broker
         self._server: _CompanionServer | None = None
         self._thread: threading.Thread | None = None
         self._lifecycle_lock = threading.RLock()
         self._pair_attempts: dict[str, list[float]] = {}
         self._pair_lock = threading.Lock()
+        self._stream_stop = threading.Event()
+        self._open_streams: set[socket.socket] = set()
+        self._streams_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -73,6 +94,7 @@ class CompanionApi:
                 daemon=True,
             )
             self._thread.start()
+            self._stream_stop.clear()
 
     def _bind_server(self) -> "_CompanionServer":
         candidates = [self.port]
@@ -148,6 +170,17 @@ class CompanionApi:
 
     def stop(self) -> None:
         with self._lifecycle_lock:
+            self._stream_stop.set()
+            if self.cbdp_broker is not None:
+                self.cbdp_broker.close_all()
+            with self._streams_lock:
+                streams = list(self._open_streams)
+                self._open_streams.clear()
+            for stream in streams:
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             server = self._server
             self._server = None
             if server is not None:
@@ -157,6 +190,14 @@ class CompanionApi:
             self._thread = None
             if thread is not None:
                 thread.join(timeout=2.0)
+
+    def register_stream(self, stream: socket.socket) -> None:
+        with self._streams_lock:
+            self._open_streams.add(stream)
+
+    def unregister_stream(self, stream: socket.socket) -> None:
+        with self._streams_lock:
+            self._open_streams.discard(stream)
 
     def log(self, message: str) -> None:
         if self._logger is not None:
@@ -174,7 +215,29 @@ class CompanionApi:
             "urls": [f"http://{address}:{snapshot.get('port')}" for address in addresses],
             "phones": snapshot.get("phones") or [],
             "pairing_expires_at": snapshot.get("pairing_expires_at") or 0,
+            "cbdp_v1": self.cbdp_capabilities(),
         }
+
+    def cbdp_capabilities(self) -> dict[str, Any]:
+        return {
+            "protocol": "CBDP",
+            "version": "1.0",
+            "version_major": 1,
+            "version_minor": 0,
+            "transport": "websocket|sse|http",
+            "paths": {
+                "websocket": "/cbdp/v1/ws",
+                "events": "/cbdp/v1/events",
+                "frame": "/cbdp/v1/frame",
+            },
+            "auth": "Authorization: Bearer <pairing credential>",
+            "auth_mode": 1,
+            "enabled": self.enabled(),
+            "port": self.port,
+        }
+
+    def enabled(self) -> bool:
+        return bool(getattr(self.store, "enabled", False))
 
     def allow_pair_attempt(self, client_host: str) -> bool:
         now = time.time()
@@ -271,6 +334,12 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path.rstrip("/") or "/"
+        if path == "/cbdp/v1/ws":
+            self._cbdp_websocket(query)
+            return
+        if path == "/cbdp/v1/events":
+            self._cbdp_sse(query)
+            return
         if path == "/api/companion/ping":
             self._send_json(
                 200,
@@ -348,6 +417,9 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         path = parsed.path.rstrip("/") or "/"
         parts = [unquote(part) for part in path.strip("/").split("/") if part]
+        if path == "/cbdp/v1/frame":
+            self._cbdp_frame(query)
+            return
         if path == "/api/companion/pair":
             self._pair(query)
             return
@@ -487,6 +559,141 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             raise ValueError("json")
         return payload
 
+    def _cbdp_session(self):
+        if self.app.cbdp_broker is None:
+            self._error(404, "cbdp_unavailable")
+            return None
+        device = self._authorize(parse_qs(urlparse(self.path).query))
+        if device is None:
+            return None
+        token = self._token(parse_qs(urlparse(self.path).query))
+        return self.app.cbdp_broker.attach(device.phone_id, token)
+
+    def _cbdp_frame(self, query) -> None:
+        session = self._cbdp_session()
+        if session is None:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._error(400, "invalid_body")
+            return
+        if length <= 0 or length > MAX_BODY_BYTES:
+            self._error(413 if length > MAX_BODY_BYTES else 400, "invalid_body")
+            return
+        raw = self.rfile.read(length)
+        try:
+            session.accept_bytes(raw)
+        except (CBDPError, WebSocketError, ValueError):
+            self._error(400, "invalid_frame")
+            return
+        self._send_json(202, {"ok": True, "accepted": True})
+
+    def _cbdp_sse(self, query) -> None:
+        session = self._cbdp_session()
+        if session is None:
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        deadline = time.monotonic() + SSE_MAX_SECONDS
+        last_heartbeat = time.monotonic()
+        self.app.register_stream(self.connection)
+        try:
+            while time.monotonic() < deadline and not self.app._stream_stop.is_set():
+                try:
+                    raw = session.queue.get(timeout=SSE_WAIT_SLICE_SECONDS)
+                except queue.Empty:
+                    if time.monotonic() - last_heartbeat >= SSE_HEARTBEAT_SECONDS:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        last_heartbeat = time.monotonic()
+                    continue
+                if raw is None:
+                    break
+                cursor = frame_cursor(raw)
+                encoded = base64.b64encode(bytes(raw)).decode("ascii")
+                self.wfile.write(
+                    f"id: {cursor}\nevent: cbdp\ndata: {encoded}\n\n".encode("utf-8")
+                )
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            self.app.unregister_stream(self.connection)
+            self.app.cbdp_broker.drop(session.device_id) if self.app.cbdp_broker else None
+
+    def _cbdp_websocket(self, query) -> None:
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        key = self.headers.get("Sec-WebSocket-Key") or ""
+        if upgrade != "websocket" or not key:
+            self._error(426, "websocket_upgrade_required")
+            return
+        session = self._cbdp_session()
+        if session is None:
+            return
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        self.end_headers()
+        buffer = bytearray()
+        self.connection.settimeout(SSE_HEARTBEAT_SECONDS)
+        self.app.register_stream(self.connection)
+        try:
+            while not self.app._stream_stop.is_set() and not session.closed.is_set():
+                while not session.queue.empty():
+                    raw = session.queue.get_nowait()
+                    if raw is None:
+                        return
+                    self.wfile.write(encode_ws_frame(raw))
+                self.wfile.flush()
+                readable, _, _ = select.select(
+                    [self.connection], [], [], SSE_HEARTBEAT_SECONDS
+                )
+                if not readable:
+                    self.wfile.write(encode_ws_frame(b"", opcode=0x9))
+                    self.wfile.flush()
+                    continue
+                chunk = self.connection.recv(4096)
+                if not chunk:
+                    return
+                buffer.extend(chunk)
+                while True:
+                    try:
+                        decoded = decode_ws_frame(buffer)
+                    except WebSocketError:
+                        return
+                    if decoded is None:
+                        break
+                    opcode, payload = decoded
+                    if opcode == 0x8:
+                        return
+                    if opcode == 0x9:
+                        self.wfile.write(encode_ws_frame(payload, opcode=0xA))
+                        self.wfile.flush()
+                        continue
+                    if opcode == 0x2:
+                        try:
+                            session.accept_bytes(payload)
+                        except (CBDPError, ValueError):
+                            return
+                while not session.queue.empty():
+                    raw = session.queue.get_nowait()
+                    if raw is None:
+                        return
+                    self.wfile.write(encode_ws_frame(raw))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            self.app.unregister_stream(self.connection)
+            if self.app.cbdp_broker is not None:
+                self.app.cbdp_broker.drop(session.device_id)
+
     def _stream_events(self, query: dict[str, list[str]], device=None) -> None:
         thread_filter = (query.get("thread_id") or [""])[0]
         after = self.headers.get('Last-Event-ID') or (query.get('after') or [''])[0]
@@ -498,6 +705,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         deadline = time.monotonic() + SSE_MAX_SECONDS
+        last_heartbeat = time.monotonic()
+        self.app.register_stream(self.connection)
         try:
             hello = {"type": "hello", "version": VERSION, "server_time": time.time()}
             self.wfile.write(
@@ -515,12 +724,14 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     data = json.dumps({"type": "queue_snapshot", **snapshot}, ensure_ascii=False)
                     self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
             self.wfile.flush()
-            while time.monotonic() < deadline:
+            while time.monotonic() < deadline and not self.app._stream_stop.is_set():
                 try:
-                    payload = target.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    payload = target.get(timeout=SSE_WAIT_SLICE_SECONDS)
                 except queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
+                    if time.monotonic() - last_heartbeat >= SSE_HEARTBEAT_SECONDS:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        last_heartbeat = time.monotonic()
                     continue
                 thread_id = str(payload.get("thread_id") or "")
                 if device is not None:
@@ -542,6 +753,7 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
             pass
         finally:
+            self.app.unregister_stream(self.connection)
             self.app.service.unsubscribe(target)
 
 

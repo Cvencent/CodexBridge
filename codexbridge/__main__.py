@@ -28,6 +28,7 @@ from codexbridge.devices.session import CbdpDeviceSession
 from codexbridge.hub import BridgeHub
 from codexbridge.cbdp.events import EventSpine
 from codexbridge.cbdp.gateway import CbdpGateway
+from codexbridge.cbdp.http_transport import CbdpHttpBroker
 from codexbridge.cbdp.leases import LeaseManager
 from codexbridge.cbdp.projection import ProjectionStore
 from codexbridge.cbdp.refs import ReferenceRegistry
@@ -479,7 +480,21 @@ def main(argv: list[str] | None = None) -> int:
     hub.commands = companion_service.commands
     # A read made on the hardware also retracts the phone notification badge.
     hub.companion_events = companion_service
-    companion = CompanionApi(companion_service, companion_store, logger=print)
+    cbdp_http = CbdpHttpBroker(
+        commands=lambda: companion_service.commands,
+        capability_for=lambda phone_id: (
+            companion_store.get_phone(phone_id).capabilities()
+            if companion_store.get_phone(phone_id)
+            else set()
+        ),
+        hub=hub,
+    )
+    companion = CompanionApi(
+        companion_service,
+        companion_store,
+        logger=print,
+        cbdp_broker=cbdp_http,
+    )
     companion_discovery = CompanionDiscovery(
         companion_store,
         port=companion_store.discovery_port,
@@ -653,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         speech.close()
         companion_discovery.stop()
         companion.stop()
+        cbdp_http.close_all()
         companion_service.stop()
         admin.stop()
         speech_thread.join(timeout=1.0)
