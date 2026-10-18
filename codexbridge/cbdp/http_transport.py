@@ -143,10 +143,18 @@ class CbdpHttpSession:
 class CbdpHttpBroker:
     """Own the CBDP sessions reachable through the Companion HTTP port."""
 
-    def __init__(self, commands, capability_for, hub=None, ttl: float = SESSION_TTL_SECONDS):
+    def __init__(
+        self,
+        commands,
+        capability_for,
+        hub=None,
+        references=None,
+        ttl: float = SESSION_TTL_SECONDS,
+    ):
         self._commands = commands
         self._capability_for = capability_for
         self._hub = hub
+        self._references = references
         self._ttl = float(ttl)
         self._sessions: dict[str, CbdpHttpSession] = {}
         self._lock = threading.RLock()
@@ -208,6 +216,7 @@ class CbdpHttpBroker:
         capabilities = expand_phone_capabilities(self._capability_for(device_id))
         gateway = CbdpGateway(
             commands=self._commands,
+            references=self._references,
             pairing_token=lambda _device_id: token,
             capability_policy=lambda _device_id: capabilities,
             transport_allowed=lambda _device_id: (1 << 64) - 1,

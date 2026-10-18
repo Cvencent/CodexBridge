@@ -59,6 +59,7 @@ from codexbridge.cbdp.constants import (
     TYPE_RESYNC,
     TYPE_WELCOME,
 )
+from codexbridge.cbdp import gateway
 from codexbridge.cbdp.frame import Frame
 from codexbridge.cbdp.gateway import CbdpGateway
 from codexbridge.cbdp.refs import ReferenceRegistry
@@ -691,6 +692,138 @@ class CbdpGatewayTests(unittest.TestCase):
             if decode_tlvs(value)[0x003F] == b"\x02"
         ]
         self.assertEqual(kinds, [0, 1, 3])
+
+    def test_oversized_thread_title_does_not_break_the_result(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        fields = self.gateway._result_fields(
+            {
+                "threads": [
+                    {"thread_id": "t1", "title": "x" * 70000, "status": "idle"},
+                    {"thread_id": "t2", "title": "ok", "status": "idle"},
+                ],
+                "next_cursor": "p2",
+            }
+        )
+        objects = decode_array(fields[TAG_OBJECTS], TAG_OBJECT)
+        self.assertEqual(len(objects), 2)
+        first = decode_tlvs(objects[0][1])
+        title = decode_utf8(first[0x0040])
+        self.assertLessEqual(len(title.encode("utf-8")), 4096)
+        self.assertIn(TAG_NEXT_CURSOR, fields)
+
+    def test_gateway_imports_every_constant_it_references(self):
+        # A missing constant shows up as a NameError that tears down a live
+        # CBDP session instead of returning an ERROR frame, so assert imports.
+        import ast
+        from pathlib import Path
+
+        source = Path(gateway.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "codexbridge.cbdp.constants"
+            ):
+                imported.update(alias.name for alias in node.names)
+        used = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id.startswith("TAG_")
+        }
+        self.assertEqual(sorted(used - imported), [])
+
+    def test_object_page_respects_the_negotiated_frame_budget(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        session.max_frame_bytes = 1024
+        fields = self.gateway._result_fields(
+            {
+                "threads": [
+                    {"thread_id": f"t{i}", "title": "t" * 400, "status": "idle"}
+                    for i in range(20)
+                ]
+            }
+        )
+        self.assertLessEqual(len(fields[TAG_OBJECTS]) + 128, 1024)
+
+    def test_thread_read_keeps_messages_when_approvals_are_present(self):
+        # thread.read also carries `pending_approvals`; a key-sniffing encoder
+        # returned that (often empty) list and silently dropped every message.
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        fields = self.gateway._result_fields(
+            {
+                "thread": {"thread_id": "t1", "title": "T", "status": "working"},
+                "messages": [
+                    {"id": "m1", "kind": "user", "text": "hi"},
+                    {"id": "m2", "kind": "agent", "text": "hello"},
+                ],
+                "pending_approvals": [],
+            },
+            "thread.read",
+        )
+        objects = decode_array(fields[TAG_OBJECTS], TAG_OBJECT)
+        types = [
+            decode_tlvs(value)[0x003F][0]
+            for _tag, value in objects
+        ]
+        self.assertEqual(types.count(2), 2)
+        self.assertEqual(types.count(0), 1)
+
+    def test_project_objects_encode_and_unknown_ref_kinds_degrade(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        fields = self.gateway._result_fields(
+            {
+                "projects": [
+                    {"project_id": "p1", "name": "Proj", "cwd": "D:\\p1"},
+                    {"project_id": "p2", "name": "Proj2", "cwd": "D:\\p2"},
+                ]
+            },
+            "projects.list",
+        )
+        objects = decode_array(fields[TAG_OBJECTS], TAG_OBJECT)
+        self.assertEqual(len(objects), 2)
+        first = decode_tlvs(objects[0][1])
+        self.assertEqual(first[0x003F], u8(10))
+        self.assertEqual(decode_utf8(first[0x0052]), "D:\\p1")
+        # An unsupported kind must yield 0 rather than raising and killing
+        # the session.
+        self.assertEqual(self.gateway._ref("not-a-kind", "x"), 0)
 
     def test_status_result_projects_online_field(self):
         fields = self.gateway._result_fields(

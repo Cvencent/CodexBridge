@@ -63,7 +63,7 @@ class ReferenceRegistry:
     @staticmethod
     def _kind(kind: str) -> str:
         value = str(kind or "").strip().lower()
-        if value not in {"thread", "turn", "message", "approval", "device"}:
+        if value not in {"thread", "turn", "message", "approval", "device", "project"}:
             raise ValueError("unsupported reference kind")
         return value
 

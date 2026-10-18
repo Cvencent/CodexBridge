@@ -48,6 +48,7 @@ from codexbridge.cbdp.constants import (
     TAG_MESSAGE_REF,
     TAG_KIND,
     TAG_TITLE,
+    TAG_SUMMARY,
     TAG_STATUS,
     TAG_REVISION,
     TAG_UPDATED_AT_MS,
@@ -65,6 +66,10 @@ from codexbridge.cbdp.constants import (
     TAG_EXPIRES_AT_MS,
     TAG_APPROVAL_KIND,
     TAG_APPROVAL_DETAIL,
+    TAG_APPROVAL_ID,
+    TAG_APPROVAL_REF,
+    TAG_DECISION,
+    TAG_OPTIONS,
     TAG_ONLINE,
     TAG_MODEL_CAPABILITIES,
     TAG_MODEL_CAPABILITY_KIND,
@@ -107,6 +112,7 @@ from codexbridge.cbdp.constants import (
     TYPE_AUDIO_END,
     TYPE_AUTH,
     TYPE_AUTH_OK,
+    TYPE_CLOSE,
     TYPE_COMMAND,
     TYPE_ERROR,
     TYPE_HELLO,
@@ -254,8 +260,47 @@ def _message_status(status: str) -> int:
     }.get(str(status or ""), 0)
 
 
+# Per-field byte budgets for object payloads. A single oversized upstream field
+# must never make the whole RESULT unencodable: a TLV value is u16-length
+# bounded and the entire frame has to fit the negotiated budget, so long text
+# is truncated on a UTF-8 boundary instead of failing the command.
+OBJECT_TEXT_LIMIT = 4096
+# Head room for the RESULT envelope (request_id, method_id, state, the objects
+# TLV wrapper, object_count and next_cursor).
+OBJECT_ENVELOPE_BYTES = 128
+OBJECT_OBJECTS_BUDGET = 48 * 1024
+
+
+def _wire_text(value, limit: int = OBJECT_TEXT_LIMIT) -> str:
+    text = str(value or "")
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit].decode("utf-8", "ignore")
+
+
+def _pack_objects(objects, budget: int = OBJECT_OBJECTS_BUDGET):
+    """Keep only the objects that fit the fixed wire budget.
+
+    Returns ``(packed, dropped)``. Dropping trailing rows is preferable to
+    sending a RESULT the peer cannot decode, and ``object_count`` plus
+    ``next_cursor`` stay consistent with what was actually sent.
+    """
+
+    packed = []
+    used = 2
+    for encoded in objects:
+        size = 4 + len(encoded)
+        if used + size > budget:
+            break
+        packed.append(encoded)
+        used += size
+    return packed, len(objects) - len(packed)
+
+
 PARAM_TAGS = {
     "thread_id": 0x0022,
+    "thread_ref": 0x0021,
     "turn_id": 0x0024,
     "message_id": 0x0026,
     "approval_id": 0x0028,
@@ -347,6 +392,8 @@ class CbdpGateway:
         self._generation = 0
         self._send = None
         self._outgoing_seq = 0
+        self.last_peer_error = None
+        self.session_closed = False
         self._transactions: dict[bytes, dict] = {}
         # CBDP carries paging cursors as opaque u64. The upstream app-server
         # returns an opaque string, so keep a reversible per-session table
@@ -521,6 +568,10 @@ class CbdpGateway:
             return self._handle_ping(frame)
         if frame.message_type == TYPE_PONG:
             return None
+        if frame.message_type == TYPE_ERROR:
+            return self._handle_peer_error(frame)
+        if frame.message_type == TYPE_CLOSE:
+            return self._handle_peer_close(frame)
         if session is None:
             return self._error(0, "UNAUTHORIZED", "HELLO_REQUIRED")
         if frame.message_type == TYPE_AUTH:
@@ -548,6 +599,24 @@ class CbdpGateway:
         if frame.message_type == TYPE_AUDIO_END:
             return self._handle_audio_end(frame)
         return self._error(self._request_id(frame), "UNSUPPORTED_FEATURE")
+
+    def _handle_peer_error(self, frame):
+        """Accept a peer-reported ERROR without echoing another error.
+
+        Protocol 21.3 keeps the connection open for frame/encoding errors.
+        Answering the peer's ERROR with UNSUPPORTED_FEATURE would turn normal
+        error reporting into a protocol loop and makes the device tear the
+        session down. Record it for diagnostics and stay silent.
+        """
+
+        self.last_peer_error = (int(frame.code), self._request_id(frame))
+        return None
+
+    def _handle_peer_close(self, frame):
+        """Handle a peer CLOSE per protocol 23 without replying."""
+
+        self.session_closed = True
+        return None
 
     def _handle_ping(self, frame):
         header = {}
@@ -796,6 +865,11 @@ class CbdpGateway:
                     result[name] = decode_u64(raw) if len(raw) == 8 else decode_u32(raw)
                 except CBDPError:
                     continue
+            elif name == "thread_ref":
+                try:
+                    result[name] = decode_u32(raw)
+                except CBDPError:
+                    continue
             elif name == "decision":
                 try:
                     result[name] = decode_u8(raw)
@@ -862,7 +936,7 @@ class CbdpGateway:
             self._result(
                 request_id,
                 method_id,
-                self._result_fields(response.get("result")),
+                self._result_fields(response.get("result"), method),
             )
 
         if self._maybe_defer(generation, run):
@@ -882,6 +956,12 @@ class CbdpGateway:
                 params["queue_id"] = str(queue_item_ref)
         if method in {"message.read.update"} and "thread_id" not in params:
             params["thread_id"] = ""
+        # Protocol selectors accept a compact ref *or* the string id; the
+        # upstream command layer only understands the string id.
+        if "thread_ref" in params:
+            resolved = self._thread_from_ref(int(params.pop("thread_ref")))
+            if resolved and "thread_id" not in params:
+                params["thread_id"] = resolved
         return params
 
     def _restore_cursor(self, method, params):
@@ -950,7 +1030,7 @@ class CbdpGateway:
             return self._thread_from_ref(ref)
         return ""
 
-    def _result_fields(self, result):
+    def _result_fields(self, result, method: str = ""):
         if not isinstance(result, dict):
             return {}
         fields = {}
@@ -981,14 +1061,24 @@ class CbdpGateway:
                 online = transport not in {"", "unstarted", "offline"}
         if online is not None:
             fields[TAG_ONLINE] = u8(1 if online else 0)
-        objects = self._result_objects(result)
+        objects = self._result_objects(result, method)
         if objects is not None:
-            fields[TAG_OBJECTS] = encode_array(TAG_OBJECT, objects)
-            fields[TAG_OBJECT_COUNT] = u16(len(objects))
+            packed, _dropped = _pack_objects(objects, self._objects_budget())
+            fields[TAG_OBJECTS] = encode_array(TAG_OBJECT, packed)
+            fields[TAG_OBJECT_COUNT] = u16(len(packed))
         cursor = self._encode_cursor(result.get("next_cursor"))
         if cursor is not None:
             fields[TAG_NEXT_CURSOR] = u64(cursor)
         return fields
+
+    def _objects_budget(self) -> int:
+        """Bytes available for the ``objects`` value inside one RESULT frame."""
+
+        session = self.session
+        limit = int(getattr(session, "max_frame_bytes", 0) or 0)
+        if limit <= 0:
+            return OBJECT_OBJECTS_BUDGET
+        return max(2, min(OBJECT_OBJECTS_BUDGET, limit - OBJECT_ENVELOPE_BYTES))
 
     def _encode_cursor(self, value) -> int | None:
         """Map an opaque upstream cursor onto a stable per-session u64."""
@@ -1022,49 +1112,106 @@ class CbdpGateway:
         with self._lock:
             return self._cursor_map.get(int(value))
 
-    def _result_objects(self, result):
-        """Encode protocol 8.4 object arrays for the methods that require them."""
+    def _result_objects(self, result, method: str = ""):
+        """Encode protocol 8.4 object arrays for the methods that require them.
 
+        The method decides which objects belong to the result. Sniffing the
+        response keys is not enough: a `thread.read` reply also carries
+        `pending_approvals`, so a key-first search would return the approvals
+        list and silently drop every message.
+        """
+
+        budget = self._objects_budget()
+        text_limit = max(32, min(OBJECT_TEXT_LIMIT, budget // 4))
         objects: list[tuple[int, bytes]] = []
-        if isinstance(result.get("threads"), list):
-            for row in result["threads"]:
-                encoded = self._encode_thread_object(row)
+
+        def threads():
+            rows = result.get("threads")
+            if not isinstance(rows, list):
+                return None
+            out = []
+            for row in rows:
+                encoded = self._encode_thread_object(row, text_limit)
                 if encoded is not None:
-                    objects.append(encoded)
-            return objects
-        if isinstance(result.get("models"), list):
-            for row in result["models"]:
-                encoded = self._encode_model_object(row)
+                    out.append(encoded)
+            return out
+
+        def models():
+            rows = result.get("models")
+            if not isinstance(rows, list):
+                return None
+            out = []
+            for row in rows:
+                encoded = self._encode_model_object(row, text_limit)
                 if encoded is not None:
-                    objects.append(encoded)
-            return objects
-        if isinstance(result.get("projects"), list):
-            for row in result["projects"]:
-                encoded = self._encode_project_object(row)
+                    out.append(encoded)
+            return out
+
+        def projects():
+            rows = result.get("projects")
+            if not isinstance(rows, list):
+                return None
+            out = []
+            for row in rows:
+                encoded = self._encode_project_object(row, text_limit)
                 if encoded is not None:
-                    objects.append(encoded)
-            return objects
-        approvals = result.get("pending_approvals")
-        if isinstance(approvals, list):
-            for row in approvals:
-                encoded = self._encode_approval_object(row)
+                    out.append(encoded)
+            return out
+
+        def approvals():
+            rows = result.get("pending_approvals")
+            if not isinstance(rows, list):
+                return None
+            out = []
+            for row in rows:
+                encoded = self._encode_approval_object(row, text_limit)
                 if encoded is not None:
-                    objects.append(encoded)
-            return objects
-        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
-        read_thread_id = str(thread.get("thread_id") or result.get("thread_id") or "")
-        if isinstance(result.get("messages"), list) and read_thread_id:
-            thread_object = self._encode_thread_object(thread or {"thread_id": read_thread_id})
+                    out.append(encoded)
+            return out
+
+        def thread_detail():
+            thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+            read_thread_id = str(
+                thread.get("thread_id") or result.get("thread_id") or ""
+            )
+            rows = result.get("messages")
+            if not isinstance(rows, list) or not read_thread_id:
+                return None
+            out = []
+            thread_object = self._encode_thread_object(
+                thread or {"thread_id": read_thread_id}, text_limit
+            )
             if thread_object is not None:
-                objects.append(thread_object)
-            for row in result["messages"]:
-                encoded = self._encode_message_object(row, read_thread_id)
+                out.append(thread_object)
+            for row in rows:
+                encoded = self._encode_message_object(row, read_thread_id, text_limit)
                 if encoded is not None:
-                    objects.append(encoded)
-            return objects
+                    out.append(encoded)
+            for row in result.get("pending_approvals") or []:
+                encoded = self._encode_approval_object(row, text_limit)
+                if encoded is not None:
+                    out.append(encoded)
+            return out
+
+        method_builders = {
+            "threads.list": (threads,),
+            "thread.search": (threads,),
+            "models.list": (models,),
+            "projects.list": (projects,),
+            "approvals.list": (approvals,),
+            "thread.read": (thread_detail,),
+        }
+        builders = method_builders.get(method)
+        if builders is None:
+            # Unknown/legacy caller: fall back to the historical key search.
+            builders = (threads, thread_detail, models, projects, approvals)
+        for builder in builders:
+            encoded = builder()
+            if encoded is not None:
+                return encoded
         return None
 
-    def _encode_thread_object(self, row):
+    def _encode_thread_object(self, row, text_limit: int = OBJECT_TEXT_LIMIT):
         if not isinstance(row, dict):
             return None
         thread_id = str(row.get("thread_id") or row.get("id") or "")
@@ -1074,7 +1221,7 @@ class CbdpGateway:
             TAG_OBJECT_TYPE: u8(0),
             TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
             TAG_THREAD_ID: utf8(thread_id),
-            TAG_TITLE: utf8(str(row.get("title") or row.get("name") or "")),
+            TAG_TITLE: utf8(_wire_text(row.get("title") or row.get("name"), text_limit)),
             TAG_STATUS: u16(_thread_state(str(row.get("status") or ""))),
             TAG_REVISION: u64(int(row.get("revision") or 0)),
             TAG_OWNER_STATE: u8(
@@ -1085,20 +1232,20 @@ class CbdpGateway:
         }
         model = str(row.get("model") or "")
         if model:
-            fields[TAG_MODEL_NAME] = utf8(model)
+            fields[TAG_MODEL_NAME] = utf8(_wire_text(model, min(128, text_limit)))
         cwd = str(row.get("cwd") or "")
         if cwd:
-            fields[TAG_CWD] = utf8(cwd)
+            fields[TAG_CWD] = utf8(_wire_text(cwd, min(1024, text_limit)))
         summary = str(row.get("preview") or row.get("summary") or "")
         if summary:
-            fields[TAG_SUMMARY] = utf8(summary)
+            fields[TAG_SUMMARY] = utf8(_wire_text(summary, text_limit))
         updated = int(float(row.get("updated_at") or row.get("recency_at") or 0) * 1000)
         if updated:
             fields[TAG_UPDATED_AT_MS] = i64(updated)
             fields[TAG_CREATED_AT_MS] = i64(updated)
         return encode_tlvs(fields.items())
 
-    def _encode_model_object(self, row):
+    def _encode_model_object(self, row, text_limit: int = OBJECT_TEXT_LIMIT):
         if not isinstance(row, dict):
             return None
         name = str(row.get("model") or row.get("id") or "")
@@ -1106,8 +1253,8 @@ class CbdpGateway:
             return None
         fields = {
             TAG_OBJECT_TYPE: u8(9),
-            TAG_MODEL_NAME: utf8(name),
-            TAG_TITLE: utf8(str(row.get("display_name") or name)),
+            TAG_MODEL_NAME: utf8(_wire_text(name, min(128, text_limit))),
+            TAG_TITLE: utf8(_wire_text(row.get("display_name") or name, min(128, text_limit))),
         }
         efforts = [
             str(item.get("effort") or "")
@@ -1128,7 +1275,7 @@ class CbdpGateway:
         )
         return encode_tlvs(fields.items())
 
-    def _encode_project_object(self, row):
+    def _encode_project_object(self, row, text_limit: int = OBJECT_TEXT_LIMIT):
         if not isinstance(row, dict):
             return None
         project_id = str(row.get("project_id") or "")
@@ -1138,18 +1285,20 @@ class CbdpGateway:
         fields = {
             TAG_OBJECT_TYPE: u8(10),
             TAG_PROJECT_REF: u32(self._ref("project", project_id or name)),
-            TAG_PROJECT_ID: utf8(project_id),
-            TAG_TITLE: utf8(name),
+            TAG_PROJECT_ID: utf8(_wire_text(project_id, min(256, text_limit))),
+            TAG_TITLE: utf8(_wire_text(name, min(256, text_limit))),
         }
         cwd = str(row.get("cwd") or "")
         if cwd:
-            fields[TAG_CWD] = utf8(cwd)
+            fields[TAG_CWD] = utf8(_wire_text(cwd, min(1024, text_limit)))
         updated = int(float(row.get("updated_at") or 0) * 1000)
         if updated:
             fields[TAG_UPDATED_AT_MS] = i64(updated)
         return encode_tlvs(fields.items())
 
-    def _encode_message_object(self, row, thread_id: str = ""):
+    def _encode_message_object(
+        self, row, thread_id: str = "", text_limit: int = OBJECT_TEXT_LIMIT
+    ):
         if not isinstance(row, dict):
             return None
         message_id = str(row.get("message_id") or row.get("id") or "")
@@ -1160,13 +1309,13 @@ class CbdpGateway:
             TAG_OBJECT_TYPE: u8(2),
             TAG_MESSAGE_REF: u32(self._ref("message", message_id)),
             TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
-            TAG_MESSAGE_ID: utf8(message_id),
+            TAG_MESSAGE_ID: utf8(_wire_text(message_id, min(256, text_limit))),
             TAG_KIND: u8(_message_kind(str(row.get("kind") or ""))),
             TAG_STATUS: u16(_message_status(str(row.get("status") or ""))),
         }
         body = str(row.get("text") or "")
         if body:
-            fields[TAG_BODY] = utf8(body)
+            fields[TAG_BODY] = utf8(_wire_text(body, text_limit))
         turn_id = str(row.get("turn_id") or "")
         if turn_id:
             fields[TAG_TURN_REF] = u32(self._ref("turn", turn_id))
@@ -1175,7 +1324,7 @@ class CbdpGateway:
             fields[TAG_CREATED_AT_MS] = i64(created)
         return encode_tlvs(fields.items())
 
-    def _encode_approval_object(self, row):
+    def _encode_approval_object(self, row, text_limit: int = OBJECT_TEXT_LIMIT):
         if not isinstance(row, dict):
             return None
         approval_id = row.get("request_id", row.get("approval_id", row.get("id")))
@@ -1187,7 +1336,7 @@ class CbdpGateway:
         fields = {
             TAG_OBJECT_TYPE: u8(3),
             TAG_APPROVAL_REF: u32(self._ref("approval", approval_id)),
-            TAG_APPROVAL_ID: utf8(approval_id),
+            TAG_APPROVAL_ID: utf8(_wire_text(approval_id, min(128, text_limit))),
             TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
             TAG_TURN_REF: u32(self._ref("turn", turn_id)),
             TAG_APPROVAL_KIND: u8(
@@ -1195,14 +1344,14 @@ class CbdpGateway:
                     str(row.get("kind") or ""), 5
                 )
             ),
-            TAG_PROMPT: utf8(str(row.get("command") or row.get("reason") or "")),
+            TAG_PROMPT: utf8(_wire_text(row.get("command") or row.get("reason"), text_limit)),
         }
         detail = str(row.get("reason") or "")
         if detail:
-            fields[TAG_APPROVAL_DETAIL] = utf8(detail)
+            fields[TAG_APPROVAL_DETAIL] = utf8(_wire_text(detail, text_limit))
         cwd = str(row.get("cwd") or "")
         if cwd:
-            fields[TAG_CWD] = utf8(cwd)
+            fields[TAG_CWD] = utf8(_wire_text(cwd, min(1024, text_limit)))
         created = int(float(row.get("created_at") or 0) * 1000)
         if created:
             fields[TAG_CREATED_AT_MS] = i64(created)
@@ -1227,7 +1376,13 @@ class CbdpGateway:
     def _ref(self, kind, external_id):
         if self.references is None or not external_id:
             return 0
-        ref = int(self.references.ref_for(kind, external_id))
+        try:
+            ref = int(self.references.ref_for(kind, external_id))
+        except (ValueError, OverflowError):
+            # An unsupported reference kind must degrade to 0, never raise:
+            # a NameError/ValueError here tears down the whole CBDP session
+            # instead of returning a decodable RESULT.
+            return 0
         if ref:
             with self._lock:
                 self._ref_external[(str(kind), ref)] = str(external_id)

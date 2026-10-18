@@ -494,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
             else set()
         ),
         hub=hub,
+        references=references,
     )
     companion = CompanionApi(
         companion_service,
