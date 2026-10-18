@@ -5,4 +5,4 @@ import codexbridge
 
 class PackageTest(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(codexbridge.VERSION, "1.4.10")
+        self.assertEqual(codexbridge.VERSION, "2.0.0")

@@ -178,11 +178,14 @@ class CollectorLivenessTests(unittest.TestCase):
         listed: list[dict],
         activity: RolloutActivity,
         running_ids: tuple[str, ...] = (LIVE,),
+        calls: list[str] | None = None,
     ) -> CodexAppServerSource:
         running = {str(item["id"]) for item in listed if item.get("id") in running_ids}
 
         class FakeClient:
             def request(self, method, params):
+                if calls is not None:
+                    calls.append(method)
                 if method == "thread/list":
                     return {"data": listed}
                 if method == "thread/read":
@@ -245,6 +248,20 @@ class CollectorLivenessTests(unittest.TestCase):
             source.refresh_thread()
 
         self.assertNotEqual(source.task["status"], "working")
+
+    def test_unchanged_idle_thread_is_not_reread_on_every_poll(self) -> None:
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as temp:
+            source = self._source(
+                [_listed(LIVE, 400)],
+                RolloutActivity(Path(temp)),
+                running_ids=(),
+                calls=calls,
+            )
+            source.refresh_thread()
+            source.refresh_thread()
+
+        self.assertEqual(calls.count("thread/read"), 1)
 
 
 class RunningCountsTests(unittest.TestCase):

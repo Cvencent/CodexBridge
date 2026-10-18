@@ -800,6 +800,7 @@ class CodexAppServerSource:
         self._chatgpt_account = False
         self._has_thread_snapshot = False
         self._unreadable_thread_ids: set[str] = set()
+        self._thread_detail_cache: dict[str, tuple[tuple, dict[str, Any]]] = {}
 
     def start(self) -> None:
         self.client.start()
@@ -863,6 +864,12 @@ class CodexAppServerSource:
             str(item.get("id") or "") for item in display_threads if isinstance(item, dict)
         }
         unreadable_ids.intersection_update(display_thread_ids)
+        detail_cache = getattr(self, "_thread_detail_cache", None)
+        if detail_cache is None:
+            detail_cache = {}
+            self._thread_detail_cache = detail_cache
+        for cached_id in set(detail_cache) - display_thread_ids:
+            detail_cache.pop(cached_id, None)
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for selected in display_threads:
@@ -880,17 +887,33 @@ class CodexAppServerSource:
         fallback: dict[str, Any] | None = None
         unreadable = 0
         for selected in candidates:
-            try:
-                detail = self.client.request("thread/read", {"threadId": selected["id"], "includeTurns": True})
-            except (AppServerError, OSError, ValueError) as error:
-                # One stored thread may contain an item type unknown to this
-                # App Server build. Keep the other readable tasks flowing.
-                unreadable += 1
-                thread_id = str(selected.get("id") or "")
-                if thread_id not in unreadable_ids:
-                    emit(f"Codex 任务读取失败，已跳过该任务：{error}")
-                unreadable_ids.add(thread_id)
-                continue
+            thread_id = str(selected.get("id") or "")
+            cache_key = self._thread_detail_cache_key(selected)
+            cached = detail_cache.get(thread_id)
+            refresh_detail = (
+                cached is None
+                or cached[0] != cache_key
+                or self._is_active_hint(selected)
+                or thread_id in self.active_thread_ids
+                or liveness.get(thread_id) == "working"
+            )
+            if not refresh_detail:
+                detail = cached[1]
+            else:
+                try:
+                    detail = self.client.request(
+                        "thread/read",
+                        {"threadId": selected["id"], "includeTurns": True},
+                    )
+                    detail_cache[thread_id] = (cache_key, detail)
+                except (AppServerError, OSError, ValueError) as error:
+                    # One stored thread may contain an item type unknown to this
+                    # App Server build. Keep the other readable tasks flowing.
+                    unreadable += 1
+                    if thread_id not in unreadable_ids:
+                        emit(f"Codex 任务读取失败，已跳过该任务：{error}")
+                    unreadable_ids.add(thread_id)
+                    continue
             thread = detail.get("thread") if isinstance(detail, dict) else None
             if not self._is_display_thread(thread):
                 continue
@@ -941,6 +964,21 @@ class CodexAppServerSource:
             # Do not erase the last valid task view when every selected
             # historical thread is temporarily unreadable.
             emit("Codex 没有可读取的任务，保留上一次成功的任务快照")
+
+    @staticmethod
+    def _thread_detail_cache_key(item: dict[str, Any]) -> tuple:
+        runtime = item.get("status") if isinstance(item.get("status"), dict) else {}
+        turns = [turn for turn in item.get("turns", []) if isinstance(turn, dict)]
+        latest = turns[-1] if turns else {}
+        return (
+            int(_epoch(item.get("updatedAt") or item.get("recencyAt"))),
+            int(_epoch(item.get("recencyAt"))),
+            str(runtime.get("type") or ""),
+            tuple(str(flag) for flag in runtime.get("activeFlags", []) if isinstance(flag, str)),
+            str(latest.get("id") or ""),
+            str(latest.get("status") or ""),
+            int(_epoch(latest.get("completedAt"))),
+        )
 
     @staticmethod
     def _is_active_hint(item: Any) -> bool:
