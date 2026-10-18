@@ -102,6 +102,7 @@ BLOCKING_DEVICE_EVENTS = frozenset(
         "approval_decision",
         "cancel_task",
         "voice_command",
+        "cbdp_deferred",
         "_replay_state",
     }
     | {name for name, cap in DEVICE_EVENT_CAPABILITY.items() if cap == "tasks"}
@@ -584,6 +585,16 @@ class BridgeHub:
         to hear ``bridge_ready`` back."""
         self._enqueue(device_id, {"type": "_replay_state"})
 
+    def defer_blocking_event(self, device_id: str, event: dict) -> None:
+        """Run one Codex-blocking callback on the device worker thread.
+
+        CBDP transactions arrive on the socket reader thread. Routing their
+        upstream work here keeps the reader draining audio frames and
+        heartbeats while Codex is busy.
+        """
+
+        self._enqueue(device_id, event)
+
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """Drain queued device work. Used by shutdown and by tests."""
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -655,6 +666,11 @@ class BridgeHub:
             return
         if event_type == 'command':
             self._handle_command(device_id, event)
+            return
+        if event_type == 'cbdp_deferred':
+            callback = event.get('callback')
+            if callable(callback):
+                callback()
             return
         if event_type == "read_ack":
             self._handle_read_ack(device_id, event)

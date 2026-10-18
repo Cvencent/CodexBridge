@@ -445,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
             subscriptions=subscriptions,
             leases=leases,
             references=references,
+            speech=speech,
+            active_thread=hub.followed_thread,
+            defer=lambda device_id, callback: hub.defer_blocking_event(
+                device_id,
+                {"type": "cbdp_deferred", "callback": callback},
+            ),
             pairing_token=lambda target: (
                 candidate.token
                 if (candidate := registry.get(target)) is not None

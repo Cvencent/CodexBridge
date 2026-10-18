@@ -182,6 +182,56 @@ class SpeechService:
             self._cancel_job(device_id)
         return []
 
+    def transcribe_pcm(
+        self,
+        device_id: str,
+        pcm: bytes,
+        *,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        channels: int = DEFAULT_CHANNELS,
+        bits: int = DEFAULT_BITS,
+    ) -> str:
+        """Synchronously transcribe one complete PCM buffer.
+
+        Used by the CBDP ``AUDIO_*`` transaction, where the device expects a
+        single ``RESULT`` with the transcript instead of the asynchronous
+        record_start/audio_chunk/record_stop flow.
+        """
+
+        if not pcm:
+            return ""
+        if channels != 1 or bits != 16 or not 8000 <= int(sample_rate) <= 48000:
+            raise ValueError("unsupported audio format")
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        capture = _Capture(
+            sample_rate=int(sample_rate),
+            channels=int(channels),
+            bits=int(bits),
+            pcm=bytearray(pcm),
+            active=False,
+        )
+        path = self._write_wav(device_id, capture)
+        process = None
+        try:
+            process = self.recognizer.start(path)
+            deadline = time.monotonic() + self._timeout()
+            while True:
+                poll = getattr(process, "poll", None)
+                if callable(poll) and poll() is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    self._terminate(process)
+                    raise TimeoutError("speech recognition timed out")
+                time.sleep(0.05)
+            ok, text = self.recognizer.result(process)
+        except Exception:
+            self._terminate(process)
+            raise
+        if not ok:
+            raise RuntimeError(str(text or "speech recognition failed"))
+        return str(text or "").strip()
+
     def poll(self) -> list[tuple[str, dict]]:
         with self._lock:
             jobs = list(self._jobs.items())

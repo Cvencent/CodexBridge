@@ -60,9 +60,19 @@ from codexbridge.cbdp.constants import (
     TAG_EVENT_PAYLOAD,
     TAG_PING_ID,
     TAG_ECHO,
+    TAG_CODEC,
+    TAG_OFFSET,
+    TAG_SAMPLE_RATE,
+    TAG_CHANNELS,
+    TAG_BITS_PER_SAMPLE,
+    TAG_TOTAL_BYTES,
+    TAG_TRANSCRIPT,
     TAG_VERSION_MINOR,
     TAG_WRITER_LEASE_SECONDS,
     TYPE_ACK,
+    TYPE_AUDIO_BEGIN,
+    TYPE_AUDIO_CHUNK,
+    TYPE_AUDIO_END,
     TYPE_AUTH,
     TYPE_AUTH_OK,
     TYPE_COMMAND,
@@ -221,6 +231,9 @@ class CbdpGateway:
         capability_policy=None,
         references=None,
         transport_allowed=None,
+        speech=None,
+        defer=None,
+        active_thread=None,
         auth_mode=1,
         policy_version=1,
     ):
@@ -231,6 +244,15 @@ class CbdpGateway:
         # call refresh_capabilities() without inventing a second state store.
         self.capability_policy = capability_policy or (lambda device_id: set())
         self.references = references
+        self.speech = speech
+        # Optional ``(device_id, callback)`` hook used to run work that can
+        # block on Codex outside the device socket reader thread. Leaving it
+        # unset keeps unit tests and embedded use fully synchronous.
+        self.defer = defer
+        # Optional ``device_id -> thread_id`` resolver. CBDP text replies are
+        # sent without an explicit thread_id, so the Bridge maps them to the
+        # conversation the device currently selected.
+        self.active_thread = active_thread
         self.transport_allowed = transport_allowed or (
             lambda device_id: (1 << 64) - 1
         )
@@ -423,6 +445,12 @@ class CbdpGateway:
             return self._handle_send_chunk(frame)
         if frame.message_type == TYPE_SEND_END:
             return self._handle_send_end(frame)
+        if frame.message_type == TYPE_AUDIO_BEGIN:
+            return self._handle_audio_begin(frame)
+        if frame.message_type == TYPE_AUDIO_CHUNK:
+            return self._handle_audio_chunk(frame)
+        if frame.message_type == TYPE_AUDIO_END:
+            return self._handle_audio_end(frame)
         return self._error(self._request_id(frame), "UNSUPPORTED_FEATURE")
 
     def _handle_ping(self, frame):
@@ -444,6 +472,29 @@ class CbdpGateway:
             return decode_u32(value)
         except CBDPError:
             return 0
+
+    def _maybe_defer(self, generation, callback) -> bool:
+        """Run ``callback`` on the hub worker instead of the socket reader.
+
+        Returns True when the work was handed off. The callback is guarded by
+        the session generation so a late worker cannot answer after the
+        device has reconnected with a new session.
+        """
+
+        if self.defer is None or self.session is None:
+            return False
+        device_id = str(self.session.device_id or "")
+        if not device_id:
+            return False
+
+        def guarded():
+            session = self.session
+            if session is None or session.generation != generation:
+                return
+            callback()
+
+        self.defer(device_id, guarded)
+        return True
 
     def _handle_hello(self, frame):
         if not (frame.flags & FLAG_REQUEST):
@@ -679,32 +730,48 @@ class CbdpGateway:
             return self._error(request_id, "UPSTREAM_UNAVAILABLE")
         try:
             params = self._decode_params(decode_tlvs(params_raw))
-            request = {
-                "type": "command",
-                "request_id": f"cbdp:{self.session.device_id}:{request_id}",
-                "method": DISPATCH_METHODS.get(method, method),
-                "params": self._normalize_params(method, params),
-            }
-            response = commands.execute(
-                self.session.device_id,
-                self._capabilities(),
-                request,
-            )
         except CBDPError as error:
             return self._error(request_id, error.name)
-        except Exception:
-            return self._error(request_id, "INTERNAL")
-        if not isinstance(response, dict) or not response.get("ok"):
-            code = str(response.get("error") or "INVALID_PARAM") if isinstance(response, dict) else "INTERNAL"
-            mapping = {
-                "capability_not_enabled": "CAPABILITY_NOT_ENABLED",
-                "request_id_conflict": "IDEMPOTENCY_CONFLICT",
-                "unsupported_method": "UNSUPPORTED_FEATURE",
-                "outcome_unknown": "INTERNAL",
-            }
-            return self._error(request_id, mapping.get(code, "INVALID_PARAM"), code)
-        result_fields = self._result_fields(response.get("result"))
-        return self._result(request_id, method_id, result_fields)
+        device_id = str(self.session.device_id or "")
+        request = {
+            "type": "command",
+            "request_id": f"cbdp:{device_id}:{request_id}",
+            "method": DISPATCH_METHODS.get(method, method),
+            "params": self._normalize_params(method, params),
+        }
+        capabilities = self._capabilities()
+        generation = int(self.session.generation)
+
+        def run():
+            try:
+                response = commands.execute(device_id, capabilities, request)
+            except Exception:
+                self._error(request_id, "INTERNAL")
+                return
+            if not isinstance(response, dict) or not response.get("ok"):
+                code = (
+                    str(response.get("error") or "INVALID_PARAM")
+                    if isinstance(response, dict)
+                    else "INTERNAL"
+                )
+                mapping = {
+                    "capability_not_enabled": "CAPABILITY_NOT_ENABLED",
+                    "request_id_conflict": "IDEMPOTENCY_CONFLICT",
+                    "unsupported_method": "UNSUPPORTED_FEATURE",
+                    "outcome_unknown": "INTERNAL",
+                }
+                self._error(request_id, mapping.get(code, "INVALID_PARAM"), code)
+                return
+            self._result(
+                request_id,
+                method_id,
+                self._result_fields(response.get("result")),
+            )
+
+        if self._maybe_defer(generation, run):
+            return None
+        run()
+        return None
 
     def _normalize_params(self, method, params):
         params = dict(params)
@@ -757,7 +824,7 @@ class CbdpGateway:
             return self._error(0, error.name)
         if tx_id in self._transactions:
             return self._error(request_id, "IDEMPOTENCY_CONFLICT")
-        self._transactions[tx_id] = {"parts": {}, "bytes": 0}
+        self._transactions[tx_id] = {"parts": {}, "bytes": 0, "kind": "text"}
         return None
 
     def _handle_send_chunk(self, frame):
@@ -782,7 +849,7 @@ class CbdpGateway:
         except CBDPError as error:
             return self._error(0, error.name)
         transaction = self._transactions.pop(tx_id, None)
-        if transaction is None:
+        if transaction is None or transaction.get("kind") != "text":
             return self._error(tx_id, "INVALID_STATE")
         data = b"".join(transaction["parts"][key] for key in sorted(transaction["parts"]))
         try:
@@ -792,19 +859,175 @@ class CbdpGateway:
         commands = self._commands()
         if commands is None:
             return self._error(tx_id, "UPSTREAM_UNAVAILABLE")
+        device_id = str(self.session.device_id or "")
+        thread_id = ""
+        if self.active_thread is not None:
+            try:
+                thread_id = str(self.active_thread(device_id) or "")
+            except Exception:
+                thread_id = ""
+        if not thread_id:
+            # The device must not be left showing "sending to the computer"
+            # forever: a text reply with no selected conversation is an
+            # explicit protocol error, not a silent drop.
+            return self._error(tx_id, "INVALID_STATE", "NO_ACTIVE_THREAD")
+        capabilities = self._capabilities() | {"control"}
+        generation = int(self.session.generation)
+
+        def run():
+            try:
+                response = commands.execute(
+                    device_id,
+                    capabilities,
+                    {
+                        "type": "command",
+                        "request_id": f"cbdp-tx:{device_id}:{tx_id}",
+                        "method": "turn.start",
+                        "params": {"thread_id": thread_id, "text": text},
+                    },
+                )
+            except Exception:
+                self._error(tx_id, "INTERNAL")
+                return
+            if not isinstance(response, dict) or not response.get("ok"):
+                self._error(tx_id, "INVALID_STATE")
+                return
+            self._result(tx_id, 0x0005, self._result_fields(response.get("result")))
+
+        if self._maybe_defer(generation, run):
+            return None
+        run()
+        return None
+
+    def _handle_audio_begin(self, frame):
+        if "audio" not in self._capabilities():
+            return self._error(self._request_id(frame), "CAPABILITY_NOT_ENABLED")
         try:
-            response = commands.execute(
-                self.session.device_id,
-                self._capabilities() | {"control"},
+            tx_id = decode_u32(require_tlv(frame.header, 0x002D))
+            request_id = tx_id
+            sample_rate = decode_u32(frame.header.get(TAG_SAMPLE_RATE, u32(16000)))
+            channels = decode_u8(frame.header.get(TAG_CHANNELS, u8(1)))
+            bits = decode_u8(frame.header.get(TAG_BITS_PER_SAMPLE, u8(16)))
+        except CBDPError as error:
+            return self._error(self._request_id(frame), error.name)
+        if tx_id in self._transactions:
+            return self._error(request_id, "IDEMPOTENCY_CONFLICT")
+        self._transactions[tx_id] = {
+            "kind": "audio",
+            "parts": {},
+            "bytes": 0,
+            "sample_rate": int(sample_rate),
+            "channels": int(channels),
+            "bits": int(bits),
+        }
+        return None
+
+    def _handle_audio_chunk(self, frame):
+        try:
+            tx_id = decode_u32(require_tlv(frame.header, 0x002D))
+            offset = decode_u32(require_tlv(frame.header, TAG_OFFSET))
+        except CBDPError as error:
+            return self._error(0, error.name)
+        transaction = self._transactions.get(tx_id)
+        limit = int(self.session.max_audio_bytes or 1048576)
+        if transaction is None or transaction.get("kind") != "audio":
+            return self._error(tx_id, "INVALID_STATE")
+        if len(frame.payload) > limit or transaction["bytes"] + len(frame.payload) > limit:
+            self._transactions.pop(tx_id, None)
+            return self._error(tx_id, "PAYLOAD_TOO_LARGE")
+        if offset == transaction["bytes"]:
+            transaction["parts"][offset] = bytes(frame.payload)
+            transaction["bytes"] += len(frame.payload)
+        elif offset not in transaction["parts"]:
+            return self._error(tx_id, "INVALID_PARAM")
+        return None
+
+    def _handle_audio_end(self, frame):
+        try:
+            tx_id = decode_u32(require_tlv(frame.header, 0x002D))
+        except CBDPError as error:
+            return self._error(0, error.name)
+        transaction = self._transactions.pop(tx_id, None)
+        if transaction is None or transaction.get("kind") != "audio":
+            return self._error(tx_id, "INVALID_STATE")
+        try:
+            data = b"".join(
+                transaction["parts"][key] for key in sorted(transaction["parts"])
+            )
+        except KeyError:
+            return self._error(tx_id, "FRAGMENT_ERROR")
+        generation = int(self.session.generation)
+
+        def run():
+            transcript = self._dispatch_audio_transcript(transaction, data)
+            if transcript is None:
+                self._error(tx_id, "UPSTREAM_UNAVAILABLE")
+                return
+            commands = self._commands()
+            if commands is None:
+                self._error(tx_id, "UPSTREAM_UNAVAILABLE")
+                return
+            device_id = str(self.session.device_id or "")
+            thread_id = ""
+            if self.active_thread is not None:
+                try:
+                    thread_id = str(self.active_thread(device_id) or "")
+                except Exception:
+                    thread_id = ""
+            if not thread_id:
+                self._error(tx_id, "INVALID_STATE", "NO_ACTIVE_THREAD")
+                return
+            try:
+                response = commands.execute(
+                    device_id,
+                    self._capabilities() | {"control"},
+                    {
+                        "type": "command",
+                        "request_id": f"cbdp-audio:{device_id}:{tx_id}",
+                        "method": "turn.start",
+                        "params": {"thread_id": thread_id, "text": transcript},
+                    },
+                )
+            except Exception:
+                self._error(tx_id, "INTERNAL")
+                return
+            if not isinstance(response, dict) or not response.get("ok"):
+                self._error(tx_id, "INVALID_STATE")
+                return
+            self._result(
+                tx_id,
+                0x0013,
                 {
-                    "type": "command",
-                    "request_id": f"cbdp-tx:{self.session.device_id}:{tx_id}",
-                    "method": "turn.start",
-                    "params": {"text": text},
+                    TAG_TRANSCRIPT: utf8(transcript),
+                    **self._result_fields(response.get("result")),
                 },
             )
+
+        if self._maybe_defer(generation, run):
+            return None
+        run()
+        return None
+
+    def _dispatch_audio_transcript(self, transaction, data):
+        """Run STT for an AUDIO_* transaction, then submit the text.
+
+        Returns the transcribed text, or None when the recognizer cannot be
+        used. The caller decides how to report the error on the wire.
+        """
+
+        recognizer = self.speech
+        if recognizer is None or not hasattr(recognizer, "transcribe_pcm"):
+            return None
+        try:
+            text = recognizer.transcribe_pcm(
+                self.session.device_id,
+                data,
+                sample_rate=int(transaction.get("sample_rate") or 16000),
+                channels=int(transaction.get("channels") or 1),
+                bits=int(transaction.get("bits") or 16),
+            )
         except Exception:
-            return self._error(tx_id, "INTERNAL")
-        if not isinstance(response, dict) or not response.get("ok"):
-            return self._error(tx_id, "INVALID_STATE")
-        return self._result(tx_id, 0x0005, self._result_fields(response.get("result")))
+            return None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        return text.strip()

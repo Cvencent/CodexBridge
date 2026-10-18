@@ -35,6 +35,9 @@ from codexbridge.cbdp.constants import (
     TAG_TRANSPORT_SECURITY,
     TAG_VERSION_MINOR,
     TYPE_AUTH,
+    TYPE_AUDIO_BEGIN,
+    TYPE_AUDIO_CHUNK,
+    TYPE_AUDIO_END,
     TYPE_AUTH_OK,
     TYPE_COMMAND,
     TYPE_HELLO,
@@ -71,6 +74,14 @@ class FakeDispatcher:
 
     def execute(self, device_id, capabilities, request):
         self.calls.append((device_id, set(capabilities), dict(request)))
+        if request.get("method") == "turn.start" and not request.get("params", {}).get("thread_id"):
+            return {
+                "type": "command_result",
+                "request_id": request["request_id"],
+                "method": request["method"],
+                "ok": False,
+                "error": "thread_required",
+            }
         return {
             "type": "command_result",
             "request_id": request["request_id"],
@@ -90,6 +101,7 @@ class CbdpGatewayTests(unittest.TestCase):
         self.gateway = CbdpGateway(
             references=self.refs,
             commands=self.dispatcher,
+            active_thread=lambda device_id: "thread-1",
             pairing_token=lambda device_id: "0123456789abcdef0123456789abcdef",
             capability_policy=lambda device_id: {
                 "status",
@@ -331,6 +343,85 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertEqual(self.sent[-1].message_type, TYPE_ERROR)
         self.assertEqual(self.sent[-1].code, 0x000E)
 
+    def test_audio_transaction_is_transcribed_and_submitted(self):
+        class Recognizer:
+            def transcribe_pcm(self, device_id, data, **kwargs):
+                assert data == b"\x01\x02" * 8
+                return "open the build"
+
+        self.gateway.speech = Recognizer()
+        self.gateway.capability_policy = lambda device_id: {"status", "audio", "control"}
+        self.gateway.active_thread = lambda device_id: "thread-9"
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["audio"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_BEGIN,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(3), 0x0075: u32(16000), 0x0076: u8(1), 0x0077: u8(16)},
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_CHUNK,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(3), 0x0048: u32(0)},
+                payload=b"\x01\x02" * 8,
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_END,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(3)},
+            )
+        )
+        self.assertEqual(self.dispatcher.calls[-1][2]["method"], "turn.start")
+        self.assertEqual(
+            self.dispatcher.calls[-1][2]["params"]["text"], "open the build"
+        )
+        self.assertTrue(
+            any(item.message_type == TYPE_RESULT for item in self.sent)
+        )
+
+    def test_deferred_cbdp_work_runs_off_the_reader_and_updates_state(self):
+        deferred = []
+
+        def defer(device_id, callback):
+            deferred.append((device_id, callback))
+
+        self.gateway.defer = defer
+        self.gateway.active_thread = lambda device_id: "thread-1"
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        command = Frame(
+            message_type=TYPE_COMMAND,
+            flags=FLAG_REQUEST,
+            header={
+                TAG_REQUEST_ID: u32(9),
+                TAG_METHOD_ID: u16(1),
+                TAG_PARAMS: encode_tlvs([]),
+            },
+        )
+        self.gateway.handle_frame(command)
+        self.assertEqual(self.dispatcher.calls, [])
+        self.assertEqual(len(deferred), 1)
+        deferred[0][1]()
+        self.assertEqual(self.dispatcher.calls[-1][0], "dev-1")
+        self.assertEqual(self.sent[-1].message_type, TYPE_RESULT)
+
     def test_queue_update_uses_existing_queue_edit_dispatcher(self):
         self.gateway.handle_frame(self.hello())
         session = self.gateway.session
@@ -397,6 +488,41 @@ class CbdpGatewayTests(unittest.TestCase):
         )
         self.assertEqual(self.dispatcher.calls[-1][2]["method"], "turn.start")
         self.assertEqual(self.dispatcher.calls[-1][2]["params"]["text"], "你好")
+        self.assertEqual(self.dispatcher.calls[-1][2]["params"]["thread_id"], "thread-1")
+
+    def test_send_end_reports_an_error_when_no_thread_is_selected(self):
+        self.gateway.active_thread = lambda device_id: ""
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_SEND_BEGIN,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(7), 0x002B: b"i" * 16, 0x0070: u8(0)},
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_SEND_CHUNK,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(7), 0x0048: u32(0)},
+                payload="hello".encode(),
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_SEND_END,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(7)},
+            )
+        )
+        self.assertEqual(self.sent[-1].message_type, TYPE_ERROR)
+        self.assertEqual(self.sent[-1].header[TAG_REQUEST_ID], u32(7))
 
     def test_subscribe_and_ack_update_cursor(self):
         event = self.gateway.event_spine.append(0x10000001, 0x0101, QOS_STATE, {})
