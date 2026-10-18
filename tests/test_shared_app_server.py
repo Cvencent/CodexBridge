@@ -9,6 +9,23 @@ from codexbridge.codex.app_server import AppServerClient, CodexAppServerSource
 
 
 class SharedServerTests(unittest.TestCase):
+    def test_identical_read_requests_are_coalesced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            client = AppServerClient(["codex"], Path(folder))
+            calls = []
+
+            def send(message):
+                calls.append(message)
+                client._pending[message["id"]].put({"result": {"sequence": 1}})
+
+            with patch.object(client, "_send", side_effect=send):
+                first = client.request("thread/read", {"threadId": "t1"})
+                second = client.request("thread/read", {"threadId": "t1"})
+
+        self.assertEqual(first, {"sequence": 1})
+        self.assertEqual(second, {"sequence": 1})
+        self.assertEqual(len(calls), 1)
+
     def test_injected_shared_client_is_not_closed_by_source(self):
         with tempfile.TemporaryDirectory() as folder:
             client = Mock()

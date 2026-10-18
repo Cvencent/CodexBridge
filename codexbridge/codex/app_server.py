@@ -181,6 +181,17 @@ def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[s
 
 
 class AppServerClient:
+    READ_CACHE_SECONDS = 10.0
+    READ_CACHE_METHODS = frozenset({
+        "account/read",
+        "account/rateLimits/read",
+        "account/usage/read",
+        "model/list",
+        "project/list",
+        "thread/list",
+        "thread/read",
+    })
+
     def __init__(self, command: list[str], cwd: Path, timeout: float = 15.0,
                  prefer_shared: bool = False) -> None:
         self.command = command
@@ -196,6 +207,8 @@ class AppServerClient:
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self._read_cache_lock = threading.Lock()
+        self._read_cache: dict[str, tuple[float, Any]] = {}
         self.notifications: queue.Queue[dict[str, Any]] = queue.Queue()
         # Server-initiated requests (approval prompts and tool questions).
         # Only clients that explicitly consume this queue need them; the rest
@@ -314,8 +327,42 @@ class AppServerClient:
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._send({"method": method, "params": params})
 
+    @staticmethod
+    def _read_cache_key(method: str, params: dict[str, Any] | None) -> str:
+        return method + "|" + json.dumps(
+            params or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _cached_read(self, key: str) -> tuple[bool, Any]:
+        now = time.monotonic()
+        with self._read_cache_lock:
+            entry = self._read_cache.get(key)
+            if entry is None or now >= entry[0]:
+                if entry is not None:
+                    self._read_cache.pop(key, None)
+                return False, None
+            return True, entry[1]
+
+    def _clear_read_cache(self) -> None:
+        with self._read_cache_lock:
+            self._read_cache.clear()
+
     def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        cacheable = method in self.READ_CACHE_METHODS
+        cache_key = self._read_cache_key(method, params) if cacheable else ""
+        if cacheable:
+            hit, value = self._cached_read(cache_key)
+            if hit:
+                return value
         with self._request_lock:
+            if cacheable:
+                hit, value = self._cached_read(cache_key)
+                if hit:
+                    return value
             request_id = self._next_id
             self._next_id += 1
             target: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
@@ -336,7 +383,16 @@ class AppServerClient:
                         detail = detail.get("message", detail)
                     raise AppServerProtocolError(
                         f"App Server 请求失败 {method}：{detail}")
-                return response.get("result")
+                result = response.get("result")
+                if cacheable:
+                    with self._read_cache_lock:
+                        self._read_cache[cache_key] = (
+                            time.monotonic() + self.READ_CACHE_SECONDS,
+                            result,
+                        )
+                elif method not in {"initialize"}:
+                    self._clear_read_cache()
+                return result
             finally:
                 with self._pending_lock:
                     self._pending.pop(request_id, None)
@@ -344,8 +400,10 @@ class AppServerClient:
     def respond(self, request_id: int, result: Any) -> None:
         """Answer a server-initiated request such as an approval prompt."""
         self._send({"id": request_id, "result": result})
+        self._clear_read_cache()
 
     def close(self) -> None:
+        self._clear_read_cache()
         process = self.process
         self.process = None
         if process is None:
