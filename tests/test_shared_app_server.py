@@ -1,13 +1,26 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from codexbridge import VERSION
-from codexbridge.codex.app_server import AppServerClient
+from codexbridge.codex.app_server import AppServerClient, CodexAppServerSource
 
 
 class SharedServerTests(unittest.TestCase):
+    def test_injected_shared_client_is_not_closed_by_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            client = Mock()
+            source = CodexAppServerSource(
+                Path(folder),
+                Path(folder),
+                client=client,
+                owns_client=False,
+            )
+            source.close()
+            client.close.assert_not_called()
+
     def test_app_server_identity_matches_desktop_for_hydration(self):
         with tempfile.TemporaryDirectory() as folder:
             client = AppServerClient(["codex"], Path(folder))
@@ -51,6 +64,18 @@ class SharedServerTests(unittest.TestCase):
                     patch.object(client, "notify"):
                 client.start()
             self.assertEqual(spawn.call_args.args[0], ["codex", "app-server", "--listen", "stdio://"])
+
+    def test_app_server_runs_below_normal_priority_on_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            client = AppServerClient(["codex"], Path(folder))
+            with patch.object(client, "_desktop_socket", return_value=None), \
+                    patch("subprocess.Popen", return_value=Mock()) as spawn, \
+                    patch("threading.Thread"), patch.object(client, "request"), \
+                    patch.object(client, "notify"):
+                client.start()
+            flags = spawn.call_args.kwargs["creationflags"]
+            self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+            self.assertTrue(flags & subprocess.BELOW_NORMAL_PRIORITY_CLASS)
     def test_connection_status_explains_when_desktop_realtime_is_unavailable(self):
         with tempfile.TemporaryDirectory() as folder:
             client = AppServerClient(["codex"], Path(folder), prefer_shared=True)

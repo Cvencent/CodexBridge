@@ -9,7 +9,12 @@ import time
 from pathlib import Path
 
 from codexbridge.admin_api import AdminApi
-from codexbridge.codex.app_server import AppServerClient, AppServerError, _resolve_codex_command
+from codexbridge.codex.app_server import (
+    AppServerClient,
+    AppServerError,
+    CodexAppServerSource,
+    _resolve_codex_command,
+)
 from codexbridge.codex.catalog import CodexCatalogService
 from codexbridge.codex.collector import records_from_snapshot, run_codex_collector
 from codexbridge.devices.discovery import (
@@ -142,12 +147,24 @@ class _CodexSourceHolder:
         self._fallback_command = None
         self._fallback_cwd = None
         self._fallback_runtime = None
+        self._fallback_client = None
+        self._owns_fallback_client = True
 
-    def configure(self, command: str | None, cwd: Path, runtime_folder: Path) -> None:
+    def configure(
+        self,
+        command: str | None,
+        cwd: Path,
+        runtime_folder: Path,
+        *,
+        fallback_client=None,
+        owns_fallback: bool = True,
+    ) -> None:
         with self._lock:
             self._fallback_command = command
             self._fallback_cwd = cwd
             self._fallback_runtime = runtime_folder
+            self._fallback_client = fallback_client
+            self._owns_fallback_client = bool(owns_fallback)
 
     def set(self, source) -> None:
         with self._lock:
@@ -163,10 +180,8 @@ class _CodexSourceHolder:
     def request(self, method: str, params: dict) -> object:
         with self._lock:
             source = self._source
-            if source is not None:
-                return source.client.request(method, params)
-            fallback = self._fallback
-            if fallback is None:
+            fallback = self._fallback or self._fallback_client
+            if source is None and fallback is None:
                 if self._fallback_cwd is None:
                     raise AppServerError("Codex App Server 尚未连接")
                 command = _resolve_codex_command(
@@ -176,16 +191,25 @@ class _CodexSourceHolder:
                 fallback = AppServerClient(command, self._fallback_cwd)
                 fallback.start()
                 self._fallback = fallback
-            return fallback.request(method, params)
+        if source is not None:
+            return source.client.request(method, params)
+        assert fallback is not None
+        if fallback is not self._fallback:
+            fallback.start()
+        return fallback.request(method, params)
 
     def close(self) -> None:
         with self._lock:
             primary = self._source
             fallback = self._fallback
+            fallback_client = self._fallback_client if self._owns_fallback_client else None
             self._source = None
             self._fallback = None
+            self._fallback_client = None
         if fallback is not None:
             fallback.close()
+        if fallback_client is not None:
+            fallback_client.close()
         if primary is not None and hasattr(primary, "close"):
             primary.close()
 
@@ -381,7 +405,17 @@ def main(argv: list[str] | None = None) -> int:
     source_holder = _CodexSourceHolder()
     codex_cwd = _codex_working_directory()
     codex_command = os.environ.get("CODEXBRIDGE_CODEX_COMMAND")
-    source_holder.configure(codex_command, codex_cwd, data_dir)
+    shared_app_server = AppServerClient(
+        _resolve_codex_command(codex_command, data_dir),
+        codex_cwd,
+    )
+    source_holder.configure(
+        codex_command,
+        codex_cwd,
+        data_dir,
+        fallback_client=shared_app_server,
+        owns_fallback=False,
+    )
     codex_catalog = CodexCatalogService(
         source_holder.request,
         workspace=codex_cwd,
@@ -437,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         data_dir,
         codex_cwd,
         codex_command,
+        client_factory=lambda command, cwd: shared_app_server,
+        close_client_on_stop=False,
         read_state=read_state,
         show_intermediate_events=lambda: companion_store.show_intermediate_events,
     )
@@ -552,6 +588,13 @@ def main(argv: list[str] | None = None) -> int:
             "stop": codex_stop,
             "publish": publish_codex,
             "codex_command": codex_command,
+            "source_factory": lambda: CodexAppServerSource(
+                data_dir,
+                codex_cwd,
+                codex_command,
+                client=shared_app_server,
+                owns_client=False,
+            ),
             "report": codex_state.report,
             "enabled": lambda: codex_state.snapshot()["enabled"],
             "on_source": source_holder.set,
@@ -618,6 +661,7 @@ def main(argv: list[str] | None = None) -> int:
         # Close the fallback client only after the collector has stopped using
         # the source holder; closing it first can race an in-flight request.
         source_holder.close()
+        shared_app_server.close()
         projection.close()
         event_spine.close()
         references.close()

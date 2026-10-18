@@ -406,11 +406,13 @@ class CompanionService:
         sessions_root: Path | None = None,
         read_state: ReadStateStore | None = None,
         show_intermediate_events: bool | Callable[[], bool] = False,
+        close_client_on_stop: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
         self.codex_command = codex_command
         self._client_factory = client_factory
+        self._close_client_on_stop = bool(close_client_on_stop)
         self._creation_client_factory = self._make_client if client_factory is None else None
         self._desktop = None
         self._desktop_followed: dict[str, str] = {}
@@ -600,7 +602,7 @@ class CompanionService:
         with self._resumed_lock:
             self._resumed_threads.clear()
             self._locked_threads.clear()
-        if client is not None:
+        if client is not None and self._close_client_on_stop:
             try:
                 client.close()
             except Exception:  # noqa: BLE001

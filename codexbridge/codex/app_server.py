@@ -219,7 +219,9 @@ class AppServerClient:
 
     def start(self) -> None:
         if self.process is not None:
-            return
+            if self.process.poll() is None:
+                return
+            self.close()
         endpoint = self._desktop_socket() if self.prefer_shared else None
         self.shared = endpoint is not None
         self.transport = "proxy" if self.shared else "stdio"
@@ -240,7 +242,12 @@ class AppServerClient:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                    if os.name == "nt"
+                    else 0
+                ),
             )
         except OSError as error:
             raise AppServerError(f"无法启动 Codex app-server：{error}") from error
@@ -778,6 +785,8 @@ class CodexAppServerSource:
         cwd: Path,
         codex_command: str | None = None,
         activity: RolloutActivity | None = None,
+        client: AppServerClient | None = None,
+        owns_client: bool = True,
     ) -> None:
         self.runtime_folder = runtime_folder
         self.cwd = cwd
@@ -787,7 +796,8 @@ class CodexAppServerSource:
         # looks finished to a device no matter how much work it is doing.
         self.activity = activity or RolloutActivity()
         self.command = _resolve_codex_command(codex_command, runtime_folder)
-        self.client = AppServerClient(self.command, cwd)
+        self.client = client or AppServerClient(self.command, cwd)
+        self._owns_client = bool(owns_client)
         self.account: dict[str, Any] = account_snapshot({}, {})
         self.task: dict[str, Any] = thread_snapshot(None)
         self.tasks: list[dict[str, Any]] = [self.task]
@@ -1054,5 +1064,6 @@ class CodexAppServerSource:
         }
 
     def close(self) -> None:
-        self.client.close()
+        if self._owns_client:
+            self.client.close()
 

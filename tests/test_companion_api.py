@@ -17,6 +17,14 @@ from tests.test_companion_service import FakeClient, thread_detail, thread_row
 
 
 class CompanionApiTests(unittest.TestCase):
+    def test_json_response_closes_the_http_connection(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request("GET", "/api/companion/ping")
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("Connection"), "close")
+        connection.close()
+
     def test_sse_does_not_keep_old_capabilities_after_negotiation(self):
         code = self.store.pairing_code()['code']
         _, paired = self.request('POST', '/api/companion/pair', {'code': code})

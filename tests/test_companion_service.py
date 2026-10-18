@@ -44,6 +44,22 @@ class FakeClient:
         self.responses_sent.append((request_id, result))
 
 
+class SharedClientLifecycleTests(unittest.TestCase):
+    def test_stopping_companion_does_not_close_a_shared_client(self):
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as temp:
+            service = CompanionService(
+                data_dir=Path(temp),
+                cwd=Path(temp),
+                client_factory=lambda command, cwd: client,
+                close_client_on_stop=False,
+            )
+            service.start()
+            service.stop()
+        self.assertTrue(client.started)
+        self.assertFalse(client.closed)
+
+
 def thread_row(thread_id: str = "t1", **overrides):
     row = {
         "id": thread_id,

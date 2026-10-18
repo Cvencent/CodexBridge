@@ -130,6 +130,36 @@ class CodexSourceHolderTest(unittest.TestCase):
         )
         self.assertEqual(client.calls, [("project/list", {"limit": 100})])
 
+    def test_holder_reuses_a_shared_fallback_client(self):
+        class Client:
+            def __init__(self):
+                self.started = 0
+                self.calls = []
+
+            def start(self):
+                self.started += 1
+
+            def request(self, method, params=None):
+                self.calls.append((method, params))
+                return {"source": "shared"}
+
+            def close(self):
+                pass
+
+        holder = _CodexSourceHolder()
+        client = Client()
+        holder.configure(
+            None,
+            Path("D:/work"),
+            Path("D:/data"),
+            fallback_client=client,
+            owns_fallback=False,
+        )
+
+        self.assertEqual(holder.request("project/list", {"limit": 100}), {"source": "shared"})
+        self.assertEqual(client.started, 1)
+        self.assertEqual(client.calls, [("project/list", {"limit": 100})])
+
 
 
 class UnifiedDeviceAdminTest(unittest.TestCase):
