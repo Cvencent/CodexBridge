@@ -101,14 +101,14 @@ or set `CODEXBRIDGE_VOSK_MODEL` to the model directory.
 Download the Windows installer from the GitHub Releases page:
 
 ```text
-CodexBridge-Setup-2.0.5-win64.exe
+CodexBridge-Setup-2.1.0-win64.exe
 ```
 
 A portable ZIP contains the same single `CodexBridge.exe`. The release pipeline
 is defined in `.github/workflows/release-windows.yml`; local builds use:
 
 ```powershell
-./packaging/build_windows.ps1 -Version 2.0.5
+./packaging/build_windows.ps1 -Version 2.1.0
 ```
 
 `CodexBridge.exe` stays in the system tray and only handles the Codex side:
