@@ -1793,6 +1793,12 @@ coalesced_count
 重复订阅相同键时，Bridge 必须幂等处理并返回当前 cursor。超出
 `max_subscriptions` 时返回 `BUSY`。
 
+省略 `cursor` 等价于 `cursor = 0`，即从该 topic 的历史起点回放全部事件。
+只想接收新事件的客户端必须先拿到当前 cursor 再订阅，不能依赖“省略即只推新
+事件”。回放可能包含上百条 `DELTA`，Bridge 必须在设备工作线程里发送回放，
+不得阻塞该设备的 socket 读取循环；否则正在进行的 `AUDIO_*` / `SEND_*` 上行
+会因接收窗口不排空而失败。
+
 `SUBSCRIBE` 必须支持原子“快照加增量”切换。Bridge 处理流程：
 
 ```text
@@ -2848,6 +2854,11 @@ idem = first_16_bytes(SHA-256(device_id || request_id || method_id || canonical_
 6. 客户端重试 MUST 复用首次请求的 `idem` 和原始方法参数；参数规范化规则见
    6.1.3。Bridge 在返回 `IDEMPOTENCY_CONFLICT` 前不得执行任何副作用。
 
+幂等键固定为 `(device_id, idem)`，**不是** `request_id`。`request_id` 只要求
+同一连接内唯一，设备重启后会从 1 重新计数；若用 `request_id` 做键，设备重启后
+重放同一条命令就会与自己的历史记录冲突。Bridge 实现必须按 `idem` 查表，并在
+`idem` 缺失时才退回 `request_id`（用于旧客户端兼容）。
+
 ### 17.5 writer lease 与显式接管
 
 线程所有权状态：
@@ -3175,6 +3186,18 @@ duration_ms
 
 可选字段：`thread_ref`、`thread_id`、`use_active_thread`、`total_bytes`、
 `client_timestamp_ms` 和 `transcript`。
+
+线程选择器规则（2026-10-19 实现澄清）：
+
+- `AUDIO_BEGIN` / `SEND_BEGIN` **不要求**先执行 `thread.claim`。`thread.claim`
+  管理的是 writer lease（谁可以写入），文本/音频上行只要求能解析出一个线程选择器：
+  `thread_id` 优先于 `thread_ref`，两者都缺省时才用 `use_active_thread` 或
+  Bridge 当前选中的会话。
+- `thread_ref` 必须在 `BEGIN` 时就解析成功。解析不到返回
+  `ERROR(NOT_FOUND, "thread_ref")`，不得静默忽略后等到 `END` 才失败，也不得
+  报成 `UNSUPPORTED_FEATURE`。
+- 没有可用线程时，`END` 返回 `ERROR(INVALID_STATE, "NO_ACTIVE_THREAD")`；
+  这不是能力缺失，客户端不应据此关闭 `audio` 能力。
 
 ### 19.2 codec 编号
 

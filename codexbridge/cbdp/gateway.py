@@ -42,6 +42,7 @@ from codexbridge.cbdp.constants import (
     TAG_PROFILE,
     TAG_QUEUE_DEPTH,
     TAG_REQUEST_ID,
+    TAG_IDEM,
     TAG_THREAD_ID,
     TAG_THREAD_REF,
     TAG_MESSAGE_ID,
@@ -638,6 +639,16 @@ class CbdpGateway:
             # A new connection restarts both directions at seq 1.
             self._incoming_seq = 0
         self._track_incoming(frame)
+        try:
+            return self._dispatch_frame(frame)
+        except CBDPError as error:
+            return self._error(self._request_id(frame), error.name)
+        except Exception:
+            # One malformed or unexpected frame must never kill the socket
+            # reader: the device would see a connection reset with no reason.
+            return self._error(self._request_id(frame), "INTERNAL")
+
+    def _dispatch_frame(self, frame):
         session = self.session
         if frame.message_type == TYPE_HELLO:
             return self._handle_hello(frame)
@@ -888,28 +899,41 @@ class CbdpGateway:
             )
         except (SubscriptionLimitError, ValueError):
             return self._error(request_id, "BUSY")
-        if not result.recoverable:
-            self._emit(
-                Frame(
-                    message_type=TYPE_RESYNC,
-                    flags=0x0400,
-                    topic_id=int(topic_id),
-                    seq=self._next_seq(),
-                    header={
-                        TAG_RESYNC_REASON: u8(1),
-                        TAG_REQUEST_ID: u32(request_id),
-                        TAG_TOPIC_ID: u32(topic_id),
-                        TAG_SCOPE: u8(scope),
-                    },
+        generation = int(self.session.generation)
+
+        def replay():
+            # A long thread history can be hundreds of DELTA frames. Emitting
+            # them from the socket reader blocked it until the peer drained
+            # its receive window, so an in-flight AUDIO_* upload hit EAGAIN
+            # and the device eventually reset the connection. Replay runs on
+            # the per-device worker, which keeps the reader draining.
+            if not result.recoverable:
+                self._emit(
+                    Frame(
+                        message_type=TYPE_RESYNC,
+                        flags=0x0400,
+                        topic_id=int(topic_id),
+                        seq=self._next_seq(),
+                        header={
+                            TAG_RESYNC_REASON: u8(1),
+                            TAG_REQUEST_ID: u32(request_id),
+                            TAG_TOPIC_ID: u32(topic_id),
+                            TAG_SCOPE: u8(scope),
+                        },
+                    )
                 )
-            )
-        for event in result.replay:
-            self._emit(self._delta_frame(event))
-        return self._result(request_id, 0, {
-            TAG_TOPIC_ID: u32(topic_id),
-            TAG_SCOPE: u8(scope),
-            TAG_CURSOR: u64(result.cursor),
-        })
+            for event in result.replay:
+                self._emit(self._delta_frame(event))
+            self._result(request_id, 0, {
+                TAG_TOPIC_ID: u32(topic_id),
+                TAG_SCOPE: u8(scope),
+                TAG_CURSOR: u64(result.cursor),
+            })
+
+        if self._maybe_defer(generation, replay):
+            return None
+        replay()
+        return None
 
     def _handle_unsubscribe(self, frame):
         try:
@@ -998,6 +1022,9 @@ class CbdpGateway:
             "request_id": f"cbdp:{device_id}:{request_id}",
             "method": DISPATCH_METHODS.get(method, method),
             "params": normalized,
+            # Protocol 17.4 keys idempotency on (device_id, idem); request_id
+            # is only unique inside one connection.
+            "idem": bytes(frame.header.get(TAG_IDEM, b"")),
         }
         capabilities = self._capabilities()
         generation = int(self.session.generation)
@@ -1802,44 +1829,57 @@ class CbdpGateway:
         return None
 
     def _handle_audio_begin(self, frame):
-        if "audio" not in self._capabilities():
-            return self._error(self._request_id(frame), "CAPABILITY_NOT_ENABLED")
         try:
             tx_id = decode_u32(require_tlv(frame.header, 0x002D))
-            request_id = tx_id
+        except CBDPError as error:
+            return self._error(0, error.name)
+        if "audio" not in self._capabilities():
+            return self._error(tx_id, "CAPABILITY_NOT_ENABLED")
+        try:
             sample_rate = decode_u32(frame.header.get(TAG_SAMPLE_RATE, u32(16000)))
             channels = decode_u8(frame.header.get(TAG_CHANNELS, u8(1)))
             bits = decode_u8(frame.header.get(TAG_BITS_PER_SAMPLE, u8(16)))
+            thread_ref = (
+                decode_u32(frame.header[TAG_THREAD_REF])
+                if TAG_THREAD_REF in frame.header
+                else 0
+            )
+            thread_id = (
+                decode_utf8(frame.header[TAG_THREAD_ID])
+                if TAG_THREAD_ID in frame.header
+                else ""
+            )
+            use_active_thread = bool(
+                decode_u8(frame.header[TAG_USE_ACTIVE_THREAD])
+                if TAG_USE_ACTIVE_THREAD in frame.header
+                else 0
+            )
+            total_bytes = (
+                decode_u32(frame.header[TAG_TOTAL_BYTES])
+                if TAG_TOTAL_BYTES in frame.header
+                else 0
+            )
         except CBDPError as error:
-            return self._error(self._request_id(frame), error.name)
+            return self._error(tx_id, error.name)
+        if thread_ref:
+            # Resolve the compact ref at BEGIN so a stale ref is reported here
+            # instead of surfacing as a vague failure after the whole upload.
+            resolved = self._thread_from_ref(int(thread_ref))
+            if not resolved:
+                return self._error(tx_id, "NOT_FOUND", "thread_ref")
+            thread_id = resolved
         if not self._begin_transaction(tx_id, frame):
-            return self._error(request_id, "IDEMPOTENCY_CONFLICT")
+            return self._error(tx_id, "IDEMPOTENCY_CONFLICT")
         self._transactions[tx_id] = {
             "kind": "audio",
             "parts": {},
             "bytes": 0,
             "idem": bytes(frame.header.get(0x002B, b"")),
-            "total_bytes": (
-                decode_u32(frame.header[TAG_TOTAL_BYTES])
-                if TAG_TOTAL_BYTES in frame.header
-                else 0
-            ),
+            "total_bytes": total_bytes,
             "sha256": frame.header.get(TAG_SHA256, b""),
-            "thread_ref": (
-                decode_u32(frame.header[TAG_THREAD_REF])
-                if TAG_THREAD_REF in frame.header
-                else 0
-            ),
-            "thread_id": (
-                decode_utf8(frame.header[TAG_THREAD_ID])
-                if TAG_THREAD_ID in frame.header
-                else ""
-            ),
-            "use_active_thread": bool(
-                decode_u8(frame.header[TAG_USE_ACTIVE_THREAD])
-                if TAG_USE_ACTIVE_THREAD in frame.header
-                else 0
-            ),
+            "thread_ref": int(thread_ref),
+            "thread_id": thread_id,
+            "use_active_thread": use_active_thread,
             "sample_rate": int(sample_rate),
             "channels": int(channels),
             "bits": int(bits),

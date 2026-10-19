@@ -176,6 +176,40 @@ class DeviceCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(CommandError, 'request_id_conflict'):
             self.commands.execute('device-a', {'control'}, changed)
 
+    def test_idempotency_keys_on_idem_not_request_id(self):
+        # A device restarts its request_id counter at 1 on every connection.
+        # Keying on request_id made the new session collide with its own 24h
+        # history; protocol 17.4 keys on (device_id, idem).
+        first = self.commands.execute('device-a', {'control'}, {
+            'request_id': 'r1', 'method': 'turn.start',
+            'params': {'thread_id': 't1', 'text': 'continue'},
+            'idem': b'1' * 16,
+        })
+        again = self.commands.execute('device-a', {'control'}, {
+            'request_id': 'r1', 'method': 'turn.start',
+            'params': {'thread_id': 't1', 'text': 'continue'},
+            'idem': b'1' * 16,
+        })
+        self.assertEqual(first, again)
+        self.assertEqual(len(self.service.calls), 1)
+
+        # Same request_id after a restart, but a fresh idem, must execute.
+        fresh = self.commands.execute('device-a', {'control'}, {
+            'request_id': 'r1', 'method': 'turn.start',
+            'params': {'thread_id': 't1', 'text': 'continue'},
+            'idem': b'2' * 16,
+        })
+        self.assertTrue(fresh['ok'])
+        self.assertEqual(len(self.service.calls), 2)
+
+        # Reusing one idem with different parameters is still a conflict.
+        with self.assertRaisesRegex(CommandError, 'request_id_conflict'):
+            self.commands.execute('device-a', {'control'}, {
+                'request_id': 'r2', 'method': 'turn.start',
+                'params': {'thread_id': 't1', 'text': 'different'},
+                'idem': b'1' * 16,
+            })
+
     def test_permission_is_checked_even_for_cached_result(self):
         request = {'request_id': 'r1', 'method': 'turn.start',
                    'params': {'thread_id': 't1', 'text': 'continue'}}

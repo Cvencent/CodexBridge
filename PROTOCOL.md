@@ -28,6 +28,10 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - `AUDIO_END` 现在会把 STT 的真实失败原因写入 `error_message(0x0062)`，并在 `error_detail(0x0063)` 标记 `reason = STT_UNAVAILABLE`；协议错误码仍是 `UPSTREAM_UNAVAILABLE`，设备因此可以区分识别上游故障与音频参数错误。
 - `RESULT` / `ERROR` 现在分配非零递增 `seq`，并在固定头 `ack_seq` 里 piggyback 已连续收到的设备序号。之前它们发 `seq = 0`，而 §13.1 只豁免 PING/PONG/ACK/CLOSE 和发现消息，属于实现缺陷。
 - `active_state.read` / `active_state.set` 现已实现：读取当前设备的活动线程/turn，设置时把设备上报的活动线程记录进 Hub。二者都要求 `cross_device_active` 能力；未选中线程时 `read` 返回全 0，引用无法解析时 `set` 返回 `NOT_FOUND`。`events.since` 与 `resume.*` 仍为 `[本轮不实现]`。
+- 幂等键固定为 `(device_id, idem)`，不再使用 `request_id`。`request_id` 只在单条连接内唯一，设备重启后从 1 重新计数，用它做键会让新会话与自己的 24 小时历史冲突。
+- `SUBSCRIBE` 省略 `cursor` 等价于 `cursor = 0`（从历史起点回放）。回放改由每设备工作线程发送，socket 读取循环在回放期间继续排空设备上行，避免录音被截断。
+- `AUDIO_BEGIN` / `SEND_BEGIN` 不要求先 `thread.claim`；writer lease 与上行选线程无关。`thread_ref` 在 `BEGIN` 时解析，解析失败返回 `NOT_FOUND`，不会再落成 `UNSUPPORTED_FEATURE`。
+- CBDP 会话对未预期异常返回 `ERROR(INTERNAL)` 并保持连接，不再因单帧异常断开。
 
 ## 1. 范围与角色
 

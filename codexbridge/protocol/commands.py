@@ -88,7 +88,14 @@ class CommandDispatcher:
             if field in required and isinstance(value, str) and not value.strip():
                 raise CommandError('invalid_params')
         fingerprint = json.dumps([method, params], sort_keys=True, ensure_ascii=True)
-        key = (device_id, request_id)
+        # Protocol 17.4 keys idempotency on (device_id, idem). request_id is
+        # only unique per connection, so keying on it made a device collide
+        # with its own 24h history after every restart.
+        idem = request.get('idem')
+        if isinstance(idem, (bytes, bytearray)) and len(idem) == 16:
+            key = (device_id, bytes(idem).hex())
+        else:
+            key = (device_id, request_id)
         # Serialize dispatch and cache admission, including concurrent retries.
         with self._lock:
             cached = self._cache.get(key)

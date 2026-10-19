@@ -31,6 +31,7 @@ from codexbridge.cbdp.constants import (
     TAG_OBJECT_COUNT,
     TAG_NEXT_CURSOR,
     TAG_THREAD_REF,
+    TAG_USE_ACTIVE_THREAD,
     TAG_TOPIC_ID,
     TAG_STATUS,
     TAG_ONLINE,
@@ -1562,6 +1563,66 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertEqual(result.message_type, TYPE_RESULT)
         fields = decode_tlvs(encode_tlvs(result.header.items()))
         self.assertEqual(fields[0x0033], u64(second.global_seq))
+
+    def test_subscribe_replay_is_deferred_off_the_reader_thread(self):
+        # A long thread history can be hundreds of DELTAs. Emitting them from
+        # the socket reader stalls it until the peer drains its window, which
+        # truncated an in-flight AUDIO_* upload.
+        self.gateway.event_spine.append(0x10000001, 0x0101, QOS_STATE, {})
+        deferred = []
+        self.gateway.defer = lambda device_id, callback: deferred.append(callback)
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        before = len(self.sent)
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_SUBSCRIBE,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(61),
+                    0x0030: u32(0x10000001),
+                    0x0031: u8(2),
+                    0x0032: u8(QOS_STATE),
+                },
+            )
+        )
+        self.assertEqual(len(self.sent), before)
+        self.assertEqual(len(deferred), 1)
+        deferred[0]()
+        self.assertTrue(any(frame.message_type == 0x0A for frame in self.sent[before:]))
+        self.assertEqual(self.sent[-1].message_type, TYPE_RESULT)
+
+    def test_audio_begin_reports_unknown_thread_ref_instead_of_dropping(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "audio"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["audio"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_BEGIN,
+                flags=FLAG_REQUEST,
+                header={
+                    0x002D: u32(77),
+                    TAG_THREAD_REF: u32(999999),
+                    TAG_USE_ACTIVE_THREAD: u8(1),
+                },
+            )
+        )
+        error = self.sent[-1]
+        self.assertEqual(error.message_type, TYPE_ERROR)
+        self.assertEqual(error.code, 0x0001)
+        self.assertNotIn(77, self.gateway._transactions)
 
     def test_subscribe_unrecoverable_cursor_emits_resync(self):
         self.gateway.handle_frame(self.hello())
