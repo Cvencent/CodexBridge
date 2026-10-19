@@ -74,6 +74,10 @@ from codexbridge.cbdp.constants import (
     TAG_MODEL_CAPABILITIES,
     TAG_MODEL_CAPABILITY_KIND,
     TAG_MODEL_CAPABILITY_VALUE,
+    TAG_ACTIVE_THREAD_REF,
+    TAG_ACTIVE_TURN_REF,
+    TAG_ACTIVE_DEVICE_REF,
+    TAG_ACTIVE_REVISION,
     TAG_SESSION_ID,
     TAG_SERVER_NONCE,
     TAG_SERVER_TIME_MS,
@@ -322,6 +326,9 @@ PARAM_TAGS = {
     "cursor": 0x0033,
     "revision": 0x0036,
     "read_at_ms": 0x0054,
+    "active_thread_ref": 0x0170,
+    "active_turn_ref": 0x0171,
+    "active_revision": 0x0173,
     "guidance_text": 0x0109,
 }
 
@@ -367,6 +374,8 @@ class CbdpGateway:
         speech=None,
         defer=None,
         active_thread=None,
+        active_state=None,
+        set_active_state=None,
         auth_mode=1,
         policy_version=1,
     ):
@@ -386,6 +395,12 @@ class CbdpGateway:
         # sent without an explicit thread_id, so the Bridge maps them to the
         # conversation the device currently selected.
         self.active_thread = active_thread
+        # Optional ``device_id -> {thread_id, turn_id, revision}`` reader and
+        # writer for active_state.read / active_state.set. Leaving them unset
+        # keeps the shared hub as the only source of truth in tests.
+        self.active_state = active_state
+        self.set_active_state = set_active_state
+        self._active_revision = 0
         self.transport_allowed = transport_allowed or (
             lambda device_id: (1 << 64) - 1
         )
@@ -398,6 +413,9 @@ class CbdpGateway:
         self._generation = 0
         self._send = None
         self._outgoing_seq = 0
+        # Highest device_seq accepted without a gap. Responses piggyback it in
+        # the fixed header so the peer can clear its retransmit window.
+        self._incoming_seq = 0
         self.last_peer_error = None
         self.session_closed = False
         self._transactions: dict[bytes, dict] = {}
@@ -416,6 +434,7 @@ class CbdpGateway:
     def begin_session(self):
         with self._lock:
             self._generation += 1
+            self._outgoing_seq = 0
             self._cursor_map.clear()
             self._cursor_reverse.clear()
             self._cursor_seq = 0
@@ -508,6 +527,19 @@ class CbdpGateway:
         self._outgoing_seq = (self._outgoing_seq % 0xFFFFFFFF) + 1
         return self._outgoing_seq
 
+    def _track_incoming(self, frame) -> None:
+        """Advance the cumulative device_seq for frames that occupy one.
+
+        PING/PONG/ACK/CLOSE and discovery frames carry ``seq = 0`` by 13.1 and
+        must not move the cumulative acknowledgement.
+        """
+
+        seq = int(getattr(frame, "seq", 0) or 0)
+        if seq <= 0:
+            return
+        if seq > self._incoming_seq:
+            self._incoming_seq = seq
+
     def _delta_frame(self, event):
         header = {
             TAG_EVENT_ID: bytes(event.event_id),
@@ -592,6 +624,8 @@ class CbdpGateway:
         frame = Frame(
             message_type=TYPE_ERROR,
             flags=FLAG_RESPONSE,
+            seq=self._next_seq(),
+            ack_seq=self._incoming_seq,
             code=ERROR_CODES.get(code, ERROR_CODES["INVALID_PARAM"]),
             header=header,
         )
@@ -600,6 +634,10 @@ class CbdpGateway:
     def handle_frame(self, frame):
         if not isinstance(frame, Frame):
             raise TypeError("frame must be a Frame")
+        if frame.message_type == TYPE_HELLO:
+            # A new connection restarts both directions at seq 1.
+            self._incoming_seq = 0
+        self._track_incoming(frame)
         session = self.session
         if frame.message_type == TYPE_HELLO:
             return self._handle_hello(frame)
@@ -900,11 +938,11 @@ class CbdpGateway:
                 continue
             raw = fields[tag]
             try:
-                if name in {"expected_revision", "cursor", "revision", "message_ref", "queue_item_ref"}:
+                if name in {"expected_revision", "cursor", "revision", "message_ref", "queue_item_ref", "active_revision"}:
                     result[name] = decode_u64(raw) if len(raw) == 8 else decode_u32(raw)
                 elif name == "history_depth":
                     result[name] = decode_u16(raw)
-                elif name == "thread_ref":
+                elif name in {"thread_ref", "active_thread_ref", "active_turn_ref"}:
                     result[name] = decode_u32(raw)
                 elif name == "read_at_ms":
                     result[name] = decode_i64(raw)
@@ -941,6 +979,10 @@ class CbdpGateway:
             return self._error(request_id, error.name)
         device_id = str(self.session.device_id or "")
         params = self._restore_cursor(method, params)
+        if method == "active_state.read":
+            return self._active_state_result(request_id, device_id)
+        if method == "active_state.set":
+            return self._handle_active_state_set(request_id, device_id, params)
         try:
             normalized = self._normalize_params(method, params)
         except CBDPError as error:
@@ -1051,6 +1093,82 @@ class CbdpGateway:
                 params["message_limit"] = max(0, int(history_depth))
         return params
 
+    def _active_snapshot(self, device_id: str) -> dict:
+        """Current active thread/turn for one device.
+
+        ``active_state`` is optional so tests and embedded users can keep the
+        existing ``active_thread`` hook as the single source of truth.
+        """
+
+        snapshot: dict = {}
+        if self.active_state is not None:
+            try:
+                value = self.active_state(device_id)
+            except Exception:
+                value = None
+            if isinstance(value, dict):
+                snapshot = dict(value)
+        if not snapshot.get("thread_id") and self.active_thread is not None:
+            try:
+                snapshot["thread_id"] = str(self.active_thread(device_id) or "")
+            except Exception:
+                snapshot["thread_id"] = ""
+        snapshot.setdefault("turn_id", "")
+        snapshot.setdefault("revision", self._active_revision)
+        snapshot.setdefault("device_id", device_id)
+        return snapshot
+
+    def _active_state_fields(self, snapshot: dict) -> dict:
+        thread_ref = self._ref("thread", str(snapshot.get("thread_id") or ""))
+        turn_ref = self._ref("turn", str(snapshot.get("turn_id") or ""))
+        device_ref = self._ref(
+            "device", str(snapshot.get("device_id") or snapshot.get("thread_id") or "")
+        )
+        return {
+            TAG_ACTIVE_THREAD_REF: u32(thread_ref),
+            TAG_ACTIVE_TURN_REF: u32(turn_ref),
+            TAG_ACTIVE_DEVICE_REF: u32(device_ref),
+            TAG_ACTIVE_REVISION: u64(int(snapshot.get("revision") or 0)),
+        }
+
+    def _active_state_result(self, request_id, device_id):
+        return self._result(
+            request_id,
+            0x00B1,
+            self._active_state_fields(self._active_snapshot(device_id)),
+        )
+
+    def _handle_active_state_set(self, request_id, device_id, params):
+        thread_id = str(params.get("thread_id") or "")
+        if not thread_id:
+            ref = params.get("active_thread_ref")
+            if ref:
+                thread_id = self._thread_from_ref(int(ref))
+                if not thread_id:
+                    return self._error(request_id, "NOT_FOUND", "thread_ref")
+        if not thread_id:
+            return self._error(request_id, "INVALID_PARAM", "thread_required")
+        if self.set_active_state is None:
+            return self._error(request_id, "UNSUPPORTED_FEATURE", "active_state_unavailable")
+        turn_id = str(params.get("turn_id") or "")
+        if not turn_id:
+            ref = params.get("active_turn_ref")
+            if ref:
+                turn_id = self._turn_from_ref(int(ref))
+                if not turn_id:
+                    return self._error(request_id, "NOT_FOUND", "turn_ref")
+        try:
+            snapshot = self.set_active_state(device_id, thread_id, turn_id)
+        except Exception:
+            return self._error(request_id, "INTERNAL")
+        self._active_revision += 1
+        payload = dict(snapshot) if isinstance(snapshot, dict) else {}
+        payload.setdefault("thread_id", thread_id)
+        payload.setdefault("turn_id", turn_id)
+        payload.setdefault("device_id", device_id)
+        payload.setdefault("revision", self._active_revision)
+        return self._result(request_id, 0x00B2, self._active_state_fields(payload))
+
     def _restore_cursor(self, method, params):
         """Translate a CBDP u64 *command* cursor back to the upstream cursor."""
 
@@ -1083,6 +1201,18 @@ class CbdpGateway:
                 return str(external)
         with self._lock:
             return self._ref_external.get(("thread", ref), "")
+
+    def _turn_from_ref(self, ref: int) -> str:
+        """Resolve a CBDP turn_ref through the persistent registry."""
+
+        if not ref:
+            return ""
+        if self.references is not None:
+            try:
+                return str(self.references.external_id("turn", int(ref)) or "")
+            except Exception:
+                return ""
+        return ""
 
     def _message_from_ref(self, ref: int) -> str:
         """Resolve a CBDP message_ref through the persistent registry."""
@@ -1530,6 +1660,8 @@ class CbdpGateway:
             Frame(
                 message_type=TYPE_RESULT,
                 flags=FLAG_RESPONSE,
+                seq=self._next_seq(),
+                ack_seq=self._incoming_seq,
                 header=header,
             )
         )

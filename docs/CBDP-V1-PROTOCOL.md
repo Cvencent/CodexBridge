@@ -1606,6 +1606,17 @@ Bridge -> Device:  bridge_seq
 设备断线重连后，传输序号必须从 1 重新开始。业务恢复使用 cursor，不使用
 传输序号。
 
+Bridge 实现补充（v1.0 实现后修正，2026-10-19）：
+
+- 上述“不占用传输序号”的豁免只覆盖 `PING`、`PONG`、`ACK`、`CLOSE` 和发现消息。
+  `RESULT`、`ERROR`、`DELTA`、`WELCOME`、`AUTH_OK` 等其余帧都属于可确认帧，
+  `seq` 必须非零并逐帧递增。Bridge 早期版本给 `RESULT`/`ERROR` 发 `seq = 0`
+  是缺陷，已修正。
+- `ack_seq` 表示发送方已连续收到对方多大的 `seq`。`RESULT`/`ERROR` 可以
+  piggyback 当前累计值，用于让对端清除重传窗口；`ack_seq = 0` 只表示“尚未
+  确认任何帧”，不表示“无需确认”。协议不强制每个响应帧都带非零 `ack_seq`，
+  但发送方 SHOULD 在能确定累计值时携带。
+
 ### 13.2 累计确认
 
 `ACK.ack_seq = N` 表示：
@@ -2691,8 +2702,8 @@ project_ref, project_id, revision
 | `thread.goal.clear` | `thread_ref` / `thread_id` | `goal_ref`, `expected_revision` | `thread_ref`, `goal_status`, `revision` | `[本轮不实现]` |
 | `batch.execute` | `batch_ops` | `atomic`, `expected_revision` | `batch_op_index`, `batch_op_request_id`, `batch_op_idem` | `[本轮不实现]` |
 | `message.read.update` | `message_ref` / `message_id`, `read_at_ms` | `thread_ref` / `thread_id` | `message_ref`, `read_states` | `[本轮实现]`；`thread_id` 可从已经由对象引用解析出的 `thread_ref` 补齐，未提供时 Bridge 仍记录消息已读 |
-| `active_state.read` | 无 | `device_ref` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]` |
-| `active_state.set` | `active_thread_ref` | `active_turn_ref`, `active_revision` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]` |
+| `active_state.read` | 无 | `device_ref` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]`；Bridge 尚未选中线程时返回全 0，不报错 |
+| `active_state.set` | `active_thread_ref` | `active_turn_ref`, `active_revision` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]`；引用无法解析返回 `NOT_FOUND` |
 | `events.since` | `cursor` | `topic_id`, `event_count`, `history_depth` | `objects`, `event_count`, `next_cursor`, `has_more` | `[本轮实现]` |
 | `input.capabilities.read` | 无 | 无 | `model_capabilities`, `input_parts`, `attachment_kind` | `[本轮实现]` |
 | `content.read` | `content_ref` | `offset`, `max_bytes`, `content_kind` | `content_ref`, `content_kind`, `content_encoding`, `offset`, `next_offset`, `total_bytes`, `sha256` | `[本轮实现]` |
@@ -4292,7 +4303,7 @@ API 的行为。
 | 附件与输入部件 | `attachment`, `file_reference`, `image_input`, `audio_input` | `attachment.add/list/remove`, `attachment.upload.*` | `attachment.*` | `0x0150..0x0166` | panel/full | `[本轮实现]` |
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
-| 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `[本轮实现]` |
+| 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |
 | 工具与 item 流 | `item_stream`, `tool_events` | `command.status` | `item.*`, `tool.*`, `tool.redacted` | `0x0190..0x019B`, `0x01A8..0x01AD` | full | `[本轮实现]` |
 | 计划 | `plan` | 通过 turn 事件和 `item_stream` | `plan.updated` | `0x01A1..0x01A3` | full | `[本轮实现]` |
 | 推理摘要 | `reasoning_summary` | 通过 turn 事件和 `item_stream` | `reasoning.summary` | `0x01A0`, `0x01AC..0x01AD` | full | `[本轮实现]` |

@@ -833,6 +833,135 @@ class CbdpGatewayTests(unittest.TestCase):
         # the session.
         self.assertEqual(self.gateway._ref("not-a-kind", "x"), 0)
 
+    def test_result_and_error_carry_nonzero_seq_and_piggyback_ack(self):
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        command = Frame(
+            message_type=TYPE_COMMAND,
+            flags=FLAG_REQUEST,
+            seq=7,
+            header={
+                TAG_REQUEST_ID: u32(41),
+                TAG_METHOD_ID: u16(0x0001),
+                TAG_PARAMS: encode_tlvs([]),
+            },
+        )
+        self.gateway.handle_frame(command)
+        result = self.sent[-1]
+        self.assertEqual(result.message_type, TYPE_RESULT)
+        self.assertNotEqual(result.seq, 0)
+        self.assertEqual(result.ack_seq, 7)
+
+        self.gateway._error(42, "INVALID_PARAM")
+        error = self.sent[-1]
+        self.assertEqual(error.message_type, TYPE_ERROR)
+        self.assertNotEqual(error.seq, 0)
+        self.assertEqual(error.ack_seq, 7)
+        self.assertGreater(error.seq, result.seq)
+
+    def test_seq_zero_control_frames_do_not_move_the_ack(self):
+        hello = self.hello()
+        hello.seq = 5
+        self.gateway.handle_frame(hello)
+        self.assertEqual(self.gateway._incoming_seq, 5)
+        self.gateway.handle_frame(
+            Frame(message_type=TYPE_PING, flags=FLAG_REQUEST, seq=0, header={})
+        )
+        self.assertEqual(self.gateway._incoming_seq, 5)
+
+    def test_active_state_read_and_set_are_implemented(self):
+        self.gateway.capability_policy = lambda device_id: {
+            "status", "tasks", "cross_device_active",
+        }
+        self.gateway.active_state = lambda device_id: {
+            "thread_id": "thread-1", "turn_id": "turn-1",
+        }
+        recorded = {}
+
+        def setter(device_id, thread_id, turn_id):
+            recorded["value"] = (device_id, thread_id, turn_id)
+            return {"thread_id": thread_id, "turn_id": turn_id}
+
+        self.gateway.set_active_state = setter
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["cross_device_active"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(51),
+                    TAG_METHOD_ID: u16(0x00B1),
+                    TAG_PARAMS: encode_tlvs([]),
+                },
+            )
+        )
+        read = self.sent[-1]
+        self.assertEqual(read.message_type, TYPE_RESULT)
+        self.assertIn(0x0170, read.header)
+        self.assertIn(0x0173, read.header)
+
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(52),
+                    TAG_METHOD_ID: u16(0x00B2),
+                    TAG_PARAMS: encode_tlvs(
+                        [
+                            (0x0170, u32(self.refs.ref_for("thread", "thread-2"))),
+                            (0x0171, u32(self.refs.ref_for("turn", "turn-2"))),
+                        ]
+                    ),
+                },
+            )
+        )
+        written = self.sent[-1]
+        self.assertEqual(written.message_type, TYPE_RESULT)
+        self.assertEqual(recorded["value"][1:], ("thread-2", "turn-2"))
+
+    def test_active_state_set_returns_not_found_for_unknown_ref(self):
+        self.gateway.capability_policy = lambda device_id: {
+            "status", "tasks", "cross_device_active",
+        }
+        self.gateway.set_active_state = lambda device_id, thread_id, turn_id: {}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["cross_device_active"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(53),
+                    TAG_METHOD_ID: u16(0x00B2),
+                    TAG_PARAMS: encode_tlvs([(0x0170, u32(999999))]),
+                },
+            )
+        )
+        result = self.sent[-1]
+        self.assertEqual(result.message_type, TYPE_ERROR)
+        self.assertEqual(result.code, 0x0001)
+
     def test_status_result_projects_online_field(self):
         fields = self.gateway._result_fields(
             {

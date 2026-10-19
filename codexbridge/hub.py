@@ -359,6 +359,30 @@ class BridgeHub:
     def followed_thread(self, device_id: str) -> str:
         return self._device_thread.get(device_id, "")
 
+    def active_state(self, device_id: str) -> dict:
+        """Active thread/turn snapshot for active_state.read."""
+
+        with self._lock:
+            thread_id = self._device_thread.get(device_id, "")
+        turn_id = ""
+        if thread_id:
+            try:
+                snapshot = self._status_snapshot(device_id) or {}
+                if str(snapshot.get("thread_id") or "") == thread_id:
+                    turn_id = str(snapshot.get("turn_id") or "")
+            except Exception:
+                turn_id = ""
+        return {"thread_id": thread_id, "turn_id": turn_id}
+
+    def set_active_state(self, device_id: str, thread_id: str, turn_id: str = "") -> dict:
+        """Record a device-reported active thread for active_state.set."""
+
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            raise ValueError("thread_id")
+        self.note_device_thread(device_id, thread_id)
+        return {"thread_id": thread_id, "turn_id": str(turn_id or "")}
+
     def _message_visible(self, device_id: str, payload: dict) -> bool:
         """Can this record change what the device is showing right now?
 

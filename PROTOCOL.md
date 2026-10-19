@@ -26,6 +26,8 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - `thread.read(0x0003)` 的 `history_depth(0x0014)` 按 `u16` 解码，并转换为内部消息条数；省略时使用设备 profile 的历史预算，不再把该字段当作泛化 `limit` 传入共享命令层。
 - `message.read.update(0x00A0)` 现在进入共享命令层并写入统一已读存储；`message_ref` / `thread_ref` 先从持久引用表解析，未知引用返回 `NOT_FOUND`。
 - `AUDIO_END` 现在会把 STT 的真实失败原因写入 `error_message(0x0062)`，并在 `error_detail(0x0063)` 标记 `reason = STT_UNAVAILABLE`；协议错误码仍是 `UPSTREAM_UNAVAILABLE`，设备因此可以区分识别上游故障与音频参数错误。
+- `RESULT` / `ERROR` 现在分配非零递增 `seq`，并在固定头 `ack_seq` 里 piggyback 已连续收到的设备序号。之前它们发 `seq = 0`，而 §13.1 只豁免 PING/PONG/ACK/CLOSE 和发现消息，属于实现缺陷。
+- `active_state.read` / `active_state.set` 现已实现：读取当前设备的活动线程/turn，设置时把设备上报的活动线程记录进 Hub。二者都要求 `cross_device_active` 能力；未选中线程时 `read` 返回全 0，引用无法解析时 `set` 返回 `NOT_FOUND`。`events.since` 与 `resume.*` 仍为 `[本轮不实现]`。
 
 ## 1. 范围与角色
 

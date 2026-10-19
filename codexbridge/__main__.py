@@ -447,6 +447,8 @@ def main(argv: list[str] | None = None) -> int:
             references=references,
             speech=speech,
             active_thread=hub.followed_thread,
+            active_state=hub.active_state,
+            set_active_state=hub.set_active_state,
             defer=lambda device_id, callback: hub.defer_blocking_event(
                 device_id,
                 {"type": "cbdp_deferred", "callback": callback},
