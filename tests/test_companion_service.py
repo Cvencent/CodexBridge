@@ -496,6 +496,37 @@ class CompanionServiceTests(unittest.TestCase):
             sessions_root=Path(self.temp.name) / "sessions",
         )
 
+    def test_thread_read_retries_on_stale_list_turns(self) -> None:
+        """A live app-server cannot page turns for a thread it just created."""
+        from codexbridge.codex.app_server import AppServerProtocolError
+        stale = FakeClient()
+
+        def fail(params):
+            raise AppServerProtocolError(
+                "App Server 请求失败 thread/read：list_turns is not supported yet")
+
+        stale.responses["thread/read"] = fail
+        fresh = FakeClient()
+        fresh.responses["thread/read"] = thread_detail("t1")
+        clients = iter([stale, fresh])
+        service = CompanionService(
+            data_dir=Path(self.temp.name),
+            cwd=Path(self.temp.name),
+            client_factory=lambda command, cwd: next(clients),
+            desktop_state_path=Path(self.temp.name) / "missing.json",
+            sessions_root=Path(self.temp.name) / "sessions",
+        )
+        try:
+            detail = service.read_thread("t1")
+        finally:
+            service.stop()
+        self.assertEqual(detail["thread"]["thread_id"], "t1")
+        self.assertEqual(
+            [method for method, _params in stale.requests if method == "thread/read"],
+            ["thread/read"],
+        )
+        self.assertIn("thread/read", [method for method, _params in fresh.requests])
+
     def tearDown(self) -> None:
         self.service.stop()
         self.temp.cleanup()

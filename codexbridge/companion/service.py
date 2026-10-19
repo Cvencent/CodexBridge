@@ -101,6 +101,22 @@ APPROVAL_KINDS: dict[str, str] = {
 ACTIVE_STATUSES = {"working", "waiting_user"}
 
 
+def _is_stale_thread_read(error: BaseException) -> bool:
+    """True when a live app-server cannot page turns for a thread it started.
+
+    A long-lived app-server keeps a thread created through ``thread/start`` in
+    memory before it has persisted turns. ``thread/read`` then answers
+    ``list_turns is not supported yet`` instead of returning the row. A fresh
+    process reads the same rollout straight from disk, so the caller resets the
+    client and retries once rather than surfacing a spurious failure to the
+    phone.
+    """
+    text = str(error or "").strip().lower()
+    if "not supported yet" not in text:
+        return False
+    return "list_turns" in text or "thread/items/list" in text or "thread/read" in text
+
+
 def _is_active_writer_error(error: BaseException) -> bool:
     text = str(error or "").strip().lower()
     return "active writer" in text and (
@@ -1111,6 +1127,15 @@ class CompanionService:
                 # The server is alive and said no. Reconnecting spawns a whole
                 # Codex process (~1.5 s here) and the same method fails again
                 # on the fresh pipe, so report it once and keep the transport.
+                # One exception: a long-lived app-server cannot page the turns
+                # of a thread it just created, so thread/read answers
+                # "list_turns is not supported yet". A fresh process reads the
+                # same rollout from disk, so retry once on a reset instead of
+                # failing the phone's read.
+                if method == "thread/read" and _is_stale_thread_read(error) and attempt == 0:
+                    last_error = error
+                    self._reset_client()
+                    continue
                 raise
             except AppServerError as error:
                 last_error = error
