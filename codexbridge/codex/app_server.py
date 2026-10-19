@@ -25,6 +25,10 @@ from codexbridge.console import emit
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
 # A turn that stopped updating this long ago is over, not still running.
 RESUMED_ACTIVE_WINDOW_SECONDS = 120
+# A failed/interrupted turn with no end timestamp is only treated as still
+# running while its last activity is inside this window. Longer silence means
+# the turn really stopped; settle it at the last observed activity.
+STALE_TURN_WINDOW_SECONDS = 300
 TRANSIENT_REFRESH_FAILURE_LIMIT = 6
 
 
@@ -559,6 +563,66 @@ def _try_json(text: str) -> Any:
         return None
 
 
+def resolve_terminal_state(
+    status: str,
+    *,
+    completed_at: int = 0,
+    fallback_timestamps: "tuple[int, ...] | list[int]" = (),
+    now_epoch: int | None = None,
+) -> tuple[str, int]:
+    """Normalize a turn verdict into a status that always carries a real end time.
+
+    Two rules matter for every consumer (thread list, thread detail, status
+    events and read state):
+
+    1. ``completed`` / ``failed`` are terminal, so they must carry a positive
+       ``completed_at``. When the upstream turn omits ``completedAt`` we fall
+       back to the last known activity, then to the local observation time.
+    2. A ``failed`` / ``interrupted`` verdict without any end timestamp is a
+       transient upstream artefact (provider reconnect, rate-limit retry,
+       stream reset), not a finished task. Report it as ``working`` so the
+       phone keeps showing progress instead of a phantom failure.
+    """
+
+    value = str(status or "").replace("_", "").lower()
+    if value not in {"completed", "failed", "interrupted", "cancelled", "canceled"}:
+        return value, max(0, int(completed_at or 0))
+    stamp = max(0, int(completed_at or 0))
+    if value != "completed":
+        if stamp <= 0:
+            # No end time. A turn that is still moving is a reconnect
+            # artefact; one that has been quiet for a long time is a turn that
+            # ended without a timestamp, so settle it at its last activity.
+            fresh = 0
+            for candidate in fallback_timestamps:
+                try:
+                    number = max(0, int(candidate or 0))
+                except (TypeError, ValueError):
+                    number = 0
+                if number > fresh:
+                    fresh = number
+            observed = int(now_epoch if now_epoch is not None else time.time())
+            if fresh <= 0:
+                # No evidence at all that the turn ended. Keep it running
+                # rather than inventing a terminal failure.
+                return "working", 0
+            if observed - fresh < STALE_TURN_WINDOW_SECONDS:
+                return "working", 0
+            return "failed", fresh
+        return "failed", stamp
+    if stamp <= 0:
+        for candidate in fallback_timestamps:
+            try:
+                number = max(0, int(candidate or 0))
+            except (TypeError, ValueError):
+                number = 0
+            if number > stamp:
+                stamp = number
+    if stamp <= 0:
+        stamp = int(now_epoch if now_epoch is not None else time.time())
+    return "completed", stamp
+
+
 def _turn_error(turn: dict[str, Any]) -> str:
     """Return a readable message for a failed turn, if the server reported one."""
     error = turn.get("error")
@@ -725,24 +789,35 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
         str(runtime.get("type", "")).lower() == "notloaded" and
         str(thread.get("source", "")).lower() in {"vscode", "appserver"}
     )
+    fallback_stamps = (
+        _epoch(latest_turn.get("updatedAt")),
+        updated,
+        recency,
+        _epoch(latest_turn.get("startedAt")),
+    )
     if any("waiting" in flag or "approval" in flag for flag in active_flags):
         status = "waiting_user"
     elif turn_status in {"inprogress", "running", "active"}:
         status = "working"
-    elif turn_status == "completed":
-        status = "completed"
     elif turn_status == "interrupted" and (
             (latest_turn.get("completedAt") is None and recently_updating) or detached_active):
         # A second read-only app-server sees a desktop-owned in-flight turn as
         # interrupted. Newer versions may also expose an empty placeholder
         # turn with completedAt populated while recencyAt continues to move.
         status = "working"
-    elif turn_status in {"failed", "interrupted", "cancelled", "canceled"}:
-        status = "failed"
+    elif turn_status in {"completed", "failed", "interrupted", "cancelled", "canceled"}:
+        status, completed_at = resolve_terminal_state(
+            turn_status,
+            completed_at=completed_at,
+            fallback_timestamps=fallback_stamps,
+            now_epoch=now_epoch,
+        )
     elif str(runtime.get("type", "")).lower() == "active":
         status = "working"
     else:
-        status = "idle" if not turns else "completed"
+        # No turn reported a terminal verdict. Do not invent "completed":
+        # a thread we merely cannot observe is idle, not finished.
+        status = "idle"
 
     progress_messages = [text for phase, text in latest_agent_messages if phase == "commentary"]
     final_messages = [text for phase, text in latest_agent_messages if phase in {"final", "finalanswer"}]
@@ -797,7 +872,9 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
         )
 
     started = _epoch(latest_turn.get("startedAt") or latest_turn.get("createdAt"))
-    completed = 0 if status in {"working", "waiting_user"} else _epoch(latest_turn.get("completedAt"))
+    # Keep the normalized end time: a terminal verdict without completedAt was
+    # repaired above from the last activity or local observation time.
+    completed = 0 if status in {"working", "waiting_user", "idle"} else int(completed_at or 0)
     duration = max(0, (completed or now_epoch) - started) if started else 0
     plan_completed, plan_total = _plan_counts(latest_turn, latest_items)
     return {

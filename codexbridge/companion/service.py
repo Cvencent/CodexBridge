@@ -23,6 +23,7 @@ from codexbridge.codex.app_server import (
     _resolve_codex_command,
     _turn_error,
     account_snapshot,
+    resolve_terminal_state,
     thread_snapshot,
 )
 from codexbridge.codex.desktop_ipc import DesktopIpcError
@@ -191,17 +192,27 @@ def _status_from_thread(thread: dict[str, Any]) -> str:
     if any("waiting" in flag or "approval" in flag for flag in flags):
         return "waiting_user"
     turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
-    turn_status = str(turns[-1].get("status") if turns else "").replace("_", "").lower()
+    latest = turns[-1] if turns else {}
+    turn_status = str(latest.get("status") or "").replace("_", "").lower()
     if turn_status in {"inprogress", "running", "active"}:
         return "working"
-    if turn_status == "completed":
-        return "completed"
-    if turn_status in {"failed", "interrupted", "cancelled", "canceled"}:
-        return "failed"
+    if turn_status in {"completed", "failed", "interrupted", "cancelled", "canceled"}:
+        status, _stamp = resolve_terminal_state(
+            turn_status,
+            completed_at=_epoch(latest.get("completedAt")),
+            fallback_timestamps=(
+                _epoch(latest.get("updatedAt")),
+                _epoch(thread.get("recencyAt")),
+                _epoch(thread.get("updatedAt")),
+                _epoch(latest.get("startedAt")),
+            ),
+        )
+        return status
     runtime_type = str(runtime.get("type") or "").lower()
     if runtime_type == "active":
         return "working"
-    return "idle" if not turns else "completed"
+    # Missing turn state is not evidence of completion.
+    return "idle"
 
 
 _TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
@@ -494,6 +505,10 @@ class CompanionService:
         # Threads whose turn has ended. Their body cannot change again
         # until a new turn starts, so their reads stay valid far longer.
         self._terminal_threads: set[str] = set()
+        # One monotonic high-water mark per thread so a stale upstream payload
+        # can never move a terminal timestamp backwards.
+        self._terminal_stamps: dict[str, int] = {}
+        self._terminal_stamp_lock = threading.Lock()
         # Rows whose turn read settled their state while the rollout log had
         # nothing to say. Re-reading a 146 KB thread body for every such row on
         # every poll was the dominant cost of the phone API; the verdict stands
@@ -1057,6 +1072,18 @@ class CompanionService:
             return READ_TTL_SECONDS
         return TERMINAL_READ_TTL_SECONDS
 
+    def _monotonic_terminal_stamp(self, thread_id: str, stamp: int) -> int:
+        """Keep a thread's terminal timestamp from ever moving backwards."""
+
+        stamp = max(0, int(stamp or 0))
+        with self._terminal_stamp_lock:
+            previous = int(self._terminal_stamps.get(thread_id) or 0)
+            if stamp < previous:
+                stamp = previous
+            elif stamp > previous:
+                self._terminal_stamps[thread_id] = stamp
+        return stamp
+
     def _note_terminal(self, thread_id: str, status: str, live: bool = False) -> None:
         """Remember that a thread's turn is over so its reads can be cached.
 
@@ -1391,11 +1418,22 @@ class CompanionService:
             thread_id = self.visible_thread_id(str(params.get("threadId") or ""))
             completed_at = _epoch(turn.get("completedAt") or turn.get("completedAtMs"))
             self._on_turn_completed(thread_id)
+            resolved, completed_at = resolve_terminal_state(
+                status,
+                completed_at=completed_at,
+                fallback_timestamps=(
+                    _epoch(turn.get("updatedAt") or turn.get("updatedAtMs")),
+                    _epoch(turn.get("startedAt") or turn.get("startedAtMs")),
+                    _epoch(params.get("recencyAt")),
+                ),
+            )
+            if resolved in {"completed", "failed"}:
+                completed_at = self._monotonic_terminal_stamp(thread_id, completed_at)
             return {
                 "type": "turn_completed",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "status": "completed" if status == "completed" else "failed",
+                "status": resolved,
                 "duration_ms": turn.get("durationMs"),
                 "completed_at": completed_at,
                 "error_message": _turn_error(turn),
@@ -1644,7 +1682,11 @@ class CompanionService:
                 summary["status"] = inferred
             if activity is not None:
                 _newest, _kind, kind_stamp, _written, _real = activity
-                if kind_stamp > 0 and int(summary.get("completed_at") or 0) <= 0:
+                if (
+                    summary.get("status") in {"completed", "failed"}
+                    and kind_stamp > 0
+                    and int(summary.get("completed_at") or 0) <= 0
+                ):
                     # List rows carry no turns, so a finished task only shows up
                     # via its rollout log. Use that log's completion timestamp
                     # as the read watermark; otherwise completed_at stays 0 and
@@ -1680,6 +1722,25 @@ class CompanionService:
                         summary["status"] = read_status
                     if settled_at > int(summary.get("completed_at") or 0):
                         summary["completed_at"] = settled_at
+            if summary.get("status") in {"completed", "failed"}:
+                # One terminal verdict for list, detail and events: never hand a
+                # terminal status to a client without a usable end timestamp.
+                status, settled_at = resolve_terminal_state(
+                    str(summary.get("status") or ""),
+                    completed_at=int(summary.get("completed_at") or 0),
+                    fallback_timestamps=(
+                        int(kind_stamp) if activity is not None else 0,
+                        int(summary.get("updated_at") or 0),
+                        int(summary.get("recency_at") or 0),
+                        int(summary.get("started_at") or 0),
+                    ),
+                )
+                summary["status"] = status
+                summary["completed_at"] = int(settled_at)
+                if status in {"completed", "failed"}:
+                    summary["completed_at"] = self._monotonic_terminal_stamp(
+                        thread_id, int(settled_at)
+                    )
             completed_at = int(summary.get("completed_at") or 0)
             if (
                 summary.get("status") in {"completed", "failed"}
@@ -1701,11 +1762,24 @@ class CompanionService:
         latest_turn = turns[-1] if turns else {}
         usage = row.get("tokenUsage") if isinstance(row.get("tokenUsage"), dict) else {}
         total = usage.get("total") if isinstance(usage.get("total"), dict) else {}
+        status = _status_from_thread({**row, "turns": turns})
+        completed_at = _epoch(latest_turn.get("completedAt"))
+        if status in {"completed", "failed"} and completed_at <= 0:
+            status, completed_at = resolve_terminal_state(
+                status,
+                completed_at=completed_at,
+                fallback_timestamps=(
+                    _epoch(latest_turn.get("updatedAt")),
+                    _epoch(row.get("recencyAt")),
+                    _epoch(row.get("updatedAt")),
+                    _epoch(latest_turn.get("startedAt")),
+                ),
+            )
         return {
             "thread_id": str(row.get("id") or ""),
             "title": _thread_title(row),
             "preview": _clip(str(row.get("preview") or ""), 400),
-            "status": _status_from_thread({**row, "turns": turns}),
+            "status": status,
             "model": str(row.get("model") or ""),
             "cwd": str(row.get("cwd") or ""),
             "workspace": _workspace_name(str(row.get("cwd") or "")),
@@ -1713,7 +1787,7 @@ class CompanionService:
             "created_at": _epoch(row.get("createdAt")),
             "updated_at": _epoch(row.get("updatedAt") or row.get("recencyAt")),
             "recency_at": _epoch(row.get("recencyAt")),
-            "completed_at": _epoch(latest_turn.get("completedAt")),
+            "completed_at": completed_at,
             "turn_id": str(latest_turn.get("id") or ""),
             "started_at": _epoch(latest_turn.get("startedAt")),
             "tokens": int(_as_number(total.get("totalTokens")) or 0),
@@ -1859,6 +1933,13 @@ class CompanionService:
         )
         summary["status"] = resolved
         task["status"] = resolved
+        if resolved in {"completed", "failed"}:
+            stamp = self._monotonic_terminal_stamp(
+                thread_id,
+                int(summary.get("completed_at") or task.get("completed_at_epoch") or 0),
+            )
+            summary["completed_at"] = stamp
+            task["completed_at_epoch"] = stamp
         # A settled thread with a quiet rollout log cannot change again on
         # its own, so its body is worth caching far longer than a live one.
         self._note_terminal(thread_id, resolved, live=bool(live_status))
@@ -2159,9 +2240,20 @@ class CompanionService:
         log_activity = self._thread_log(thread_id)
         if log_activity is not None:
             completed_at = max(completed_at, int(log_activity[2] or 0))
-        if status in {"completed", "failed"} and completed_at > 0:
-            was_unread = not self._read_state.is_thread_read(thread_id, completed_at)
-            self._read_state.mark_thread(thread_id, completed_at)
+        if status not in ACTIVE_STATUSES:
+            # A settled thread can still arrive without a terminal timestamp
+            # (older upstream payloads, repaired rows). Persist a watermark
+            # from the best available evidence so the phone's read state
+            # survives the next list refresh.
+            watermark = completed_at
+            if watermark <= 0:
+                watermark = int(summary.get("updated_at") or summary.get("recency_at") or 0)
+            if watermark <= 0:
+                watermark = int(time.time())
+            watermark = self._monotonic_terminal_stamp(thread_id, watermark)
+            was_unread = not self._read_state.is_thread_read(thread_id, watermark)
+            self._read_state.mark_thread(thread_id, watermark)
+            completed_at = watermark
             if was_unread:
                 self.publish(
                     {

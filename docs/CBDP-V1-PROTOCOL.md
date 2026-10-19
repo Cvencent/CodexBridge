@@ -3294,6 +3294,28 @@ AUDIO_BEGIN / AUDIO_CHUNK / AUDIO_END
    `version_minor`、`transport`、`paths`、`auth`、`auth_mode`、`enabled`、
    `port`。
 
+### 19.7 终态与完成时间（2026-10-19 实现修正）
+
+`thread_state` 的 `completed` / `failed` 是终态，客户端依赖它们做已读、提醒和
+排序，因此终态必须自带可比较的结束时间：
+
+- 任何 `completed` / `failed` 的 thread 或 turn 都必须同时给出
+  `completed_at_ms > 0`。上游缺少 `completedAt` 时，Bridge 依次使用该 turn 的
+  最后活动时间、线程最后更新时间、本机观测时间补齐；同一线程的终态时间戳
+  只增不减，不得因后续读到旧快照而回退。
+- `failed` / `interrupted` 但拿不到该 turn 自己的结束时间时，视为网络重连、
+  供应商限流重试或流重置留下的瞬态结果，对外保持 `running`，不得编码成
+  `failed`。只有拿到结束时间，或该 turn 已静默超过 Bridge 的陈旧窗口并以最后
+  活动时间落定，才编码为 `failed`。
+- 缺少 turn 终态证据时不得推断 `completed`；无法观察的线程编码为 `idle`。
+- `threads.list`、`thread.read`、`thread.*` 事件和 `turn.completed` 必须给出
+  同一组 `status` / `completed_at_ms` / `turn_ref`。瞬态失败时
+  `turn.completed` 携带 `status=running`、`completed_at_ms=0`，客户端不得把它
+  当作结束。
+- 已读不依赖终态时间：只要线程不处于活动状态，Bridge 会用完成时间、最后更新
+  时间或本机时间写入已读水位，因此历史上 `completed_at_ms = 0` 的线程在客户端
+  读取后也会稳定回到 `idle`。
+
 ## 20. 审批协议
 
 ### 20.1 APPROVAL_REQUEST

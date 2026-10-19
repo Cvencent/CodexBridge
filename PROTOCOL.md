@@ -1205,6 +1205,22 @@ ESP/设备协议；设备只使用后文的通用命令协议。
 标记为全局已读，线程列表状态回落为 `idle`，并向所有在线客户端广播 `thread_status`
 的 `idle` 事件，其他设备据此撤回尚未展示的完成提醒。
 
+终态必须带有效完成时间（2026-10-19 实现修正）：
+
+- `completed` / `failed` 的线程与任务必须同时返回 `completed_at > 0`。上游未给出
+  `completedAt` 时，Bridge 依次使用 turn 的最后活动时间、线程最后更新时间、本机观测
+  时间补齐；同一线程的终态时间戳只增不减。
+- `failed` / `interrupted` 但拿不到该 turn 自己的结束时间时，视为网络重连、供应商
+  限流重试或流重置留下的瞬态结果，对外保持 `working`，不得显示为 `failed`。只有
+  确实拿到结束时间，或该 turn 已静默超过陈旧窗口并以最后活动时间落定，才发布失败。
+- 缺少 turn 终态证据时不得推断 `completed`；无法观察的线程一律按 `idle` 处理。
+- `threads.list`、`thread.read`、`thread_status` 和 `turn_completed` 必须给出同一组
+  `status` / `completed_at` / `turn_id`。`turn_completed` 在瞬态失败时返回
+  `status=working`、`completed_at=0`，客户端不得把它当作结束。
+- 已读接口不再依赖 `completed_at`：只要线程不处于 `running` 类活动状态，Bridge 会用
+  完成时间、最后更新时间或本机时间写入已读水位，因此 `completed_at = 0` 的历史线程
+  也能在刷新后保持 `idle`。
+
 ### 17.4 电脑端占用线程时的续写
 
 app-server 对同一线程只允许一个 writer。电脑端 Codex（或另一个 app-server 进程）打开某线程后，

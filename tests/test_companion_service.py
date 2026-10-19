@@ -1294,6 +1294,96 @@ class CompanionServiceTests(unittest.TestCase):
         detail = self.service.read_thread("t1")
         self.assertEqual(detail["continued_as"], "")
 
+    def test_failed_turn_without_end_time_is_not_reported_as_failed(self) -> None:
+        # A provider reconnect can mark the turn failed before it really ends.
+        # Without an end timestamp the task is still in flight.
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "failed"
+        turn.pop("completedAt", None)
+        turn["startedAt"] = int(time.time()) - 5
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "working")
+        self.assertEqual(result["thread"]["completed_at"], 0)
+        self.assertEqual(result["task"]["status"], "working")
+
+    def test_failed_turn_with_end_time_stays_terminal(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "failed"
+        turn["completedAt"] = 1791000400
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "failed")
+        self.assertEqual(result["thread"]["completed_at"], 1791000400)
+        self.assertEqual(result["task"]["completed_at_epoch"], 1791000400)
+
+    def test_completed_turn_without_end_time_gets_one(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        turn.pop("completedAt", None)
+        turn["updatedAt"] = 1791000500
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "completed")
+        self.assertEqual(result["thread"]["completed_at"], 1791000500)
+        self.assertEqual(result["task"]["completed_at_epoch"], 1791000500)
+
+    def test_completed_turn_without_timestamps_falls_back_to_now(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        for key in ("completedAt", "updatedAt", "startedAt"):
+            turn.pop(key, None)
+        detail["thread"].pop("recencyAt", None)
+        detail["thread"].pop("updatedAt", None)
+        self.client.responses["thread/read"] = detail
+
+        before = int(time.time())
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "completed")
+        self.assertGreaterEqual(result["thread"]["completed_at"], before)
+
+    def test_missing_turn_state_is_idle_not_completed(self) -> None:
+        detail = thread_detail("t1")
+        detail["thread"]["turns"][0].pop("status", None)
+        detail["thread"]["turns"][0].pop("completedAt", None)
+        detail["thread"]["status"] = {"type": "notLoaded", "activeFlags": []}
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "idle")
+        self.assertEqual(result["thread"]["completed_at"], 0)
+
+    def test_read_persists_when_completed_at_is_missing(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        turn.pop("completedAt", None)
+        turn["updatedAt"] = 1791000600
+        detail["thread"]["recencyAt"] = 1791000600
+        self.client.responses["thread/read"] = detail
+        self.client.responses["thread/list"] = {
+            "data": [{**thread_row("t1"), "recencyAt": 1791000600}],
+            "nextCursor": None,
+        }
+
+        self.service.mark_thread_read("t1")
+        page = self.service.list_threads()
+
+        row = next(item for item in page["threads"] if item["thread_id"] == "t1")
+        self.assertEqual(row["status"], "idle")
+
     def test_thread_summary_surfaces_provider_failure_reason(self) -> None:
         payload = json.dumps(
             {
@@ -1315,6 +1405,86 @@ class CompanionServiceTests(unittest.TestCase):
             "[workbuddy] upstream client (http 400): invalid function call parameters",
         )
 
+    def test_completed_turn_without_timestamp_gets_one(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        turn.pop("completedAt", None)
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "completed")
+        self.assertGreater(result["thread"]["completed_at"], 0)
+        self.assertEqual(result["task"]["status"], "completed")
+        self.assertGreater(result["task"]["completed_at_epoch"], 0)
+
+    def test_failed_turn_without_timestamp_stays_working(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "failed"
+        turn.pop("completedAt", None)
+        turn.pop("startedAt", None)
+        detail["thread"].pop("updatedAt", None)
+        detail["thread"].pop("recencyAt", None)
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        # No end time means the turn is still in flight, not a phantom failure.
+        self.assertEqual(result["thread"]["status"], "working")
+        self.assertEqual(result["thread"]["completed_at"], 0)
+
+    def test_failed_turn_with_timestamp_is_terminal(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "failed"
+        turn["completedAt"] = 1791000200
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "failed")
+        self.assertEqual(result["thread"]["completed_at"], 1791000200)
+
+    def test_missing_turn_status_is_not_inferred_as_completed(self) -> None:
+        detail = thread_detail("t1")
+        detail["thread"]["turns"][0].pop("status", None)
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.read_thread("t1")
+
+        self.assertEqual(result["thread"]["status"], "idle")
+
+    def test_terminal_timestamp_never_moves_backwards(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        turn["completedAt"] = 1791000500
+        self.client.responses["thread/read"] = detail
+        self.service.read_thread("t1", message_limit=1)
+
+        # A later read reports an older completion time; the monotonic guard
+        # must keep the newest one.
+        turn["completedAt"] = 1791000100
+        self.service._read_cache.clear()
+        again = self.service.read_thread("t1", message_limit=1)
+
+        self.assertEqual(again["thread"]["completed_at"], 1791000500)
+
+    def test_mark_thread_read_persists_without_terminal_timestamp(self) -> None:
+        detail = thread_detail("t1")
+        turn = detail["thread"]["turns"][0]
+        turn["status"] = "completed"
+        turn.pop("completedAt", None)
+        self.client.responses["thread/read"] = detail
+
+        result = self.service.mark_thread_read("t1")
+
+        self.assertEqual(result["status"], "idle")
+        self.assertGreater(result["read_at"], 0)
+        self.assertTrue(self.service._read_state.thread_read_at("t1") > 0)
+
     def test_turn_completed_event_carries_provider_error(self) -> None:
         payload = {
             "threadId": "t1",
@@ -1330,6 +1500,22 @@ class CompanionServiceTests(unittest.TestCase):
 
         self.assertEqual(event["status"], "failed")
         self.assertEqual(event["error_message"], "provider exploded")
+
+    def test_turn_completed_event_without_end_time_stays_running(self) -> None:
+        payload = {
+            "threadId": "t1",
+            "turn": {
+                "id": "turn-9",
+                "status": "failed",
+                "error": {"message": "connection reset"},
+            },
+        }
+
+        event = self.service._event_payload({"method": "turn/completed", "params": payload})
+
+        self.assertEqual(event["status"], "working")
+        self.assertEqual(event["completed_at"], 0)
+        self.assertFalse(event["read"])
 
     def test_fork_rename_does_not_retitle_the_phone_thread(self) -> None:
         def resume(_params):
