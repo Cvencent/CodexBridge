@@ -199,6 +199,21 @@ class QueueService:
         if expected_revision != item["revision"]:
             raise CommandError("queue_conflict")
 
+    def _resume_locked(self, thread_id: str) -> bool:
+        """Clear a dispatch pause for one thread. True when it was paused.
+
+        ``_paused`` only exists to stop a hot retry loop after a dispatch
+        failure. Any explicit user action that shows the thread is usable
+        again (adding a message, deleting the failed item, or a turn that
+        actually completed) must lift it, otherwise the queue stays stuck
+        until someone edits the exact failed row.
+        """
+
+        if thread_id in self._paused:
+            self._paused.discard(thread_id)
+            return True
+        return False
+
     def enqueue(self, thread_id: str, text: str, model: str = "", effort: str = "",
                 created_by: str = "", created_by_kind: str = "") -> dict[str, Any]:
         if not isinstance(thread_id, str) or not thread_id or not self._thread_exists(thread_id):
@@ -230,6 +245,8 @@ class QueueService:
                 "error": "",
             }
             items[queue_id] = item
+            # A new message is an explicit retry: let the queue move again.
+            self._resume_locked(thread_id)
             self._next_revision()
             self._save()
             self._emit("queue_item_added", thread_id, item)
@@ -276,6 +293,10 @@ class QueueService:
             self._items.get(thread_id, {}).pop(queue_id, None)
             if not self._items.get(thread_id):
                 self._items.pop(thread_id, None)
+            remaining = self._items.get(thread_id, {}).values()
+            still_failed = any(value["status"] == "failed" for value in remaining)
+            if item["status"] == "failed" or not still_failed:
+                self._resume_locked(thread_id)
             self._next_revision()
             self._save()
             self._emit("queue_item_removed", thread_id, item, reason="deleted")
@@ -325,6 +346,9 @@ class QueueService:
 
     def on_turn_finished(self, thread_id: str) -> None:
         with self._lock:
+            # The thread just ran a turn, so a stale dispatch pause no longer
+            # describes reality.
+            self._resume_locked(thread_id)
             item = next(
                 (
                     value for value in self._items.get(thread_id, {}).values()

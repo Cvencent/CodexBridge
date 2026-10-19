@@ -2913,6 +2913,18 @@ queue item:
 8. `micro` 和 `panel` 可以只实现 `queue.add`，不实现 `queue_manage`。未实现
    队列能力的设备仍可普通发送，由 Bridge 决定 `turn.start` 或返回 `BUSY`。
 
+Bridge 实现补充（v1.0 实现后追加，无新增线格式字段）：
+
+- 派发失败时 Bridge 把该项置为 `failed`，并可暂停该线程的队列派发，避免对同一
+  错误做无上限热重试。暂停状态通过 `queue.list` 快照的 `paused` 布尔字段
+  暴露（Bridge 扩展字段，设备可忽略）。
+- 暂停必须可恢复。以下任一用户可见操作都会清除暂停：`queue.add`、
+  `queue.update`、删除该线程的失败项、删除后该线程已无失败项，以及该线程
+  有 turn 正常完成。Bridge 不得要求客户端只能靠 `queue.update` 解除暂停。
+- 因此客户端不需要额外的 `queue.resume` 命令；重发（`queue.add`）本身就是
+  恢复动作。若仍保留自定义恢复按钮，调用 `queue.update` 或重新 `queue.add`
+  都符合本规范。
+
 ### 17.8 引导语义
 
 引导是向正在运行的 turn 注入的新指令，不创建一条用户消息，不改变用户可见的

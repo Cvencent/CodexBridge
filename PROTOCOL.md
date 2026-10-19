@@ -898,8 +898,13 @@ HTTP 手机使用现有 `POST /api/companion/commands` 信封，TCP 设备使用
 | `queue_paused` | 派发失败后暂停该线程自动派发 |
 
 客户端按 `queue_id` 和 revision 合并，不能按事件到达顺序推断队列顺序。每个事件带
-全局 `revision`、`thread_id` 和 `server_time`。派发失败时项变为 `failed` 并暂停该线程；
-编辑或删除失败项后恢复派发。
+全局 `revision`、`thread_id` 和 `server_time`。派发失败时项变为 `failed` 并暂停该线程，
+避免对同一错误无上限热重试；暂停状态通过 `queue_snapshot` / `queue.list` 的
+`paused` 布尔字段暴露。
+
+暂停必须可恢复，且不需要额外的恢复命令。以下任一操作都清除暂停并唤醒派发：
+`queue.enqueue`、`queue.edit`、删除该线程的失败项、删除后该线程已无失败项，
+以及该线程有 turn 正常完成。因此用户删掉失败项后直接重发即可恢复，不会卡住。
 
 SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `queue` 的客户端，
 `approval_*`、`turn_*` / `resync_required` 和其余任务事件分别要求 `approval`、
