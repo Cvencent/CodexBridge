@@ -15,6 +15,51 @@ class Service:
         return {'thread_id': thread_id, 'turn_id': 'turn-1', 'status': 'working'}
 
 
+class ReadStateCommandTests(unittest.TestCase):
+    def test_message_read_update_marks_shared_message_and_thread_state(self):
+        from codexbridge.companion.service import CompanionService
+        from codexbridge.read_state import ReadStateStore
+
+        store = ReadStateStore(None)
+        service = CompanionService.__new__(CompanionService)
+        service._read_state = store
+        result = CommandDispatcher(service).execute(
+            "device-a",
+            {"read_unread"},
+            {
+                "request_id": "read-1",
+                "method": "message.read.update",
+                "params": {
+                    "message_id": "m1",
+                    "thread_id": "t1",
+                    "read_at_ms": 1791000000000,
+                },
+            },
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(store.is_message_read("m1"))
+        self.assertEqual(store.thread_read_at("t1"), 1791000000)
+        self.assertEqual(result["result"]["message_id"], "m1")
+        self.assertEqual(result["result"]["read_states"][0]["source"], "device-a")
+
+    def test_message_read_update_rejects_missing_read_timestamp(self):
+        from codexbridge.companion.service import CompanionService
+        from codexbridge.read_state import ReadStateStore
+
+        service = CompanionService.__new__(CompanionService)
+        service._read_state = ReadStateStore(None)
+        with self.assertRaisesRegex(CommandError, "invalid_params"):
+            CommandDispatcher(service).execute(
+                "device-a",
+                {"read_unread"},
+                {
+                    "request_id": "read-2",
+                    "method": "message.read.update",
+                    "params": {"message_id": "m1"},
+                },
+            )
+
+
 class DeviceCommandTests(unittest.TestCase):
     def test_legacy_cancel_is_executed_with_existing_tasks_capability(self):
         from codexbridge.hub import BridgeHub

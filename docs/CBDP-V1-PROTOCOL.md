@@ -2628,7 +2628,7 @@ project_ref, project_id, revision
 |---|---|---|---|---|
 | `status.read` | 无 | 无 | `online`, `metrics`, `applied_policy` | `[本轮实现]` |
 | `threads.list` | 无 | `cursor`, `history_depth`, `search_snippet`, `project_ref` | `objects`, `next_cursor`, `object_count` | `[本轮实现]` |
-| `thread.read` | `thread_ref` / `thread_id` | `cursor`, `history_depth` | `thread_ref`, `status`, `objects`, `next_cursor` | `[本轮实现]` |
+| `thread.read` | `thread_ref` / `thread_id` | `cursor`, `history_depth` | `thread_ref`, `status`, `objects`, `next_cursor` | `[本轮实现]`；`history_depth` 映射为最多返回的消息条数，省略时使用设备 profile 的历史预算 |
 | `thread.start` | 无 | `title`, `cwd`, `model_name`, `effort`, `project_ref` | `thread_ref`, `owner_state`, `revision` | `[本轮实现]` |
 | `turn.start` | `thread_ref` / `thread_id`, `body` 或 `input_parts` | `model_name`, `effort`, `part_ref`, `references`, `deadline_ms` | `thread_ref`, `turn_ref`, `status` | `[本轮实现]` |
 | `turn.steer` | `thread_ref` / `thread_id`, `body` 或 `input_parts` | `turn_ref`, `part_ref`, `references` | `thread_ref`, `turn_ref`, `status` | `[本轮实现]` |
@@ -2690,7 +2690,7 @@ project_ref, project_id, revision
 | `thread.goal.set` | `thread_ref` / `thread_id`, `goal_text` | `expected_revision` | `goal_ref`, `goal_status`, `revision` | `[本轮不实现]` |
 | `thread.goal.clear` | `thread_ref` / `thread_id` | `goal_ref`, `expected_revision` | `thread_ref`, `goal_status`, `revision` | `[本轮不实现]` |
 | `batch.execute` | `batch_ops` | `atomic`, `expected_revision` | `batch_op_index`, `batch_op_request_id`, `batch_op_idem` | `[本轮不实现]` |
-| `message.read.update` | `message_ref` / `message_id`, `read_at_ms` | `thread_ref` / `thread_id` | `message_ref`, `read_states` | `[本轮实现]` |
+| `message.read.update` | `message_ref` / `message_id`, `read_at_ms` | `thread_ref` / `thread_id` | `message_ref`, `read_states` | `[本轮实现]`；`thread_id` 可从已经由对象引用解析出的 `thread_ref` 补齐，未提供时 Bridge 仍记录消息已读 |
 | `active_state.read` | 无 | `device_ref` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]` |
 | `active_state.set` | `active_thread_ref` | `active_turn_ref`, `active_revision` | `active_thread_ref`, `active_turn_ref`, `active_revision` | `[本轮实现]` |
 | `events.since` | `cursor` | `topic_id`, `event_count`, `history_depth` | `objects`, `event_count`, `next_cursor`, `has_more` | `[本轮实现]` |
@@ -2702,6 +2702,10 @@ project_ref, project_id, revision
 `max_bytes` 缺省时由 Bridge 使用 `max_chunk_bytes`，但不得超过该值。消息事件
 中的 `body_ref` 与工具结果中的内容引用都作为 `content_ref` 发送给
 `content.read`，不得自行拼接第二个引用格式。
+
+`message.read.update` 的 `read_at_ms` 是按毫秒计的非负 `i64`；`read_at_ms = 0` 表示仅上报单条消息已读、不推进线程级水位；Bridge 把同一标记写入共享已读存储，因此手机、浏览器和其他设备会立即看到同一状态。只带 `message_ref` 的设备请求必须通过 Bridge 的持久引用表解析；解析失败返回 `NOT_FOUND`，不得返回 `INTERNAL`。
+
+`thread.read` 的 `history_depth` 按 §8.2 是 `u16`，语义是最多返回最近多少条消息，不是泛化的 `limit` 参数。Bridge 不得把这个字段直接传给上游命令层；省略该字段时仍按 §9.4 的 profile 历史预算处理。
 
 所有写方法的参数规范化后参与 `idem` 计算。参数中同时出现紧凑 ref 与外部字符串
 ID 时，Bridge 必须验证二者指向同一对象，否则返回 `INVALID_PARAM`。设备只发送
@@ -3214,7 +3218,9 @@ AUDIO_BEGIN / AUDIO_CHUNK / AUDIO_END
 - `AUDIO_END` 后 Bridge 执行 STT，把识别文本按
   `AUDIO_* -> SEND_* semantics -> turn.start / turn.steer` 提交，并在
   `RESULT` 中携带 `transcript`。识别失败返回 `UPSTREAM_UNAVAILABLE`，不得
-  静默丢弃。
+  静默丢弃。Bridge 必须在 `error_message(0x0062)` 里保留可操作的识别失败
+  原因，并在 `error_detail(0x0063)` 内带 `reason = STT_UNAVAILABLE`；设备
+  因此可以区分 STT 上游故障与音频格式、分片或会话状态错误。
 - `SEND_END` 和 `AUDIO_END` 必须绑定设备当前选中的会话。设备未选择会话时
   Bridge 必须返回 `ERROR(INVALID_STATE, NO_ACTIVE_THREAD)`，不得既不创建
   turn 也不回错误。
@@ -3222,6 +3228,18 @@ AUDIO_BEGIN / AUDIO_CHUNK / AUDIO_END
   必须把这类工作交给每设备工作线程，保持读循环持续排空音频分片和心跳。
 - `AUDIO_BEGIN` 需要 `audio` 能力；未声明或未启用时返回
   `CAPABILITY_NOT_ENABLED`。
+
+### 19.5.1 `message.read.update` 与 `thread.read` 实现修正（2026-10-19）
+
+联调发现以下 Bridge 行为不符合既有字段语义，修正不改变线格式版本：
+
+- `message.read.update(0x00A0)` 进入共享命令层后必须真正写入 `ReadStateStore`，
+  不得只回成功信封。缺 `read_at_ms` 或 `message_id`/`message_ref` 返回
+  `INVALID_PARAM`；引用无法解析返回 `NOT_FOUND`。
+- `thread.read(0x0003)` 的 `history_depth(0x0014)` 只控制消息条数；
+  Gateway 必须先解码 `u16`，再转换成内部 `message_limit`，不能把字段原名或
+  泛化 `limit` 传给上游。
+- 以上错误都必须返回可解释的 `ERROR`，不得再被统一吞成 `INTERNAL`。
 
 ### 19.6 v1.0 实现后修正（2026-10-18）
 

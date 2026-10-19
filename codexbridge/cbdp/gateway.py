@@ -90,6 +90,9 @@ from codexbridge.cbdp.constants import (
     TAG_TOPIC_SEQ,
     TAG_GLOBAL_SEQ,
     TAG_EVENT_TYPE,
+    TAG_ERROR_DETAIL,
+    TAG_ERROR_MESSAGE,
+    TAG_REASON,
     TAG_EVENT_PAYLOAD,
     TAG_PING_ID,
     TAG_ECHO,
@@ -132,6 +135,7 @@ from codexbridge.cbdp.events import EventSpine, event_scope
 from codexbridge.cbdp.frame import Frame, encode_frame
 from codexbridge.cbdp.leases import LeaseConflictError, LeaseManager
 from codexbridge.cbdp.subscriptions import SubscriptionLimitError, SubscriptionManager
+from codexbridge.protocol.commands import CommandError
 from codexbridge.cbdp.tlv import (
     CBDPError,
     decode_bool,
@@ -303,6 +307,7 @@ PARAM_TAGS = {
     "thread_ref": 0x0021,
     "turn_id": 0x0024,
     "message_id": 0x0026,
+    "message_ref": 0x0025,
     "approval_id": 0x0028,
     "text": 0x0042,
     "body": 0x0042,
@@ -313,9 +318,10 @@ PARAM_TAGS = {
     "expected_revision": 0x006B,
     "effort": 0x0124,
     "model": 0x0051,
-    "limit": 0x0014,
+    "history_depth": 0x0014,
     "cursor": 0x0033,
     "revision": 0x0036,
+    "read_at_ms": 0x0054,
     "guidance_text": 0x0109,
 }
 
@@ -566,15 +572,28 @@ class CbdpGateway:
         # event is delivered in pieces instead of being dropped here.
         return self._emit(frame)
 
-    def _error(self, request_id=0, code="INVALID_PARAM", message=""):
+    def _error(self, request_id=0, code="INVALID_PARAM", message="", detail=None):
+        text = _wire_text(message or code, 512)
+        header = {
+            TAG_REQUEST_ID: u32(int(request_id or 0)),
+            TAG_ERROR_MESSAGE: utf8(text),
+        }
+        if isinstance(detail, dict) and detail:
+            fields = {}
+            for key, value in detail.items():
+                if key == "reason":
+                    fields[TAG_REASON] = utf8(_wire_text(value, 128))
+                elif key == "http_status":
+                    fields[0x01B3] = u16(int(value))
+                elif key == "retry_after_ms":
+                    fields[0x0067] = u32(int(value))
+            if fields:
+                header[TAG_ERROR_DETAIL] = encode_tlvs(fields.items())
         frame = Frame(
             message_type=TYPE_ERROR,
             flags=FLAG_RESPONSE,
             code=ERROR_CODES.get(code, ERROR_CODES["INVALID_PARAM"]),
-            header={
-                TAG_REQUEST_ID: u32(int(request_id or 0)),
-                0x0062: utf8(message or code),
-            },
+            header=header,
         )
         return self._emit(frame)
 
@@ -880,26 +899,24 @@ class CbdpGateway:
             if name in result:
                 continue
             raw = fields[tag]
-            if name in {"expected_revision", "cursor", "limit", "revision", "message_ref", "queue_item_ref"}:
-                try:
+            try:
+                if name in {"expected_revision", "cursor", "revision", "message_ref", "queue_item_ref"}:
                     result[name] = decode_u64(raw) if len(raw) == 8 else decode_u32(raw)
-                except CBDPError:
-                    continue
-            elif name == "thread_ref":
-                try:
+                elif name == "history_depth":
+                    result[name] = decode_u16(raw)
+                elif name == "thread_ref":
                     result[name] = decode_u32(raw)
-                except CBDPError:
-                    continue
-            elif name == "decision":
-                try:
+                elif name == "read_at_ms":
+                    result[name] = decode_i64(raw)
+                elif name == "decision":
                     result[name] = decode_u8(raw)
-                except CBDPError:
-                    continue
-            else:
-                try:
+                else:
                     result[name] = decode_utf8(raw)
-                except CBDPError:
-                    continue
+            except CBDPError:
+                # A malformed known field must be reported as INVALID_PARAM by
+                # the command schema, never silently dropped and replaced by a
+                # default that changes the request.
+                result[name] = ""
         return result
 
     def _handle_command(self, frame):
@@ -924,11 +941,17 @@ class CbdpGateway:
             return self._error(request_id, error.name)
         device_id = str(self.session.device_id or "")
         params = self._restore_cursor(method, params)
+        try:
+            normalized = self._normalize_params(method, params)
+        except CBDPError as error:
+            return self._error(request_id, error.name)
+        except (TypeError, ValueError):
+            return self._error(request_id, "INVALID_PARAM")
         request = {
             "type": "command",
             "request_id": f"cbdp:{device_id}:{request_id}",
             "method": DISPATCH_METHODS.get(method, method),
-            "params": self._normalize_params(method, params),
+            "params": normalized,
         }
         capabilities = self._capabilities()
         generation = int(self.session.generation)
@@ -936,6 +959,19 @@ class CbdpGateway:
         def run():
             try:
                 response = commands.execute(device_id, capabilities, request)
+            except CommandError as error:
+                code = str(error)
+                mapping = {
+                    "capability_not_enabled": "CAPABILITY_NOT_ENABLED",
+                    "invalid_request": "INVALID_PARAM",
+                    "invalid_request_id": "INVALID_PARAM",
+                    "invalid_params": "INVALID_PARAM",
+                    "request_id_conflict": "IDEMPOTENCY_CONFLICT",
+                    "unsupported_method": "UNSUPPORTED_FEATURE",
+                    "outcome_unknown": "INTERNAL",
+                }
+                self._error(request_id, mapping.get(code, "INVALID_PARAM"), code)
+                return
             except Exception:
                 self._error(request_id, "INTERNAL")
                 return
@@ -974,14 +1010,45 @@ class CbdpGateway:
             queue_item_ref = params.pop("queue_item_ref", None)
             if queue_item_ref is not None and "queue_id" not in params:
                 params["queue_id"] = str(queue_item_ref)
-        if method in {"message.read.update"} and "thread_id" not in params:
-            params["thread_id"] = ""
         # Protocol selectors accept a compact ref *or* the string id; the
-        # upstream command layer only understands the string id.
+        # upstream command layer only understands the string id. Resolve the
+        # compact form first, then validate mutual selectors against the real
+        # value instead of manufacturing an empty thread_id that hides a bad
+        # request.
         if "thread_ref" in params:
-            resolved = self._thread_from_ref(int(params.pop("thread_ref")))
-            if resolved and "thread_id" not in params:
-                params["thread_id"] = resolved
+            ref = int(params.pop("thread_ref"))
+            resolved = self._thread_from_ref(ref)
+            if not resolved:
+                raise CBDPError("NOT_FOUND")
+            if "thread_id" in params and params["thread_id"] != resolved:
+                raise ValueError("thread selectors disagree")
+            params["thread_id"] = resolved
+        if "message_ref" in params:
+            ref = int(params.pop("message_ref"))
+            resolved = self._message_from_ref(ref)
+            if not resolved:
+                raise CBDPError("NOT_FOUND")
+            if "message_id" in params and params["message_id"] != resolved:
+                raise ValueError("message selectors disagree")
+            params["message_id"] = resolved
+        if method == "message.read.update":
+            if "thread_id" not in params:
+                thread_id = self._thread_for_message(params.get("message_id"))
+                if thread_id:
+                    params["thread_id"] = thread_id
+            read_at_ms = params.get("read_at_ms")
+            if not isinstance(read_at_ms, int) or isinstance(read_at_ms, bool) or read_at_ms < 0:
+                raise ValueError("read_at_ms")
+            params["read_at_ms"] = int(read_at_ms)
+        if method == "thread.read":
+            history_depth = params.pop("history_depth", None)
+            if "message_limit" not in params:
+                # Omitting the field uses the profile history budget. Explicit
+                # zero means metadata only, while a positive value caps the
+                # returned message list.
+                if history_depth is None:
+                    history_depth = profile_budget(int(self.session.profile or 0)).history_depth
+                params["message_limit"] = max(0, int(history_depth))
         return params
 
     def _restore_cursor(self, method, params):
@@ -1016,6 +1083,37 @@ class CbdpGateway:
                 return str(external)
         with self._lock:
             return self._ref_external.get(("thread", ref), "")
+
+    def _message_from_ref(self, ref: int) -> str:
+        """Resolve a CBDP message_ref through the persistent registry."""
+
+        if not ref:
+            return ""
+        if self.references is not None:
+            try:
+                return str(self.references.external_id("message", int(ref)) or "")
+            except Exception:
+                return ""
+        return ""
+
+    def _thread_for_message(self, message_id) -> str:
+        """Best-effort thread lookup for a read marker without a thread_id."""
+
+        value = str(message_id or "")
+        if not value:
+            return ""
+        # The event spine supplies the thread when only the message payload
+        # knows it. The lookup is bounded by EventSpine.latest_event.
+        if self.event_spine is not None:
+            event = self.event_spine.latest_event(
+                lambda item: item.payload.get(TAG_MESSAGE_ID) == utf8(value)
+            )
+            if event is not None:
+                try:
+                    return decode_utf8(event.payload.get(TAG_THREAD_ID, b""))
+                except CBDPError:
+                    return ""
+        return ""
 
     def _request_thread(self, frame) -> str:
         """Resolve an explicit thread selector carried on a SEND/AUDIO frame."""
@@ -1666,9 +1764,14 @@ class CbdpGateway:
         generation = int(self.session.generation)
 
         def run():
-            transcript = self._dispatch_audio_transcript(transaction, data)
+            transcript, failure = self._dispatch_audio_transcript(transaction, data)
             if transcript is None:
-                self._error(tx_id, "UPSTREAM_UNAVAILABLE")
+                self._error(
+                    tx_id,
+                    "UPSTREAM_UNAVAILABLE",
+                    failure or "STT_UNAVAILABLE",
+                    {"reason": "STT_UNAVAILABLE"},
+                )
                 return
             commands = self._commands()
             if commands is None:
@@ -1713,15 +1816,16 @@ class CbdpGateway:
         return None
 
     def _dispatch_audio_transcript(self, transaction, data):
-        """Run STT for an AUDIO_* transaction, then submit the text.
+        """Run STT and return ``(transcript_or_none, failure_reason)``.
 
-        Returns the transcribed text, or None when the recognizer cannot be
-        used. The caller decides how to report the error on the wire.
+        A recognizer exception is user-actionable and must survive to the wire;
+        otherwise a remote STT outage is indistinguishable from a missing
+        recognizer or an empty transcript.
         """
 
         recognizer = self.speech
         if recognizer is None or not hasattr(recognizer, "transcribe_pcm"):
-            return None
+            return None, "STT_NOT_CONFIGURED"
         try:
             text = recognizer.transcribe_pcm(
                 self.session.device_id,
@@ -1730,8 +1834,9 @@ class CbdpGateway:
                 channels=int(transaction.get("channels") or 1),
                 bits=int(transaction.get("bits") or 16),
             )
-        except Exception:
-            return None
+        except Exception as error:
+            reason = str(error).strip() or error.__class__.__name__
+            return None, _wire_text(reason, 512)
         if not isinstance(text, str) or not text.strip():
-            return None
-        return text.strip()
+            return None, "STT_EMPTY_TRANSCRIPT"
+        return text.strip(), ""

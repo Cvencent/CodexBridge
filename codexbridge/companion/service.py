@@ -1836,7 +1836,11 @@ class CompanionService:
                 if message.get("kind") not in INTERMEDIATE_MESSAGE_KINDS
             ]
         total = len(messages)
-        trimmed = messages[-max(1, int(message_limit)):]
+        # CBDP thread.read uses history_depth=0 for a metadata-only response.
+        # Other callers keep the historical "at least one message" behavior by
+        # sending a positive limit explicitly.
+        limit = max(0, int(message_limit))
+        trimmed = messages[-limit:] if limit else []
         summary = self._summary(thread)
         summary["thread_id"] = thread_id
         original = self._original_title(thread_id)
@@ -2105,6 +2109,40 @@ class CompanionService:
                 raise DesktopIpcError('desktop_handoff_pending')
         self.publish({'type': 'threads_changed', 'thread_id': thread_id})
         return {"thread": self._summary(thread)}
+
+    def mark_message_read(
+        self,
+        message_id: str,
+        read_at_ms: int,
+        thread_id: str = "",
+        source: str = "",
+    ) -> dict[str, Any]:
+        """Persist one message read marker and return the shared read state."""
+
+        if not message_id:
+            raise ValueError("message_id")
+        if not isinstance(read_at_ms, int) or isinstance(read_at_ms, bool) or read_at_ms < 0:
+            raise ValueError("read_at_ms")
+        source = str(source or "")
+        self._read_state.mark_message(message_id, source=source)
+        if thread_id and read_at_ms > 0:
+            self._read_state.mark_thread(
+                thread_id,
+                int(read_at_ms // 1000),
+                source=source,
+                notify=False,
+            )
+        return {
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "read_at": int(self._read_state.thread_read_at(thread_id)) if thread_id else 0,
+            "read_states": [
+                {
+                    "read_at_ms": int(read_at_ms),
+                    "source": source,
+                }
+            ],
+        }
 
     def mark_thread_read(self, thread_id: str) -> dict[str, Any]:
         if not thread_id:

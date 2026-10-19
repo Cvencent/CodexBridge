@@ -30,6 +30,11 @@ COMMANDS = {
     'queue.edit': ('queue', ('queue_id', 'text', 'expected_revision'), ('model', 'effort')),
     'queue.delete': ('queue', ('queue_id', 'expected_revision'), ()),
     'queue.steer': ('queue', ('queue_id', 'expected_revision'), ()),
+    # CBDP read-state uplink. Keeping this in the shared dispatcher means the
+    # device path uses the same validation, idempotency and read-state fan-out
+    # as the phone companion path instead of inventing a transport-specific
+    # implementation.
+    'message.read.update': ('read_unread', ('message_id', 'read_at_ms'), ('thread_id',)),
 }
 
 
@@ -69,8 +74,14 @@ class CommandDispatcher:
             if field == 'response':
                 if not isinstance(value, dict) or len(json.dumps(value)) > 20000:
                     raise CommandError('invalid_params')
-            elif field in {'limit', 'message_limit', 'approval_id', 'expected_revision'}:
-                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            elif field in {'limit', 'message_limit', 'approval_id', 'expected_revision', 'read_at_ms'}:
+                if field == 'read_at_ms':
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise CommandError('invalid_params')
+                elif field == 'message_limit':
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise CommandError('invalid_params')
+                elif not isinstance(value, int) or isinstance(value, bool) or value < 1:
                     raise CommandError('invalid_params')
             elif not isinstance(value, str) or len(value) > 20000:
                 raise CommandError('invalid_params')
@@ -88,7 +99,7 @@ class CommandDispatcher:
                     raise CommandError('outcome_unknown') from cached[1]
                 return self._visible(deepcopy(cached[1]), capabilities)
             try:
-                result = self._dispatch(method, params, request_id)
+                result = self._dispatch(device_id, method, params, request_id)
             except Exception as error:
                 # A failed transport may have dispatched the write already.
                 self._remember(key, fingerprint, error)
@@ -110,7 +121,7 @@ class CommandDispatcher:
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
 
-    def _dispatch(self, method, params, request_id):
+    def _dispatch(self, device_id, method, params, request_id):
         service = self.service
         if method == 'status.read':
             return service.snapshot()
@@ -146,4 +157,6 @@ class CommandDispatcher:
             return service.queue_delete(**params)
         if method == 'queue.steer':
             return service.queue_steer(**params)
+        if method == 'message.read.update':
+            return service.mark_message_read(**params, source=device_id)
         return {'resolved': service.resolve_approval(params['approval_id'], params['decision'])}

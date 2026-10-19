@@ -19,6 +19,14 @@ CBDP v1 是当前主设备协议；本文档定义旧设备继续接入时使用
 或本文件记录的管理接口的改动，都必须在同一个提交中同步更新本文件。修改协议
 行为时，同时更新相关测试和示例；不确定是否影响协议时，按需要更新处理。
 
+## 当前协议实现修正
+
+CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026-10-19 修正了以下 Bridge 行为：
+
+- `thread.read(0x0003)` 的 `history_depth(0x0014)` 按 `u16` 解码，并转换为内部消息条数；省略时使用设备 profile 的历史预算，不再把该字段当作泛化 `limit` 传入共享命令层。
+- `message.read.update(0x00A0)` 现在进入共享命令层并写入统一已读存储；`message_ref` / `thread_ref` 先从持久引用表解析，未知引用返回 `NOT_FOUND`。
+- `AUDIO_END` 现在会把 STT 的真实失败原因写入 `error_message(0x0062)`，并在 `error_detail(0x0063)` 标记 `reason = STT_UNAVAILABLE`；协议错误码仍是 `UPSTREAM_UNAVAILABLE`，设备因此可以区分识别上游故障与音频参数错误。联调机的语音配置指向 `127.0.0.1:8790` 的 OpenAI 兼容接口；该端口可连接，但识别仍失败，需根据修复后返回的原因继续定位接口响应、模型或超时问题。
+
 ## 1. 范围与角色
 
 CodexBridge 是 PC 端协议主机，负责：

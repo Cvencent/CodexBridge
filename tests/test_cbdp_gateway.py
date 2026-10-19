@@ -74,6 +74,7 @@ from codexbridge.cbdp.tlv import (
     decode_u32,
     decode_u64,
     encode_tlvs,
+    i64,
     u8,
     u16,
     u32,
@@ -885,6 +886,261 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertTrue(self.gateway._transactions)
         self.gateway.begin_session()
         self.assertEqual(self.gateway._transactions, {})
+
+    def test_audio_end_preserves_stt_failure_reason(self):
+        class Recognizer:
+            def transcribe_pcm(self, device_id, data, **kwargs):
+                raise RuntimeError("STT upstream refused the request")
+
+        self.gateway.speech = Recognizer()
+        self.gateway.capability_policy = lambda device_id: {"status", "audio", "control"}
+        self.gateway.active_thread = lambda device_id: "thread-1"
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["audio"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_BEGIN,
+                flags=FLAG_REQUEST,
+                header={
+                    0x002D: u32(32),
+                    0x0073: u8(0),
+                    0x0074: u32(16000),
+                    0x0075: u8(1),
+                    0x0076: u8(16),
+                },
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_CHUNK,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(32), 0x0048: u32(0)},
+                payload=b"\x01\x02" * 8,
+            )
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUDIO_END,
+                flags=FLAG_REQUEST,
+                header={0x002D: u32(32)},
+            )
+        )
+        error = self.sent[-1]
+        self.assertEqual(error.message_type, TYPE_ERROR)
+        self.assertEqual(error.code, 0x000B)
+        self.assertEqual(
+            decode_utf8(error.header[0x0062]),
+            "STT upstream refused the request",
+        )
+        detail = decode_tlvs(error.header[0x0063])
+        self.assertEqual(decode_utf8(detail[0x0096]), "STT_UNAVAILABLE")
+
+    def test_thread_read_maps_history_depth_to_message_limit(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        params = encode_tlvs(
+            [
+                (0x0021, u32(self.refs.ref_for("thread", "t1"))),
+                (0x0014, u16(2)),
+            ]
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(30),
+                    TAG_METHOD_ID: u16(0x0003),
+                    TAG_PARAMS: params,
+                },
+            )
+        )
+        self.assertEqual(self.sent[-1].message_type, TYPE_RESULT)
+        request = self.dispatcher.calls[-1][2]
+        self.assertEqual(request["method"], "thread.read")
+        self.assertEqual(
+            request["params"],
+            {"thread_id": "t1", "message_limit": 2},
+        )
+
+    def test_message_read_update_dispatches_through_shared_command_layer(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "read_unread"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["read_unread"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        params = encode_tlvs(
+            [
+                (0x0025, u32(self.refs.ref_for("message", "m1"))),
+                (0x0021, u32(self.refs.ref_for("thread", "t1"))),
+                (0x0054, i64(1791000000000)),
+            ]
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(31),
+                    TAG_METHOD_ID: u16(0x00A0),
+                    TAG_PARAMS: params,
+                },
+            )
+        )
+        self.assertEqual(self.sent[-1].message_type, TYPE_RESULT)
+        request = self.dispatcher.calls[-1][2]
+        self.assertEqual(request["method"], "message.read.update")
+        self.assertEqual(
+            request["params"],
+            {
+                "message_id": "m1",
+                "thread_id": "t1",
+                "read_at_ms": 1791000000000,
+            },
+        )
+
+    def test_thread_read_zero_history_depth_requests_metadata_not_a_message(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        params = encode_tlvs(
+            [
+                (0x0021, u32(self.refs.ref_for("thread", "t1"))),
+                (0x0014, u16(0)),
+            ]
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(33),
+                    TAG_METHOD_ID: u16(0x0003),
+                    TAG_PARAMS: params,
+                },
+            )
+        )
+        self.assertEqual(
+            self.dispatcher.calls[-1][2]["params"]["message_limit"],
+            0,
+        )
+
+    def test_thread_read_omitted_history_depth_uses_profile_budget(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["tasks"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        params = encode_tlvs(
+            [(0x0021, u32(self.refs.ref_for("thread", "t1")))]
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(34),
+                    TAG_METHOD_ID: u16(0x0003),
+                    TAG_PARAMS: params,
+                },
+            )
+        )
+        self.assertEqual(
+            self.dispatcher.calls[-1][2]["params"]["message_limit"],
+            2,
+        )
+
+    def test_unknown_message_ref_returns_not_found(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "read_unread"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["read_unread"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        params = encode_tlvs(
+            [
+                (0x0025, u32(999999)),
+                (0x0054, i64(1791000000000)),
+            ]
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(35),
+                    TAG_METHOD_ID: u16(0x00A0),
+                    TAG_PARAMS: params,
+                },
+            )
+        )
+        self.assertEqual(self.sent[-1].message_type, TYPE_ERROR)
+        self.assertEqual(self.sent[-1].code, 0x0001)
+        self.assertEqual(self.dispatcher.calls, [])
+
+    def test_unknown_command_error_keeps_its_operation_reason(self):
+        class RefusingDispatcher:
+            def execute(self, device_id, capabilities, request):
+                raise gateway.CommandError("invalid_params")
+
+        self.gateway.commands = RefusingDispatcher()
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_COMMAND,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(36),
+                    TAG_METHOD_ID: u16(0x0001),
+                    TAG_PARAMS: encode_tlvs([]),
+                },
+            )
+        )
+        self.assertEqual(self.sent[-1].message_type, TYPE_ERROR)
+        self.assertEqual(self.sent[-1].code, 0x0006)
+        self.assertEqual(decode_utf8(self.sent[-1].header[0x0062]), "invalid_params")
 
     def test_thread_read_result_carries_top_level_thread_ref_and_status(self):
         self.gateway.capability_policy = lambda device_id: {"status", "tasks"}
