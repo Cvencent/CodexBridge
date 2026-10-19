@@ -207,6 +207,26 @@ class CbdpHttpTransportTests(unittest.TestCase):
         self.assertEqual(response.status, 200, payload)
         self.assertEqual(payload["cbdp_v1"]["version_major"], 1)
 
+    def test_broker_passes_active_state_hooks_to_the_gateway(self) -> None:
+        recorded = {}
+
+        def setter(device_id, thread_id, turn_id):
+            recorded["value"] = (device_id, thread_id, turn_id)
+            return {"thread_id": thread_id, "turn_id": turn_id}
+
+        broker = CbdpHttpBroker(
+            commands=lambda: self.service.commands,
+            capability_for=lambda phone_id: {"tasks"},
+            active_state=lambda device_id: {"thread_id": "t1", "turn_id": ""},
+            set_active_state=setter,
+        )
+        gateway = broker._gateway("phone-http-1", "token")
+        self.assertIsNotNone(gateway.active_state)
+        self.assertIsNotNone(gateway.set_active_state)
+        self.assertEqual(gateway.active_state("phone-http-1")["thread_id"], "t1")
+        gateway.set_active_state("phone-http-1", "t2", "u2")
+        self.assertEqual(recorded["value"][1:], ("t2", "u2"))
+
     def test_ws_route_exists_and_requires_upgrade(self) -> None:
         paired = self.pair()
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)

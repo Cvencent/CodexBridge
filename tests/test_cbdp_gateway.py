@@ -874,6 +874,29 @@ class CbdpGatewayTests(unittest.TestCase):
         )
         self.assertEqual(self.gateway._incoming_seq, 5)
 
+    def test_handshake_responses_are_numbered(self):
+        self.gateway.handle_frame(self.hello())
+        welcome = self.sent[-1]
+        self.assertEqual(welcome.message_type, TYPE_WELCOME)
+        self.assertNotEqual(welcome.seq, 0)
+        session = self.gateway.session
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_AUTH,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_DEVICE_ID: utf8("dev-1"),
+                    TAG_SESSION_ID: session.session_id,
+                    TAG_AUTH_PROOF: self.gateway.expected_proof("dev-1", session),
+                    TAG_AUTH_MODE: u8(1),
+                    TAG_REQUEST_ID: u32(2),
+                },
+            )
+        )
+        auth_ok = self.sent[-1]
+        self.assertEqual(auth_ok.message_type, TYPE_AUTH_OK)
+        self.assertGreater(auth_ok.seq, welcome.seq)
+
     def test_active_state_read_and_set_are_implemented(self):
         self.gateway.capability_policy = lambda device_id: {
             "status", "tasks", "cross_device_active",

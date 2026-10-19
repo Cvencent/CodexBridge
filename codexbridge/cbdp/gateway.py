@@ -788,6 +788,8 @@ class CbdpGateway:
         welcome = Frame(
             message_type=TYPE_WELCOME,
             flags=FLAG_RESPONSE,
+            seq=self._next_seq(),
+            ack_seq=self._incoming_seq,
             header={
                 TAG_VERSION_MINOR: u16(0),
                 TAG_SESSION_ID: session.session_id,
@@ -845,6 +847,8 @@ class CbdpGateway:
             Frame(
                 message_type=TYPE_AUTH_OK,
                 flags=FLAG_RESPONSE,
+                seq=self._next_seq(),
+                ack_seq=self._incoming_seq,
                 header={
                     TAG_DEVICE_ID: utf8(device_id),
                     TAG_EFFECTIVE_CAPS: u64(session.effective),
