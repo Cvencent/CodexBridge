@@ -77,11 +77,18 @@ class SubscriptionManager:
                 existing.cursor = 0
                 existing.pending = []
                 return SubscriptionResult(topic_id, scope, qos, 0, False, [])
-            replay = self.event_spine.events_since(
-                cursor,
-                topic_id=topic_id,
-                limit=max(1, self._queue_depth.get(device_id, self.default_queue_depth)),
-            )
+            depth = max(1, self._queue_depth.get(device_id, self.default_queue_depth))
+            if cursor == 0:
+                # A device with no cursor wants current state, not the oldest
+                # page of a long journal. Replaying from 0 would hand it
+                # ancient history and it would never reach the present.
+                replay = self.event_spine.events_latest(topic_id=topic_id, limit=depth)
+            else:
+                replay = self.event_spine.events_since(
+                    cursor,
+                    topic_id=topic_id,
+                    limit=depth,
+                )
             next_cursor = cursor
             for event in replay:
                 next_cursor = max(next_cursor, int(event.global_seq))

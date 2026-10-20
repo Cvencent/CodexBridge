@@ -246,6 +246,51 @@ class EventSpine:
             for row in rows
         ]
 
+    def events_latest(self, topic_id=0, limit=256):
+        """Return the newest committed events, still in ascending seq order.
+
+        A fresh subscriber has no cursor, so replaying from ``0`` would walk
+        the oldest history and never reach current state. Bounded queues are
+        the real limit: give the client the most recent window instead.
+        """
+
+        limit = max(1, min(int(limit), 4096))
+        with self._lock:
+            if self._connection is None:
+                rows = [
+                    event for event in list(self.ring)
+                    if not topic_id or event.topic_id == int(topic_id)
+                ][-limit:]
+                return rows
+            query = (
+                "SELECT event_id, global_seq, topic_id, topic_seq, revision, "
+                "event_type, qos, payload, created_at_ms FROM events "
+            )
+            params: tuple = ()
+            if topic_id:
+                query += "WHERE topic_id = ? ORDER BY global_seq DESC LIMIT ?"
+                params = (int(topic_id), limit)
+            else:
+                query += "ORDER BY global_seq DESC LIMIT ?"
+                params = (limit,)
+            fetched = self._connection.execute(query, params).fetchall()
+        events = [
+            Event(
+                event_id=bytes.fromhex(row[0]),
+                global_seq=int(row[1]),
+                topic_id=int(row[2]),
+                topic_seq=int(row[3]),
+                revision=int(row[4]),
+                event_type=int(row[5]),
+                qos=int(row[6]),
+                payload=decode_tlvs(row[7] or b""),
+                created_at_ms=int(row[8]),
+            )
+            for row in fetched
+        ]
+        events.reverse()
+        return events
+
     def cursor_is_recoverable(self, cursor):
         cursor = max(0, int(cursor))
         if cursor == 0:

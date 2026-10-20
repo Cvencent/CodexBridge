@@ -25,6 +25,21 @@ class SubscriptionManagerTests(unittest.TestCase):
         self.assertEqual([item.global_seq for item in result.replay], [second.global_seq])
         self.assertEqual(result.cursor, second.global_seq)
 
+    def test_fresh_subscription_replays_the_newest_window(self):
+        # A fresh subscriber has no cursor. Replaying the oldest page of a long
+        # journal would never reach current state, so the newest window wins.
+        spine, manager = self.make(depth=4)
+        for _ in range(10):
+            spine.append(0x10000001, 0x0101, 1, {})
+        result = manager.subscribe("dev-1", 0x10000001, 1, 1, cursor=0)
+        self.assertTrue(result.recoverable)
+        seqs = [item.global_seq for item in result.replay]
+        self.assertEqual(len(seqs), 4)
+        # Ascending order, and the newest event is included.
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(seqs[-1], 10)
+        self.assertEqual(result.cursor, 10)
+
     def test_ack_cursor_advances_only_for_its_subscription(self):
         spine, manager = self.make()
         event = spine.append(0x10000001, 0x0101, 1, {})
