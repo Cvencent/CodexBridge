@@ -37,6 +37,20 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、
   `failed_unread_count(0x00BE)`。旧的 `codex_state` 字典无法翻译成 CBDP DELTA，
   之前在 CBDP 会话上被静默丢弃，是首页“运行中”恒为 0 的原因。
+- Companion 审批提交路由修正为 `POST /api/companion/approvals/<request_id>`
+  （路径只有 4 段，旧代码按 5 段判断导致恒 404）；请求体带 `response` 时走
+  结构化审批，否则走 `decision`。
+- CBDP `APPROVAL_RESOLVE` 现已实现：字段位于消息 header，接受
+  `approval_ref`（经引用表解析，失败返回 `NOT_FOUND`）或 `approval_id`，
+  携带 `response` 时转成结构化 `approval.respond`。
+- 审批 `approval_kind` 按协议 §20.4 校正为 `command=0`、`file_change=1`、
+  `network_access=2`、`permission=3`、`mcp_tool=4`、`user_input=5`、
+  `other=6`、`mcp_elicitation=7`；旧实现的 permission/mcp/user_input 编号是错的。
+- `approval.requested/resolved/expired` 现在同时写入 CBDP Event Spine，
+  面板等 CBDP 设备能收到 `0x0401/0x0402/0x0403`。
+- 新增 `thread.settings.read/update`（CBDP `0x001A/0x001B`），可读写模型、
+  effort、cwd 以及 `approval_policy` / `approvals_reviewer` /
+  `sandbox_policy` / `personality`。
 
 ## 1. 范围与角色
 

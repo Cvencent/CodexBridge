@@ -486,6 +486,11 @@ def main(argv: list[str] | None = None) -> int:
         show_intermediate_events=lambda: companion_store.show_intermediate_events,
     )
     hub.commands = companion_service.commands
+    # Approval changes must also reach CBDP panels, not just the legacy JSON
+    # event stream. Give the service the same spine and refs the device path
+    # uses so it can append approval.* events.
+    companion_service._cbdp_event_spine = event_spine
+    companion_service._cbdp_references = references
     # A read made on the hardware also retracts the phone notification badge.
     hub.companion_events = companion_service
     cbdp_http = CbdpHttpBroker(

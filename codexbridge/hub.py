@@ -47,6 +47,12 @@ from codexbridge.cbdp.constants import (
     TAG_RUNNING_COUNT,
     TAG_COMPLETED_UNREAD,
     TAG_FAILED_UNREAD,
+    TAG_APPROVAL_KIND,
+    TAG_APPROVAL_ID,
+    TAG_APPROVAL_REF,
+    TAG_PROMPT,
+    TAG_EXPIRES_AT_MS,
+    TAG_TURN_REF,
 )
 
 from codexbridge.cbdp.capabilities import capability_bitmap

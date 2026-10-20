@@ -383,7 +383,11 @@ class DesktopIpcClient:
         return result
 
     def update_thread_settings(self, owner_id: str, thread_id: str, *,
-                               model: str = '', effort: str = '') -> bool:
+                               model: str = '', effort: str = '',
+                               approval_policy: str = '',
+                               approvals_reviewer: str = '',
+                               sandbox_policy: str = '',
+                               personality: str = '') -> bool:
         """Persist explicit model/effort choices before a desktop-owned turn.
 
         The desktop inherits thread settings for follower turns, so a model
@@ -395,6 +399,14 @@ class DesktopIpcClient:
             settings['model'] = str(model)
         if effort:
             settings['effort'] = str(effort)
+        if approval_policy:
+            settings['approvalPolicy'] = str(approval_policy)
+        if approvals_reviewer:
+            settings['approvalsReviewer'] = str(approvals_reviewer)
+        if sandbox_policy:
+            settings['sandboxPolicy'] = str(sandbox_policy)
+        if personality:
+            settings['personality'] = str(personality)
         if not settings:
             return True
         response = self._request('thread-follower-update-thread-settings', {

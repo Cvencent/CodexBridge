@@ -118,6 +118,7 @@ from codexbridge.cbdp.constants import (
     TYPE_AUDIO_BEGIN,
     TYPE_AUDIO_CHUNK,
     TYPE_AUDIO_END,
+    TYPE_APPROVAL_RESOLVE,
     TYPE_AUTH,
     TYPE_AUTH_OK,
     TYPE_CLOSE,
@@ -187,6 +188,8 @@ METHOD_IDS = {
     0x00B1: "active_state.read",
     0x00B2: "active_state.set",
     0x00B3: "events.since",
+    0x001A: "thread.settings.read",
+    0x001B: "thread.settings.update",
 }
 METHOD_CAPABILITIES = {
     0x0001: "status",
@@ -213,6 +216,8 @@ METHOD_CAPABILITIES = {
     0x00B1: "cross_device_active",
     0x00B2: "cross_device_active",
     0x00B3: "events_since",
+    0x001A: "thread_settings",
+    0x001B: "thread_settings",
 }
 DISPATCH_METHODS = {
     "queue.add": "queue.enqueue",
@@ -269,6 +274,17 @@ def _message_status(status: str) -> int:
     }.get(str(status or ""), 0)
 
 
+def _decision_name(value: int) -> str:
+    """Map the wire decision number to the shared command's decision word."""
+
+    return {
+        0: "accept",
+        1: "acceptForSession",
+        2: "decline",
+        3: "cancel",
+    }.get(int(value), "")
+
+
 # Per-field byte budgets for object payloads. A single oversized upstream field
 # must never make the whole RESULT unencodable: a TLV value is u16-length
 # bounded and the entire frame has to fit the negotiated budget, so long text
@@ -314,10 +330,13 @@ PARAM_TAGS = {
     "message_id": 0x0026,
     "message_ref": 0x0025,
     "approval_id": 0x0028,
+    "approval_ref": 0x0027,
+    "approval_kind": 0x0087,
     "text": 0x0042,
     "body": 0x0042,
     "title": 0x0040,
     "decision": 0x0082,
+    "response": 0x0083,
     "queue_id": 0x0100,
     "queue_item_ref": 0x0100,
     "expected_revision": 0x006B,
@@ -686,6 +705,8 @@ class CbdpGateway:
             return self._handle_audio_chunk(frame)
         if frame.message_type == TYPE_AUDIO_END:
             return self._handle_audio_end(frame)
+        if frame.message_type == TYPE_APPROVAL_RESOLVE:
+            return self._handle_approval_resolve(frame)
         return self._error(self._request_id(frame), "UNSUPPORTED_FEATURE")
 
     def _handle_peer_error(self, frame):
@@ -970,12 +991,15 @@ class CbdpGateway:
                     result[name] = decode_u64(raw) if len(raw) == 8 else decode_u32(raw)
                 elif name == "history_depth":
                     result[name] = decode_u16(raw)
-                elif name in {"thread_ref", "active_thread_ref", "active_turn_ref"}:
+                elif name in {"thread_ref", "active_thread_ref", "active_turn_ref", "approval_ref"}:
                     result[name] = decode_u32(raw)
                 elif name == "read_at_ms":
                     result[name] = decode_i64(raw)
                 elif name == "decision":
                     result[name] = decode_u8(raw)
+                elif name == "response":
+                    # response is a nested TLV; keep it opaque for the caller.
+                    result[name] = raw
                 else:
                     result[name] = decode_utf8(raw)
             except CBDPError:
@@ -1622,9 +1646,20 @@ class CbdpGateway:
             TAG_THREAD_REF: u32(self._ref("thread", thread_id)),
             TAG_TURN_REF: u32(self._ref("turn", turn_id)),
             TAG_APPROVAL_KIND: u8(
-                {"command": 0, "file": 1, "permissions": 2, "mcp": 3, "input": 4}.get(
-                    str(row.get("kind") or ""), 5
-                )
+                # Protocol 20.4: 0=command_execution, 1=file_change,
+                # 2=network_access, 3=permission, 4=mcp_tool, 5=user_input,
+                # 6=other, 7=mcp_elicitation.
+                {
+                    "command": 0,
+                    "fileChange": 1,
+                    "file": 1,
+                    "network": 2,
+                    "permissions": 3,
+                    "permission": 3,
+                    "mcp": 4,
+                    "input": 5,
+                    "mcp_elicitation": 7,
+                }.get(str(row.get("kind") or ""), 6)
             ),
             TAG_PROMPT: utf8(_wire_text(row.get("command") or row.get("reason"), text_limit)),
         }
@@ -1696,6 +1731,103 @@ class CbdpGateway:
                 header=header,
             )
         )
+
+    def _handle_approval_resolve(self, frame):
+        """Handle APPROVAL_RESOLVE (0x17) from a device.
+
+        Accepts either the compact ``approval_ref`` or the external
+        ``approval_id``, and passes a structured ``response`` through when the
+        client sent one (MCP elicitation, user input, permissions). Without a
+        response the plain numeric ``decision`` is used.
+        """
+
+        try:
+            request_id = decode_u32(require_tlv(frame.header, TAG_REQUEST_ID))
+        except CBDPError as error:
+            return self._error(self._request_id(frame), error.name)
+        if "approval" not in self._capabilities():
+            return self._error(request_id, "CAPABILITY_NOT_ENABLED")
+        # APPROVAL_RESOLVE carries its fields in the message header (the
+        # firmware builds it that way), not inside a params TLV.
+        params = self._decode_params(frame.header)
+        approval_id = str(params.get("approval_id") or "")
+        if not approval_id:
+            ref = int(params.get("approval_ref") or 0)
+            if ref:
+                approval_id = self._approval_from_ref(ref)
+                if not approval_id:
+                    return self._error(request_id, "NOT_FOUND", "approval_ref")
+        if not approval_id:
+            return self._error(request_id, "INVALID_PARAM", "approval_required")
+
+        response = None
+        raw_response = params.get("response")
+        if isinstance(raw_response, (bytes, bytearray)) and raw_response:
+            try:
+                nested = decode_tlvs(raw_response)
+                action = decode_utf8(nested.get(0x0141, b""))
+                content_raw = decode_utf8(nested.get(0x0142, b"{}")) or "{}"
+                response = {"action": action, "content": json.loads(content_raw)}
+            except (CBDPError, ValueError, TypeError):
+                response = None
+        decision = params.get("decision")
+        if response is None and decision is None:
+            return self._error(request_id, "INVALID_PARAM", "decision_required")
+
+        commands = self._commands()
+        if commands is None:
+            return self._error(request_id, "UPSTREAM_UNAVAILABLE")
+        if response is not None:
+            method = "approval.respond"
+            call_params = {"approval_id": approval_id, "response": response}
+        else:
+            method = "approval.resolve"
+            call_params = {
+                "approval_id": approval_id,
+                "decision": _decision_name(int(decision)),
+            }
+        device_id = str(self.session.device_id or "")
+        generation = int(self.session.generation)
+
+        def run():
+            try:
+                result = commands.execute(
+                    device_id,
+                    self._capabilities(),
+                    {
+                        "type": "command",
+                        "request_id": f"cbdp-approval:{device_id}:{request_id}",
+                        "method": method,
+                        "params": call_params,
+                    },
+                )
+            except Exception:
+                self._error(request_id, "INTERNAL")
+                return
+            if not isinstance(result, dict) or not result.get("ok"):
+                code = (
+                    str(result.get("error") or "INVALID_STATE")
+                    if isinstance(result, dict)
+                    else "INTERNAL"
+                )
+                self._error(request_id, "INVALID_STATE", code)
+                return
+            self._result(
+                request_id, 0x0009, self._result_fields(result.get("result"), method)
+            )
+
+        if self._maybe_defer(generation, run):
+            return None
+        run()
+        return None
+
+    def _approval_from_ref(self, ref: int) -> str:
+        if not ref or self.references is None:
+            return ""
+        try:
+            return str(self.references.external_id("approval", int(ref)) or "")
+        except Exception:
+            return ""
 
     def _begin_transaction(self, tx_id, frame) -> bool:
         """Accept a BEGIN, tolerating a retry of an empty in-flight transaction.

@@ -163,6 +163,39 @@ class CbdpHubEventTests(unittest.TestCase):
             )
         )
 
+    def test_approval_request_is_mirrored_onto_the_event_spine(self):
+        from codexbridge.companion.service import CompanionService
+        from codexbridge.cbdp.tlv import decode_tlvs
+
+        service = CompanionService(
+            self.root,
+            self.root,
+            client_factory=lambda command, cwd: _NullClient(),
+        )
+        self.addCleanup(service.stop)
+        service._cbdp_event_spine = self.events
+        service._cbdp_references = self.refs
+        service.publish(
+            {
+                "type": "approval_request",
+                "thread_id": "t1",
+                "turn_id": "u1",
+                "request_id": "ap-9",
+                "kind": "mcp",
+                "command": "codegraph_context",
+            }
+        )
+        events = self._events(0x0401)
+        self.assertEqual(len(events), 1)
+        fields = events[0].payload
+        self.assertEqual(fields[0x0087], b"\x04")  # mcp_tool
+        self.assertEqual(fields[0x0028], b"ap-9")
+
+
+class _NullClient:
+    def close(self):
+        return None
+
     def test_message_events_share_the_thread_topic_and_scope(self):
         from codexbridge.cbdp.events import event_scope
 

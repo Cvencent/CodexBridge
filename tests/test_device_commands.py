@@ -14,6 +14,14 @@ class Service:
         self.calls.append((thread_id, text, options))
         return {'thread_id': thread_id, 'turn_id': 'turn-1', 'status': 'working'}
 
+    def read_thread_settings(self, thread_id):
+        self.calls.append(('settings-read', thread_id))
+        return {'thread_id': thread_id, 'approval_policy': 'on-request'}
+
+    def update_thread_settings(self, thread_id, **settings):
+        self.calls.append(('settings-update', thread_id, settings))
+        return {'thread_id': thread_id, 'applied': True, 'settings_revision': 0}
+
 
 class ReadStateCommandTests(unittest.TestCase):
     def test_message_read_update_marks_shared_message_and_thread_state(self):
@@ -225,6 +233,20 @@ class DeviceCommandTests(unittest.TestCase):
                 self.commands.execute('a', {'control'},
                                       {'request_id': 'x', 'method': 'turn.start', 'params': params})
         self.assertEqual(self.service.calls, [])
+
+    def test_thread_settings_read_and_update_are_dispatched(self):
+        read = self.commands.execute('device-a', {'tasks'}, {
+            'request_id': 'rs1', 'method': 'thread.settings.read',
+            'params': {'thread_id': 't1'},
+        })
+        self.assertTrue(read['ok'])
+        self.assertEqual(read['result']['thread_id'], 't1')
+        updated = self.commands.execute('device-a', {'control'}, {
+            'request_id': 'rs2', 'method': 'thread.settings.update',
+            'params': {'thread_id': 't1', 'approval_policy': 'never'},
+        })
+        self.assertTrue(updated['ok'])
+        self.assertTrue(updated['result']['applied'])
 
     def test_thread_rename_uses_shared_dispatch(self):
         result = self.commands.execute('device-a', {'control'}, {

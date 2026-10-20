@@ -26,6 +26,16 @@ from codexbridge.codex.app_server import (
     resolve_terminal_state,
     thread_snapshot,
 )
+from codexbridge.cbdp.constants import (
+    TAG_APPROVAL_ID,
+    TAG_APPROVAL_KIND,
+    TAG_APPROVAL_REF,
+    TAG_EXPIRES_AT_MS,
+    TAG_PROMPT,
+    TAG_THREAD_REF,
+    TAG_TURN_REF,
+)
+from codexbridge.cbdp.tlv import encode_tlvs, i64, u8, u32, utf8
 from codexbridge.codex.desktop_ipc import DesktopIpcError
 from codexbridge.codex.rollout_activity import (
     read_log_tail,
@@ -1165,6 +1175,79 @@ class CompanionService:
         if payload.get('type') not in self.STREAMING_EVENT_TYPES:
             self._invalidate_reads(str(payload.get('thread_id') or ''))
         self._events.publish(payload)
+        if payload.get('type') in {"approval_request", "approval_resolved", "approval_expired"}:
+            publish_cbdp = getattr(self, "_publish_cbdp_approval", None)
+            if callable(publish_cbdp):
+                publish_cbdp(payload)
+
+    def _publish_cbdp_approval(self, payload: dict[str, Any]) -> None:
+        """Mirror an approval change onto the CBDP Event Spine.
+
+        Legacy phones read approval_* from the JSON event stream. CBDP devices
+        only see committed Event Spine events, so the same transition must be
+        appended there or an ESP panel never learns that approval is pending.
+        """
+
+        spine = getattr(self, "_cbdp_event_spine", None)
+        if spine is None:
+            return
+        kind = str(payload.get("type") or "")
+        event_type = {
+            "approval_request": 0x0401,
+            "approval_resolved": 0x0402,
+            "approval_expired": 0x0403,
+        }.get(kind)
+        if event_type is None:
+            return
+        thread_id = str(payload.get("thread_id") or "")
+        approval_id = str(payload.get("request_id") or payload.get("approval_id") or "")
+        if not approval_id:
+            return
+        topic_id = 0
+        refs = getattr(self, "_cbdp_references", None)
+        if refs is not None:
+            try:
+                topic_id = int(refs.topic_for(thread_id)) if thread_id else 0
+            except Exception:
+                topic_id = 0
+        fields: dict[int, bytes] = {
+            TAG_APPROVAL_ID: utf8(approval_id),
+        }
+        if refs is not None:
+            try:
+                fields[TAG_APPROVAL_REF] = u32(
+                    int(refs.ref_for("approval", approval_id))
+                )
+                if thread_id:
+                    fields[TAG_THREAD_REF] = u32(
+                        int(refs.ref_for("thread", thread_id))
+                    )
+                turn_id = str(payload.get("turn_id") or "")
+                if turn_id:
+                    fields[TAG_TURN_REF] = u32(int(refs.ref_for("turn", turn_id)))
+            except Exception:
+                pass
+        if kind == "approval_request":
+            fields[TAG_APPROVAL_KIND] = u8(
+                {
+                    "command": 0,
+                    "fileChange": 1,
+                    "permissions": 3,
+                    "mcp": 4,
+                    "input": 5,
+                }.get(str(payload.get("kind") or ""), 6)
+            )
+            prompt = str(payload.get("command") or payload.get("reason") or "")
+            if prompt:
+                fields[TAG_PROMPT] = utf8(_clip(prompt, 512))
+            expires = int(float(payload.get("expires_at") or 0) * 1000)
+            if expires:
+                fields[TAG_EXPIRES_AT_MS] = i64(expires)
+        try:
+            # EventSpine expects the TLV map itself and encodes it on append.
+            spine.append(topic_id, event_type, 0x0, fields)
+        except Exception:
+            return
 
     def _invalidate_reads(self, thread_id: str) -> None:
         """Retire the cached reads a change makes stale.
@@ -2248,6 +2331,90 @@ class CompanionService:
                     "source": source,
                 }
             ],
+        }
+
+    def read_thread_settings(self, thread_id: str) -> dict[str, Any]:
+        """Return the settings a phone needs for its approval-mode control."""
+
+        if not thread_id:
+            raise ValueError("thread_id")
+        detail = self._read("thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = detail.get("thread") if isinstance(detail, dict) else None
+        if not isinstance(thread, dict):
+            raise ValueError("thread")
+        runtime = thread.get("status") if isinstance(thread.get("status"), dict) else {}
+        return {
+            "thread_id": thread_id,
+            "model": str(thread.get("model") or ""),
+            "effort": str(thread.get("effort") or ""),
+            "cwd": str(thread.get("cwd") or ""),
+            "approval_policy": str(
+                thread.get("approvalPolicy") or runtime.get("approvalPolicy") or ""
+            ),
+            "approvals_reviewer": str(
+                thread.get("approvalsReviewer") or runtime.get("approvalsReviewer") or ""
+            ),
+            "sandbox_policy": str(
+                thread.get("sandboxPolicy") or runtime.get("sandboxPolicy") or ""
+            ),
+            "personality": str(thread.get("personality") or ""),
+            "settings_revision": int(thread.get("settingsRevision") or 0),
+        }
+
+    def update_thread_settings(
+        self,
+        thread_id: str,
+        model: str = "",
+        effort: str = "",
+        approval_policy: str = "",
+        approvals_reviewer: str = "",
+        sandbox_policy: str = "",
+        personality: str = "",
+    ) -> dict[str, Any]:
+        """Persist thread-level settings, including the approval mode."""
+
+        if not thread_id:
+            raise ValueError("thread_id")
+        if not any(
+            [model, effort, approval_policy, approvals_reviewer, sandbox_policy, personality]
+        ):
+            raise ValueError("settings")
+        owner = None
+        with self._resumed_lock:
+            owner = self._desktop_followed.get(thread_id)
+        if owner and self._desktop is not None:
+            applied = self._desktop.update_thread_settings(
+                owner,
+                thread_id,
+                model=model,
+                effort=effort,
+                approval_policy=approval_policy,
+                approvals_reviewer=approvals_reviewer,
+                sandbox_policy=sandbox_policy,
+                personality=personality,
+            )
+        else:
+            self._ensure_client()
+            params: dict[str, Any] = {"threadId": thread_id}
+            if model:
+                params["model"] = model
+            if effort:
+                params["effort"] = effort
+            if approval_policy:
+                params["approvalPolicy"] = approval_policy
+            if approvals_reviewer:
+                params["approvalsReviewer"] = approvals_reviewer
+            if sandbox_policy:
+                params["sandboxPolicy"] = sandbox_policy
+            if personality:
+                params["personality"] = personality
+            self._client.request("thread/settings/update", params)
+            applied = True
+        self.publish({"type": "thread_settings_changed", "thread_id": thread_id})
+        return {
+            "thread_id": thread_id,
+            "applied": bool(applied),
+            "settings_revision": 0,
         }
 
     def mark_thread_read(self, thread_id: str) -> dict[str, Any]:

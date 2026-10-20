@@ -29,6 +29,9 @@ from codexbridge.cbdp.constants import (
     TAG_OBJECT,
     TAG_OBJECTS,
     TAG_OBJECT_COUNT,
+    TAG_APPROVAL_KIND,
+    TAG_DECISION,
+    TAG_APPROVAL_REF,
     TAG_NEXT_CURSOR,
     TAG_THREAD_REF,
     TAG_USE_ACTIVE_THREAD,
@@ -43,6 +46,7 @@ from codexbridge.cbdp.constants import (
     TAG_SUPPORTED_CAPS,
     TAG_TRANSPORT_SECURITY,
     TAG_VERSION_MINOR,
+    TYPE_APPROVAL_RESOLVE,
     TYPE_AUTH,
     TYPE_AUDIO_BEGIN,
     TYPE_AUDIO_CHUNK,
@@ -985,6 +989,72 @@ class CbdpGatewayTests(unittest.TestCase):
         result = self.sent[-1]
         self.assertEqual(result.message_type, TYPE_ERROR)
         self.assertEqual(result.code, 0x0001)
+
+    def _approval_gateway(self):
+        self.gateway.capability_policy = lambda device_id: {"status", "approval"}
+        self.gateway.handle_frame(self.hello())
+        session = self.gateway.session
+        session.supported |= capability_bitmap(["approval"])
+        self.gateway.refresh_capabilities()
+        self.gateway.authenticate(
+            session_id=session.session_id,
+            proof=self.gateway.expected_proof("dev-1", session),
+            device_id="dev-1",
+        )
+
+    def test_approval_resolve_accepts_approval_ref(self):
+        self._approval_gateway()
+        ref = self.refs.ref_for("approval", "ap-1")
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_APPROVAL_RESOLVE,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(71),
+                    TAG_APPROVAL_REF: u32(ref),
+                    TAG_DECISION: u8(0),
+                },
+            )
+        )
+        # The shared dispatcher has no approval backing in this fixture, so a
+        # bridge-level error is acceptable; it must not be UNSUPPORTED_FEATURE
+        # and must echo the request id.
+        result = self.sent[-1]
+        self.assertNotEqual(result.code, 0x000E)
+        self.assertEqual(result.header[TAG_REQUEST_ID], u32(71))
+
+    def test_approval_resolve_unknown_ref_returns_not_found(self):
+        self._approval_gateway()
+        self.gateway.handle_frame(
+            Frame(
+                message_type=TYPE_APPROVAL_RESOLVE,
+                flags=FLAG_REQUEST,
+                header={
+                    TAG_REQUEST_ID: u32(72),
+                    TAG_APPROVAL_REF: u32(999999),
+                    TAG_DECISION: u8(0),
+                },
+            )
+        )
+        result = self.sent[-1]
+        self.assertEqual(result.message_type, TYPE_ERROR)
+        self.assertEqual(result.code, 0x0001)
+
+    def test_approval_object_kind_matches_protocol_numbers(self):
+        cases = {
+            "command": 0,
+            "fileChange": 1,
+            "permissions": 3,
+            "mcp": 4,
+            "input": 5,
+            "unknown-kind": 6,
+        }
+        for kind, expected in cases.items():
+            encoded = self.gateway._encode_approval_object(
+                {"request_id": "ap-1", "kind": kind, "thread_id": "t1"}
+            )
+            fields = decode_tlvs(encoded)
+            self.assertEqual(fields[TAG_APPROVAL_KIND][0], expected, kind)
 
     def test_status_result_projects_online_field(self):
         fields = self.gateway._result_fields(

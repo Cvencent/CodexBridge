@@ -17,6 +17,13 @@ COMMANDS = {
     'thread.read': ('tasks', ('thread_id',), ('message_limit',)),
     'thread.start': ('control', (), ('cwd', 'model')),
     'thread.rename': ('control', ('thread_id', 'title'), ()),
+    'thread.settings.read': ('tasks', ('thread_id',), ()),
+    'thread.settings.update': (
+        'control',
+        ('thread_id',),
+        ('model', 'effort', 'approval_policy', 'approvals_reviewer',
+         'sandbox_policy', 'personality'),
+    ),
     'turn.start': ('control', ('thread_id', 'text'), ('model', 'effort')),
     'turn.steer': ('control', ('thread_id', 'text'), ()),
     'turn.interrupt': ('control', ('thread_id',), ('turn_id',)),
@@ -140,6 +147,10 @@ class CommandDispatcher:
             return service.start_thread(**params)
         if method == 'thread.rename':
             return service.rename_thread(params['thread_id'], params['title'])
+        if method == 'thread.settings.read':
+            return service.read_thread_settings(params['thread_id'])
+        if method == 'thread.settings.update':
+            return service.update_thread_settings(**params)
         if method == 'turn.start':
             return service.start_turn(**params, client_message_id=request_id)
         if method == 'turn.steer':

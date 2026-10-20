@@ -3418,6 +3418,18 @@ amendment 的响应必须同时携带 `execpolicy_amendment` 或
 客户端不得发送，Bridge 必须返回 `UNSUPPORTED_FEATURE`，不能把它们降级猜测为
 基础审批。
 
+Bridge 实现补充（2026-10-20）：
+
+- `APPROVAL_RESOLVE` 的字段直接放在消息 header 里，不是 `params`。Bridge
+  必须能从 header 读取 `approval_ref`、`approval_id`、`decision`、`response`。
+- `approval_ref` 通过持久引用表解析为外部 `approval_id`；解析失败返回
+  `NOT_FOUND`。同时提供 `approval_ref` 与 `approval_id` 时两者必须一致，
+  否则返回 `INVALID_PARAM`。
+- 携带 `response` 时按结构化响应处理（MCP elicitation、用户输入、权限），
+  转成共享命令层的 `approval.respond`；只带 `decision` 时走
+  `approval.resolve`。`response` 是目前唯一允许承载 `action`/`content`/
+  `answers` 的通道，不能被丢弃成纯 `decision`。
+
 审批采用 first-valid-response-wins。第一个通过校验的响应生效，之后所有响应
 返回 `INVALID_STATE`。生效后 Bridge 发布 `approval.resolved`，其他设备更新
 本地状态，不得再显示可操作按钮。
@@ -3451,6 +3463,12 @@ reject late decisions with TIMEOUT
 | `7` | `mcp_elicitation` | MCP server 发起 elicitation |
 | `8` | `network_policy` | 网络策略或域名规则变更；`[本轮不实现]` |
 | `9` | `execpolicy_amendment` | 命令执行策略修订；`[本轮不实现]` |
+
+> 2026-10-20 修正：Bridge 早期把 `permissions` 编成 `2`（`network_access`）、
+> 把 `mcp` 编成 `3`（`permission`）、把 `user_input` 编成 `4`（`mcp_tool`）。
+> 这与上表不符，已按上表校正：`command=0`、`file_change=1`、
+> `network_access=2`、`permission=3`、`mcp_tool=4`、`user_input=5`、
+> `other=6`、`mcp_elicitation=7`。客户端应按上表解析，不要依赖旧映射。
 
 `risk`：
 

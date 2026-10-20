@@ -487,9 +487,19 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 result = self.app.service.interrupt(parts[3], str(payload.get("turn_id") or ""))
                 self._send_json(200, {"ok": True, **result})
                 return
-            if len(parts) == 5 and parts[:3] == ["api", "companion", "approvals"]:
-                request_id = int(parts[4])
-                resolved = self.app.service.resolve_approval(request_id, str(payload.get("decision") or ""))
+            if len(parts) == 4 and parts[:3] == ["api", "companion", "approvals"]:
+                # /api/companion/approvals/<request_id> splits into exactly
+                # four parts; the old len(parts) == 5 check meant this branch
+                # was unreachable and every submission became a 404.
+                request_id = int(parts[3])
+                if isinstance(payload.get("response"), dict):
+                    resolved = self.app.service.respond_approval(
+                        request_id, payload["response"]
+                    )
+                else:
+                    resolved = self.app.service.resolve_approval(
+                        request_id, str(payload.get("decision") or "")
+                    )
                 self._send_json(200, {"ok": True, "resolved": resolved})
                 return
         except CommandError as error:
