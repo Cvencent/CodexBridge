@@ -919,6 +919,9 @@ message 解析。`objects` 数组的元素 tag 固定为 `0x00A0`。
 | `0x00B5` | `bytes` | `capability_blob` |
 | `0x00B6` | `u16` | `window_frames` |
 | `0x00B7` | `u32` | `window_bytes` |
+| `0x00BC` | `u16` | `running_count` | 当前运行中的任务数；`codex.state` 事件使用 |
+| `0x00BD` | `u16` | `completed_unread_count` | 全局未读的完成结果数；`codex.state` 事件使用 |
+| `0x00BE` | `u16` | `failed_unread_count` | 全局未读的失败结果数；`codex.state` 事件使用 |
 | `0x00B8` | `u32` | `retransmit_timeout_ms` |
 | `0x00B9` | `u8` | `max_retries` |
 | `0x00BA` | `u32` | `fragment_timeout_ms` |
@@ -2017,6 +2020,7 @@ System 事件：
 | `0x0701` | `system.resync.required` | `critical` | `[本轮实现]` |
 | `0x0702` | `system.shutdown` | `critical` | `[本轮实现]` |
 | `0x0703` | `system.upstream.changed` | `state` | `[本轮实现]` |
+| `0x0704` | `system.codex_state` | `state` | `[本轮实现]` |
 
 Queue 事件：
 
@@ -2262,6 +2266,22 @@ lease_expires_at_ms, load, last_seen_ms, revision
 resync_reason, revision, server_time_ms, reason,
 policy_version, upstream_request_id
 ```
+
+`system.codex_state`（`0x0704`，2026-10-20 追加）：
+
+```text
+running_count, completed_unread_count, failed_unread_count
+```
+
+- 这是首页“运行中 / 完成 / 失败”聚合计数，必须在
+  `system.thread_summaries`（`0x50000003`）topic 的 `summary` scope 上以
+  `state` QoS 下发。设备订阅该 topic + scope 即可收到。
+- Bridge 在运行集合或全局未读数变化时发布一条新事件；计数不变时不重复发布。
+  设备重连或显式请求状态时，Bridge 直接补发一条携带当前计数的等价事件。
+- 三个计数都是 `u16`，字段缺失按 `0` 解释。客户端不得把未知事件类型当作错误，
+  应按 §16.1 忽略并在 `ACK` 中推进 cursor。
+- 该事件替代 legacy `codex_state` 字典在 CBDP 会话上的作用；legacy 字典仍保留给
+  旧 JSON 设备。
 
 `queue.changed`：
 

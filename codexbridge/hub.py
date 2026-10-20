@@ -44,6 +44,9 @@ from codexbridge.cbdp.constants import (
     TAG_TURN_ID,
     TAG_TURN_REF,
     TAG_UPDATED_AT_MS,
+    TAG_RUNNING_COUNT,
+    TAG_COMPLETED_UNREAD,
+    TAG_FAILED_UNREAD,
 )
 
 from codexbridge.cbdp.capabilities import capability_bitmap
@@ -63,6 +66,9 @@ from codexbridge.protocol.capabilities import effective
 from codexbridge.protocol.messages import clip_text, clip_utf8, decode, wire_messages
 from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
+
+EVENT_CODEX_STATE = 0x0704
+
 
 DEVICE_EVENT_CAPABILITY: dict[str, str] = {
     "voice_command": "voice",
@@ -186,6 +192,9 @@ class BridgeHub:
         self._event_subscriptions: dict[str, Any] = {}
         self._incoming_commands: dict[str, dict] = {}
         self._lock = threading.RLock()
+        # Last aggregate counts published as system.codex_state, so a steady
+        # state does not append a duplicate event on every publish tick.
+        self._last_codex_state: tuple[int, int, int] | None = None
         # Per-device deferred work: queue, worker handle, and depth counters.
         self._work: dict[str, "queue.Queue[tuple[str, Any]]"] = {}
         self._workers: dict[str, threading.Thread] = {}
@@ -415,11 +424,113 @@ class BridgeHub:
         if "request_id" in event:
             payload["request_id"] = request_id
         self._send(device_id, payload)
+        # CBDP sessions drop the legacy dict, so answer the explicit pull with
+        # a summary event as well.
+        with self._lock:
+            session = self._sessions.get(device_id)
+        if session is not None:
+            self._send_codex_state_event(session)
         snapshot = self._status_snapshot(device_id)
         if snapshot is not None and "request_id" in event:
             snapshot["request_id"] = request_id
         if snapshot is not None:
             self._send(device_id, snapshot)
+
+    @staticmethod
+    def _codex_state_event_payload(counts: dict[str, int]) -> dict[int, bytes]:
+        return {
+            TAG_RUNNING_COUNT: u16(max(0, int(counts.get("running") or 0))),
+            TAG_COMPLETED_UNREAD: u16(
+                max(0, int(counts.get("completed_unread") or 0))
+            ),
+            TAG_FAILED_UNREAD: u16(max(0, int(counts.get("failed_unread") or 0))),
+        }
+
+    def _codex_state_tuple(self) -> tuple[int, int, int]:
+        counts = self.counts()
+        return (
+            int(counts.get("running") or 0),
+            int(counts.get("completed_unread") or 0),
+            int(counts.get("failed_unread") or 0),
+        )
+
+    @staticmethod
+    def _event_counts(event) -> tuple[int, int, int] | None:
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return (
+                int.from_bytes(payload.get(TAG_RUNNING_COUNT, b"\x00\x00"), "big"),
+                int.from_bytes(payload.get(TAG_COMPLETED_UNREAD, b"\x00\x00"), "big"),
+                int.from_bytes(payload.get(TAG_FAILED_UNREAD, b"\x00\x00"), "big"),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _send_codex_state_event(self, session: Any) -> None:
+        """Push the aggregate counts to one attached session.
+
+        CBDP sessions receive a real delta; legacy sessions keep using the
+        ``codex_state`` dict sent by ``_send_codex_state``.
+        """
+
+        if self.event_spine is None:
+            return
+        gateway = getattr(session, "gateway", None)
+        send_event = getattr(session, "send_event", None)
+        if gateway is None or not callable(send_event):
+            return
+        expected = self._codex_state_tuple()
+        event = None
+        try:
+            event = self.event_spine.latest_event(
+                lambda item: (
+                    item.event_type == EVENT_CODEX_STATE
+                    and self._event_counts(item) == expected
+                )
+            )
+        except Exception:
+            event = None
+        if event is None:
+            try:
+                event = self.event_spine.append(
+                    SYSTEM_THREAD_SUMMARIES_TOPIC,
+                    EVENT_CODEX_STATE,
+                    QOS_STATE,
+                    self._codex_state_event_payload(self.counts()),
+                )
+            except Exception:
+                return
+        try:
+            send_event(event)
+        except (OSError, RuntimeError):
+            return
+
+    def _publish_codex_state(self) -> None:
+        """Append one aggregate-count event for CBDP summary subscribers.
+
+        The legacy ``codex_state`` dict has no CBDP translation, so CBDP
+        sessions silently dropped it and a device home screen never learned
+        the running count. This publishes the same numbers as a committed
+        summary-scope event instead.
+        """
+
+        if self.event_spine is None:
+            return
+        expected = self._codex_state_tuple()
+        if expected == self._last_codex_state:
+            return
+        try:
+            self._append_event(
+                SYSTEM_THREAD_SUMMARIES_TOPIC,
+                EVENT_CODEX_STATE,
+                QOS_STATE,
+                self._codex_state_event_payload(self.counts()),
+            )
+            self._last_codex_state = expected
+        except Exception:
+            return
 
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
@@ -1006,6 +1117,11 @@ class BridgeHub:
         # correct for pull-only clients without the host hardcoding them.
         if "status" in self.capabilities_for(device_id):
             self._send_codex_state(device_id, {})
+            if session is not None:
+                # CBDP sessions cannot translate the legacy dict above; push
+                # the aggregate counts as a real summary event so a reconnect
+                # immediately refreshes the home screen.
+                self._send_codex_state_event(session)
 
         if "queue" in self.capabilities_for(device_id):
             queue_snapshots = getattr(self.commands.service, "queue_snapshots", None) if self.commands else None
@@ -1083,6 +1199,9 @@ class BridgeHub:
             ]
         for session in targets:
             self._send_to(session, payload)
+        # CBDP sessions cannot translate the legacy dict above, so also publish
+        # it through the event spine where subscriptions can deliver it.
+        self._publish_codex_state()
 
     def _retract_companion_badge(self, thread_id: str) -> None:
         companion = self.companion_events

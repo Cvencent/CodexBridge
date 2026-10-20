@@ -33,6 +33,10 @@ _SUMMARY_EVENTS = frozenset(
         0x0601,
         0x0602,
         0x0603,
+        # system.codex_state: aggregate running/unread counters for the home
+        # screen. Summary topic, state QoS, so it can be replayed to a device
+        # that reconnects with a cursor.
+        0x0704,
     }
 )
 _THREAD_EVENTS = frozenset(

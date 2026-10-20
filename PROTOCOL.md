@@ -32,6 +32,11 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - `SUBSCRIBE` 省略 `cursor` 等价于 `cursor = 0`（从历史起点回放）。回放改由每设备工作线程发送，socket 读取循环在回放期间继续排空设备上行，避免录音被截断。
 - `AUDIO_BEGIN` / `SEND_BEGIN` 不要求先 `thread.claim`；writer lease 与上行选线程无关。`thread_ref` 在 `BEGIN` 时解析，解析失败返回 `NOT_FOUND`，不会再落成 `UNSUPPORTED_FEATURE`。
 - CBDP 会话对未预期异常返回 `ERROR(INTERNAL)` 并保持连接，不再因单帧异常断开。
+- 首页聚合计数在 CBDP 上改用独立事件 `system.codex_state(0x0704)`，在
+  `system.thread_summaries(0x50000003)` 的 `summary` scope、`state` QoS 下发，
+  携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、
+  `failed_unread_count(0x00BE)`。旧的 `codex_state` 字典无法翻译成 CBDP DELTA，
+  之前在 CBDP 会话上被静默丢弃，是首页“运行中”恒为 0 的原因。
 
 ## 1. 范围与角色
 

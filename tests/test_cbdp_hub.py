@@ -26,6 +26,9 @@ from codexbridge.cbdp.constants import (
     TAG_THREAD_REF,
     TAG_TURN_REF,
     TAG_UPDATED_AT_MS,
+    TAG_RUNNING_COUNT,
+    TAG_COMPLETED_UNREAD,
+    TAG_FAILED_UNREAD,
 )
 from codexbridge.cbdp.events import EventSpine
 from codexbridge.cbdp.projection import ProjectionStore
@@ -103,6 +106,62 @@ class CbdpHubEventTests(unittest.TestCase):
 
     def _events(self, event_type):
         return [event for event in self.events.events_since(0) if event.event_type == event_type]
+
+    def test_codex_state_is_published_as_a_summary_event(self):
+        from codexbridge.cbdp.events import SCOPE_SUMMARY, event_scope
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+        from codexbridge.hub import EVENT_CODEX_STATE
+
+        self.hub._broadcast_codex_state()
+        events = self._events(EVENT_CODEX_STATE)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.topic_id, SYSTEM_THREAD_SUMMARIES_TOPIC)
+        self.assertEqual(event.qos, QOS_STATE)
+        self.assertEqual(event_scope(event.event_type), SCOPE_SUMMARY)
+        self.assertIn(TAG_RUNNING_COUNT, event.payload)
+        self.assertIn(TAG_COMPLETED_UNREAD, event.payload)
+        self.assertIn(TAG_FAILED_UNREAD, event.payload)
+
+    def test_unchanged_codex_state_is_not_republished(self):
+        from codexbridge.hub import EVENT_CODEX_STATE
+
+        self.hub._broadcast_codex_state()
+        self.hub._broadcast_codex_state()
+        self.hub._broadcast_codex_state()
+        self.assertEqual(len(self._events(EVENT_CODEX_STATE)), 1)
+
+    def test_codex_state_reaches_a_summary_subscriber(self):
+        from codexbridge.cbdp.events import SCOPE_SUMMARY
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+        from codexbridge.cbdp.subscriptions import SubscriptionManager
+        from codexbridge.hub import EVENT_CODEX_STATE
+
+        subscriptions = SubscriptionManager(self.events)
+        gateway = CbdpGateway(
+            event_spine=self.events,
+            subscriptions=subscriptions,
+            references=self.refs,
+        )
+        gateway.defer = None
+        gateway.begin_session()
+        gateway.session.device_id = "dev-state"
+        gateway.session.ready = True
+        sent = []
+        gateway.bind_transport(sent.append)
+        self.hub.register_cbdp_gateway("dev-state", gateway)
+        subscriptions.subscribe(
+            "dev-state", SYSTEM_THREAD_SUMMARIES_TOPIC, SCOPE_SUMMARY, QOS_STATE, 0
+        )
+        self.hub._broadcast_codex_state()
+        deltas = [frame for frame in sent if frame.message_type == 0x0A]
+        self.assertTrue(
+            any(
+                frame.header.get(0x0037) == EVENT_CODEX_STATE.to_bytes(2, "big")
+                for frame in deltas
+            )
+        )
 
     def test_message_events_share_the_thread_topic_and_scope(self):
         from codexbridge.cbdp.events import event_scope
