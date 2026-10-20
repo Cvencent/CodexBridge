@@ -95,6 +95,13 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   `system.codex_state(0x0704)`，Bridge 会在回放结束前补发最新一条聚合计数事件。
   这样即使设备在 attach 之后才发出 `SUBSCRIBE`，首页“运行中/完成/失败”也不会
   永久停在 0。
+- **2026-10-20 后续修正：** Bridge 启动时会用 `PRAGMA quick_check` 校验
+  `cbdp-events.sqlite3`。校验失败时，先把主库及 WAL/SHM 备份为
+  `cbdp-events.sqlite3.corrupt-<时间戳>`，再用 `VACUUM INTO` 重建并原子替换；
+  如果无法无损重建，则保留损坏备份并新建空事件库，不让损坏索引拖垮设备订阅。
+  替换成功后，`SUBSCRIBE` 的主题回放查询必须使用新索引恢复正常。若运行期间仍
+  出现存储错误，`ERROR(INTERNAL)` 必须带
+  `reason=event_store_unavailable`，设备可据此重试而不会再收到无信息的 INTERNAL。
 
 ## 1. 范围与角色
 

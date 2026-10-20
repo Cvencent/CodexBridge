@@ -4443,6 +4443,33 @@ API 的行为。
   而 `cursor = 0` 只回放有界的最新窗口。补发使用同一 `topic_id`、`summary` scope
   与 `state` QoS，字段仍为 `running_count(0x00BC)`、
   `completed_unread_count(0x00BD)`、`failed_unread_count(0x00BE)`。
+
+### 19.10 事件库自检与恢复（2026-10-20 后续修正）
+
+设备反馈 `SUBSCRIBE` 在 summary 主题上返回 `INTERNAL`，只读取证确认
+`cbdp-events.sqlite3` 的 `idx_events_topic_seq` 索引页损坏：不带主题过滤的查询
+仍可能成功，但协议使用的
+`WHERE topic_id = ? ORDER BY global_seq DESC` 直接报
+`database disk image is malformed`。本修正不改变 CBDP 线格式和订阅字段，只补齐
+Bridge 的故障恢复语义：
+
+- Bridge 打开事件库前必须执行 `PRAGMA quick_check`。返回 `ok` 时不得改动数据文件，
+  也不得创建备份。
+- 校验失败时，先把主库及现有 `-wal` / `-shm` 复制为
+  `cbdp-events.sqlite3.corrupt-<时间戳>`，再对原库执行 `VACUUM INTO`；重建结果必须
+  再次通过 `quick_check` 后才能原子替换原库。替换前必须移除旧侧车文件，避免旧 WAL
+  再次覆盖新库。
+- 若 `VACUUM INTO` 仍失败，Bridge 必须保留损坏备份并新建空事件库继续启动；不得
+  静默删除唯一副本，也不得让整个 Bridge 因索引损坏无法启动。
+- 恢复成功后，`global_seq` / `topic_seq` / `revision` 继续从恢复库的最大值递增，
+  设备已有的 cursor 语义不变。原先仍可读取的历史事件不应因重建而丢失。
+- 运行期间若存储页再次报错，`SUBSCRIBE` 返回
+  `ERROR(INTERNAL, "EVENT_STORE_UNAVAILABLE")`，并在 `error_detail(0x0063)` 带
+  `reason = event_store_unavailable`。设备可以把这类错误与普通参数错误区分开，
+  按有界退避重试订阅。
+- 验收要求：`PRAGMA quick_check` 为 `ok`；AUTH_OK 后 summary `SUBSCRIBE` 收到
+  `RESULT`；随后收到包含 `running_count` 的 `system.codex_state(0x0704)`。
+
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

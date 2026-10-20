@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -972,6 +973,16 @@ class CbdpGateway:
             )
         except (SubscriptionLimitError, ValueError):
             return self._error(request_id, "BUSY")
+        except sqlite3.Error as error:
+            # A corrupt page/index must not surface as an unexplained INTERNAL.
+            # The event store repairs itself at startup; this is the bounded
+            # diagnostic path if damage appears while the process is running.
+            return self._error(
+                request_id,
+                "INTERNAL",
+                "EVENT_STORE_UNAVAILABLE",
+                {"reason": "event_store_unavailable", "error": str(error)},
+            )
         generation = int(self.session.generation)
 
         def replay():

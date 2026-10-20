@@ -1,6 +1,8 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codexbridge.cbdp.auth import pairing_token_proof
 from codexbridge.cbdp.capabilities import capability_bitmap
@@ -1820,6 +1822,35 @@ class CbdpGatewayTests(unittest.TestCase):
         )
         self.assertEqual(self.sent[-2].message_type, TYPE_RESYNC)
         self.assertEqual(self.sent[-1].message_type, TYPE_RESULT)
+
+    def test_subscribe_store_error_is_diagnostic_internal(self):
+        self._authenticated()
+        self.sent.clear()
+        with mock.patch.object(
+            self.gateway.subscriptions,
+            "subscribe",
+            side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+        ):
+            self.gateway.handle_frame(
+                Frame(
+                    message_type=TYPE_SUBSCRIBE,
+                    flags=FLAG_REQUEST,
+                    header={
+                        TAG_REQUEST_ID: u32(19),
+                        0x0030: u32(0x50000003),
+                        0x0031: u8(0),
+                        0x0032: u8(QOS_STATE),
+                        0x0033: u64(0),
+                    },
+                )
+            )
+
+        error = self.sent[-1]
+        self.assertEqual(error.message_type, TYPE_ERROR)
+        self.assertEqual(error.code, 0x0015)
+        self.assertEqual(decode_utf8(error.header[0x0062]), "EVENT_STORE_UNAVAILABLE")
+        detail = decode_tlvs(error.header[0x0063])
+        self.assertEqual(decode_utf8(detail[0x0096]), "event_store_unavailable")
 
     def _authenticated(self):
         self.gateway.handle_frame(self.hello())
