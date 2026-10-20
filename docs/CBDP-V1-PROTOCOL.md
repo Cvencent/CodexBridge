@@ -4408,6 +4408,25 @@ API 的行为。
 | 结构化输入 | `structured_input`, `server_request` | `input.respond` | `input.requested`, `input.answered`, `input.cancelled` | `0x0130..0x013C` | panel/full | `[本轮实现]` |
 | 服务端请求 | `server_request` | `tool.respond` | `server.request.created`, `server.request.resolved` | `0x019C..0x019D` | full | `[本轮实现]` |
 | 附件与输入部件 | `attachment`, `file_reference`, `image_input`, `audio_input` | `attachment.add/list/remove`, `attachment.upload.*` | `attachment.*` | `0x0150..0x0166` | panel/full | `[本轮实现]` |
+
+### 19.8 附件与 `input_parts` 实现修正（2026-10-20）
+
+前面章节定义的附件能力此前只有协议没有 Bridge 实现；本版本补齐：
+
+- `attachment.add/list/remove` 与 `attachment.upload.begin/chunk/end/cancel` 现在
+  由 Bridge 统一命令层实现，内容保存在
+  `%LOCALAPPDATA%\CodexBridge\attachments\`。每个线程最多保留最近 64 个附件，
+  单附件上限 32 MiB，单分片上限 2 MiB。
+- 上传分片按 `upload_offset` 顺序写入，乱序返回
+  `UPLOAD_OFFSET_MISMATCH`；`content_sha256` 不匹配返回
+  `CONTENT_HASH_MISMATCH`；`attachment_kind` 与 `mime_type` 不匹配返回
+  `ATTACHMENT_KIND_MISMATCH`。
+- `content.read(0x00C1)` 返回分页内容，`content_encoding` 为 `base64`。
+- `turn.start(0x0005)` 与 `queue.add(0x0030)` 的 `input_parts(0x015B)` 已解析：
+  元素 tag 为 `0x00A0`，图片部件转成 Codex `input_image` + inline data URL，
+  文本部件按顺序插入。`body` 与 `input_parts` 同时出现仍返回 `INVALID_PARAM`。
+- 手机 Companion HTTP 的完整接入流程见
+  [CodexBridge-mobile-attachment-api.md](CodexBridge-mobile-attachment-api.md)。
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

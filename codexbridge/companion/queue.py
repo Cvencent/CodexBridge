@@ -117,7 +117,12 @@ class QueueService:
         text = raw.get("text")
         if not isinstance(queue_id, str) or not queue_id:
             return None
-        if not isinstance(text, str) or not text.strip():
+        raw_parts = raw.get("input_parts")
+        parts = (
+            [dict(part) for part in raw_parts if isinstance(part, dict)]
+            if isinstance(raw_parts, list) else []
+        )
+        if (not isinstance(text, str) or not text.strip()) and not parts:
             return None
         status = str(raw.get("status") or "pending")
         if status not in {"pending", "dispatching", "failed"} | _TERMINAL:
@@ -126,6 +131,7 @@ class QueueService:
             "queue_id": queue_id,
             "thread_id": thread_id,
             "text": text[:MAX_TEXT_CHARS],
+            "input_parts": parts,
             "model": str(raw.get("model") or ""),
             "effort": str(raw.get("effort") or ""),
             "status": status,
@@ -215,11 +221,13 @@ class QueueService:
         return False
 
     def enqueue(self, thread_id: str, text: str, model: str = "", effort: str = "",
-                created_by: str = "", created_by_kind: str = "") -> dict[str, Any]:
+                created_by: str = "", created_by_kind: str = "",
+                input_parts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if not isinstance(thread_id, str) or not thread_id or not self._thread_exists(thread_id):
             raise CommandError("thread_not_found")
         content = text.strip() if isinstance(text, str) else ""
-        if not content:
+        parts = [dict(part) for part in (input_parts or []) if isinstance(part, dict)]
+        if not content and not parts:
             raise CommandError("invalid_params")
         if len(content) > MAX_TEXT_CHARS:
             raise CommandError("queue_text_too_long")
@@ -234,6 +242,7 @@ class QueueService:
                 "queue_id": queue_id,
                 "thread_id": thread_id,
                 "text": content,
+                "input_parts": parts,
                 "model": str(model or ""),
                 "effort": str(effort or ""),
                 "status": "pending",
@@ -403,13 +412,14 @@ class QueueService:
                 self._save()
                 self._emit("queue_item_updated", thread_id, item)
             try:
-                self._start_turn(
-                    thread_id,
-                    item["text"],
-                    model=item["model"],
-                    effort=item["effort"],
-                    client_message_id=item["queue_id"],
-                )
+                kwargs = {
+                    "model": item["model"],
+                    "effort": item["effort"],
+                    "client_message_id": item["queue_id"],
+                }
+                if item.get("input_parts"):
+                    kwargs["input_parts"] = item["input_parts"]
+                self._start_turn(thread_id, item["text"], **kwargs)
             except Exception as error:
                 with self._lock:
                     item["status"] = "failed"

@@ -24,7 +24,7 @@ COMMANDS = {
         ('model', 'effort', 'approval_policy', 'approvals_reviewer',
          'sandbox_policy', 'personality'),
     ),
-    'turn.start': ('control', ('thread_id', 'text'), ('model', 'effort')),
+    'turn.start': ('control', ('thread_id',), ('text', 'model', 'effort', 'input_parts')),
     'turn.steer': ('control', ('thread_id', 'text'), ()),
     'turn.interrupt': ('control', ('thread_id',), ('turn_id',)),
     'models.list': ('tasks', (), ()),
@@ -33,7 +33,7 @@ COMMANDS = {
     'approval.resolve': ('approval', ('approval_id', 'decision'), ()),
     'approval.respond': ('approval', ('approval_id', 'response'), ()),
     'queue.list': ('queue', ('thread_id',), ()),
-    'queue.enqueue': ('queue', ('thread_id', 'text'), ('model', 'effort')),
+    'queue.enqueue': ('queue', ('thread_id',), ('text', 'model', 'effort', 'input_parts')),
     'queue.edit': ('queue', ('queue_id', 'text', 'expected_revision'), ('model', 'effort')),
     'queue.delete': ('queue', ('queue_id', 'expected_revision'), ()),
     'queue.steer': ('queue', ('queue_id', 'expected_revision'), ()),
@@ -42,6 +42,17 @@ COMMANDS = {
     # as the phone companion path instead of inventing a transport-specific
     # implementation.
     'message.read.update': ('read_unread', ('message_id', 'read_at_ms'), ('thread_id',)),
+    'attachment.add': ('attachment', ('thread_id', 'attachment_id',), ('alt_text',)),
+    'attachment.list': ('attachment', ('thread_id',), ()),
+    'attachment.remove': ('attachment', ('attachment_id',), ()),
+    'attachment.upload.begin': (
+        'attachment', ('thread_id', 'attachment_kind', 'byte_size'),
+        ('filename', 'mime_type', 'content_sha256', 'alt_text'),
+    ),
+    'attachment.upload.chunk': ('attachment', ('upload_id', 'upload_offset', 'data'), ()),
+    'attachment.upload.end': ('attachment', ('upload_id',), ('byte_size',)),
+    'attachment.upload.cancel': ('attachment', ('upload_id',), ()),
+    'content.read': ('text', ('attachment_id',), ('offset', 'max_bytes')),
 }
 
 
@@ -81,11 +92,25 @@ class CommandDispatcher:
             if field == 'response':
                 if not isinstance(value, dict) or len(json.dumps(value)) > 20000:
                     raise CommandError('invalid_params')
+            elif field == 'data':
+                if not isinstance(value, (bytes, bytearray)) or not value:
+                    raise CommandError('invalid_params')
+            elif field == 'input_parts':
+                if not isinstance(value, list) or not value:
+                    raise CommandError('invalid_params')
+                if not all(isinstance(part, dict) for part in value):
+                    raise CommandError('invalid_params')
             elif field == 'sandbox_policy':
                 if not isinstance(value, (str, dict)) or len(json.dumps(value)) > 2000:
                     raise CommandError('invalid_params')
-            elif field in {'limit', 'message_limit', 'approval_id', 'expected_revision', 'read_at_ms'}:
+            elif field in {
+                'limit', 'message_limit', 'approval_id', 'expected_revision',
+                'read_at_ms', 'byte_size', 'upload_offset', 'offset', 'max_bytes',
+            }:
                 if field == 'read_at_ms':
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                        raise CommandError('invalid_params')
+                elif field in {'byte_size', 'upload_offset', 'offset', 'max_bytes'}:
                     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                         raise CommandError('invalid_params')
                 elif field == 'message_limit':
@@ -180,4 +205,20 @@ class CommandDispatcher:
             return service.queue_steer(**params)
         if method == 'message.read.update':
             return service.mark_message_read(**params, source=device_id)
+        if method == 'attachment.add':
+            return service.attachment_add(**params)
+        if method == 'attachment.list':
+            return service.attachment_list(**params)
+        if method == 'attachment.remove':
+            return service.attachment_remove(**params)
+        if method == 'attachment.upload.begin':
+            return service.attachment_upload_begin(**params)
+        if method == 'attachment.upload.chunk':
+            return service.attachment_upload_chunk(**params)
+        if method == 'attachment.upload.end':
+            return service.attachment_upload_end(**params)
+        if method == 'attachment.upload.cancel':
+            return service.attachment_upload_cancel(**params)
+        if method == 'content.read':
+            return service.content_read(**params)
         return {'resolved': service.resolve_approval(params['approval_id'], params['decision'])}

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 from codexbridge.companion.events import EventStream
+from codexbridge.companion.attachments import AttachmentStore
 from codexbridge.protocol.commands import CommandDispatcher
 from codexbridge.companion.queue import QueueService
 
@@ -571,6 +572,7 @@ class CompanionService:
         self._log_cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
         self._log_cache_lock = threading.Lock()
         self._read_cache = ReadCache()
+        self.attachments = AttachmentStore(self.data_dir)
         # Threads whose turn has ended. Their body cannot change again
         # until a new turn starts, so their reads stay valid far longer.
         self._terminal_threads: set[str] = set()
@@ -593,6 +595,54 @@ class CompanionService:
     def _include_intermediate_events(self) -> bool:
         setting = self._show_intermediate_events
         return bool(setting() if callable(setting) else setting)
+
+    def _codex_inputs(
+        self,
+        text: str,
+        input_parts: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Translate device/HTTP input parts into Codex ``turn/start`` input.
+
+        Codex accepts text and inline image inputs on this transport. File
+        attachments are kept in the Bridge content store and referenced by the
+        message; only images are handed to the model as inline data URLs.
+        """
+
+        parts = [part for part in (input_parts or []) if isinstance(part, dict)]
+        if not parts:
+            content = (text or "").strip()
+            return [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}] if content else []
+        result: list[dict[str, Any]] = []
+        text_parts: list[str] = []
+        for part in parts:
+            kind = str(part.get("type") or part.get("part_kind") or "text").lower()
+            if kind == "text":
+                value = str(part.get("text") or part.get("body") or "")
+                if value:
+                    text_parts.append(value)
+                continue
+            attachment_id = str(
+                part.get("attachment_id")
+                or part.get("attachment_ref")
+                or part.get("content_ref")
+                or ""
+            )
+            record = self.attachments.get_by_ref(attachment_id)
+            if record is None:
+                raise ValueError("attachment_not_found")
+            if record.kind != "image":
+                raise ValueError("unsupported_attachment_kind")
+            result.append(
+                {
+                    "type": "input_image",
+                    "image_url": self.attachments.data_url(record.attachment_id),
+                    "detail": str(part.get("detail") or "original"),
+                }
+            )
+        merged = "\n".join(text_parts).strip() or (text or "").strip()
+        if merged:
+            result.insert(0, {"type": "text", "text": merged[:MAX_MESSAGE_CHARS]})
+        return result
 
     def start(self) -> None:
         self._stop.clear()
@@ -1742,8 +1792,21 @@ class CompanionService:
     def queue_list(self, thread_id: str) -> dict[str, Any]:
         return self.queues.list(thread_id)
 
-    def queue_enqueue(self, thread_id: str, text: str, model: str = "", effort: str = "") -> dict[str, Any]:
-        return self.queues.enqueue(thread_id, text, model=model, effort=effort)
+    def queue_enqueue(
+        self,
+        thread_id: str,
+        text: str,
+        model: str = "",
+        effort: str = "",
+        input_parts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return self.queues.enqueue(
+            thread_id,
+            text,
+            model=model,
+            effort=effort,
+            input_parts=input_parts,
+        )
 
     def queue_edit(self, queue_id: str, text: str, model: str = "", effort: str = "", expected_revision: int = 0) -> dict[str, Any]:
         return self.queues.edit(queue_id, text, model=model, effort=effort, expected_revision=expected_revision)
@@ -1756,6 +1819,76 @@ class CompanionService:
 
     def queue_snapshots(self) -> list[dict[str, Any]]:
         return self.queues.snapshots()
+
+    def attachment_list(self, thread_id: str) -> dict[str, Any]:
+        return self.attachments.list(thread_id)
+
+    def attachment_add(
+        self,
+        thread_id: str,
+        attachment_id: str,
+        alt_text: str = "",
+    ) -> dict[str, Any]:
+        record = self.attachments.get(attachment_id)
+        if record is None:
+            raise ValueError("attachment_not_found")
+        if alt_text:
+            record = self.attachments.set_alt_text(attachment_id, alt_text) or record
+        return record.public()
+
+    def attachment_remove(self, attachment_id: str) -> dict[str, Any]:
+        return {"removed": self.attachments.remove(attachment_id)}
+
+    def attachment_upload_begin(
+        self,
+        thread_id: str,
+        attachment_kind: str,
+        byte_size: int,
+        filename: str = "",
+        mime_type: str = "",
+        content_sha256: str = "",
+        alt_text: str = "",
+    ) -> dict[str, Any]:
+        return self.attachments.begin_upload(
+            thread_id=thread_id,
+            kind=attachment_kind,
+            byte_size=byte_size,
+            content_sha256=content_sha256,
+            filename=filename,
+            mime_type=mime_type,
+            alt_text=alt_text,
+        )
+
+    def attachment_upload_chunk(
+        self,
+        upload_id: str,
+        upload_offset: int,
+        data: bytes,
+    ) -> dict[str, Any]:
+        return self.attachments.upload_chunk(upload_id, upload_offset, data)
+
+    def attachment_upload_end(
+        self,
+        upload_id: str,
+        byte_size: int | None = None,
+    ) -> dict[str, Any]:
+        return self.attachments.end_upload(upload_id, byte_size=byte_size)
+
+    def attachment_upload_cancel(self, upload_id: str) -> dict[str, Any]:
+        return self.attachments.cancel_upload(upload_id)
+
+    def content_read(
+        self,
+        attachment_id: str,
+        offset: int = 0,
+        max_bytes: int = 256 * 1024,
+    ) -> dict[str, Any]:
+        result = self.attachments.read_bytes(attachment_id, offset, max_bytes)
+        import base64
+
+        data = result.pop("data", b"")
+        result["content_base64"] = base64.b64encode(data).decode("ascii")
+        return result
 
     def snapshot(self) -> dict[str, Any]:
         account = self._account()
@@ -2634,18 +2767,20 @@ class CompanionService:
         model: str = "",
         effort: str = "",
         client_message_id: str = "",
+        input_parts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if not thread_id:
             raise ValueError("thread_id")
         content = (text or "").strip()
-        if not content:
+        inputs = self._codex_inputs(content, input_parts)
+        if not inputs:
             raise ValueError("text")
         if thread_id in self._desktop_required and thread_id not in self._desktop_followed:
             raise DesktopIpcError('desktop_handoff_pending')
         target_id = thread_id
         params: dict[str, Any] = {
             "threadId": target_id,
-            "input": [{"type": "text", "text": content[:MAX_MESSAGE_CHARS]}],
+            "input": inputs,
         }
         if model:
             params["model"] = str(model)

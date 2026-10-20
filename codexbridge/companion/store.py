@@ -30,7 +30,14 @@ TOKEN_GRACE_SECONDS = 60 * 60.0
 # A restart can drop several pair responses in a row, so the allowance keeps
 # the last few secrets rather than only the previous one.
 TOKEN_GRACE_HISTORY = 4
-PHONE_CAPABILITIES = {'status', 'tasks', 'control', 'approval', 'queue'}
+PHONE_CAPABILITIES = {
+    'status',
+    'tasks',
+    'control',
+    'approval',
+    'queue',
+    'attachment',
+}
 
 
 def _hash_token(token: str) -> str:

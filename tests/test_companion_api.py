@@ -94,6 +94,72 @@ class CompanionApiTests(unittest.TestCase):
         kinds = [item["kind"] for item in payload["messages"]]
         self.assertIn("command", kinds)
 
+    def test_image_upload_then_message_uses_inline_input_image(self):
+        import base64
+        import hashlib
+
+        code = self.store.pairing_code()["code"]
+        _, paired = self.request("POST", "/api/companion/pair", {"code": code})
+        token = paired["token"]
+        payload = b"\x89PNG\r\n\x1a\nimage"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        status, upload = self.request(
+            "POST",
+            "/api/companion/threads/t1/attachments",
+            {
+                "kind": "image",
+                "byte_size": len(payload),
+                "content_sha256": digest,
+                "filename": "photo.png",
+                "mime_type": "image/png",
+            },
+            token=token,
+        )
+        self.assertEqual(status, 201, upload)
+        upload_id = upload["upload_id"]
+
+        status, _ = self.request(
+            "POST",
+            f"/api/companion/uploads/{upload_id}/chunk",
+            {"offset": 0, "data": base64.b64encode(payload).decode("ascii")},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        status, record = self.request(
+            "POST",
+            f"/api/companion/uploads/{upload_id}/end",
+            {"byte_size": len(payload)},
+            token=token,
+        )
+        self.assertEqual(status, 200, record)
+
+        status, result = self.request(
+            "POST",
+            "/api/companion/threads/t1/messages",
+            {
+                "text": "看一下",
+                "input_parts": [
+                    {"type": "text", "text": "看一下"},
+                    {"type": "image", "attachment_id": record["attachment_id"]},
+                ],
+            },
+            token=token,
+        )
+        self.assertEqual(status, 200, result)
+        self.service.queues.dispatch_ready()
+        turn = [call for call in self.client.requests if call[0] == "turn/start"][-1]
+        inputs = turn[1]["input"]
+        self.assertEqual(inputs[0], {"type": "text", "text": "看一下"})
+        self.assertEqual(inputs[1]["type"], "input_image")
+        self.assertTrue(inputs[1]["image_url"].startswith("data:image/png;base64,"))
+
+        status, listing = self.request(
+            "GET", "/api/companion/threads/t1/attachments", token=token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["object_count"], 1)
+
     def test_desktop_disconnect_returns_structured_error(self):
         from unittest.mock import patch
         from codexbridge.codex.desktop_ipc import DesktopIpcError

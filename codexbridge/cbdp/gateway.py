@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 import threading
@@ -79,6 +80,11 @@ from codexbridge.cbdp.constants import (
     TAG_ACTIVE_TURN_REF,
     TAG_ACTIVE_DEVICE_REF,
     TAG_ACTIVE_REVISION,
+    TAG_ALT_TEXT,
+    TAG_ATTACHMENT_ID,
+    TAG_ATTACHMENT_REF,
+    TAG_CONTENT_REF,
+    TAG_PART_KIND,
     TAG_SESSION_ID,
     TAG_SERVER_NONCE,
     TAG_SERVER_TIME_MS,
@@ -190,6 +196,14 @@ METHOD_IDS = {
     0x00B3: "events.since",
     0x001A: "thread.settings.read",
     0x001B: "thread.settings.update",
+    0x0060: "attachment.add",
+    0x0061: "attachment.list",
+    0x0062: "attachment.remove",
+    0x0063: "attachment.upload.begin",
+    0x0064: "attachment.upload.chunk",
+    0x0065: "attachment.upload.end",
+    0x0066: "attachment.upload.cancel",
+    0x00C1: "content.read",
 }
 METHOD_CAPABILITIES = {
     0x0001: "status",
@@ -218,6 +232,14 @@ METHOD_CAPABILITIES = {
     0x00B3: "events_since",
     0x001A: "thread_settings",
     0x001B: "thread_settings",
+    0x0060: "attachment",
+    0x0061: "attachment",
+    0x0062: "attachment",
+    0x0063: "attachment",
+    0x0064: "attachment",
+    0x0065: "attachment",
+    0x0066: "attachment",
+    0x00C1: "text",
 }
 DISPATCH_METHODS = {
     "queue.add": "queue.enqueue",
@@ -359,6 +381,22 @@ PARAM_TAGS = {
     "approvals_reviewer": 0x0126,
     "sandbox_policy": 0x0127,
     "personality": 0x0128,
+    "attachment_id": 0x0151,
+    "attachment_ref": 0x0150,
+    "attachment_kind": 0x0152,
+    "filename": 0x0153,
+    "mime_type": 0x0154,
+    "byte_size": 0x0155,
+    "content_sha256": 0x0156,
+    "content_ref": 0x0157,
+    "upload_id": 0x0158,
+    "upload_offset": 0x0159,
+    "data": 0x0042,
+    "content_kind": 0x0162,
+    "offset": 0x0048,
+    "max_bytes": 0x001A,
+    "alt_text": 0x0166,
+    "input_parts": 0x015B,
 }
 
 
@@ -1012,6 +1050,26 @@ class CbdpGateway:
                     "sandbox_policy",
                 }:
                     result[name] = decode_u8(raw)
+                elif name in {
+                    "attachment_ref",
+                    "attachment_id",
+                    "attachment_kind",
+                    "filename",
+                    "mime_type",
+                    "byte_size",
+                    "content_sha256",
+                    "content_ref",
+                    "upload_id",
+                    "upload_offset",
+                    "offset",
+                    "max_bytes",
+                    "alt_text",
+                    "content_kind",
+                    "data",
+                }:
+                    result[name] = decode_utf8(raw)
+                elif name == "input_parts":
+                    result[name] = raw
                 elif name == "response":
                     # response is a nested TLV; keep it opaque for the caller.
                     result[name] = raw
@@ -1114,6 +1172,24 @@ class CbdpGateway:
 
     def _normalize_params(self, method, params):
         params = dict(params)
+        if method in {"turn.start", "queue.add"} and "input_parts" in params:
+            params["input_parts"] = self._decode_input_parts(params["input_parts"])
+        if method.startswith("attachment."):
+            for field in ("byte_size", "upload_offset", "offset", "max_bytes"):
+                if field in params:
+                    try:
+                        params[field] = int(params[field])
+                    except (TypeError, ValueError):
+                        raise CBDPError("INVALID_PARAM")
+            if method == "attachment.upload.chunk":
+                raw_data = str(params.get("data") or "")
+                try:
+                    params["data"] = base64.b64decode(raw_data, validate=True)
+                except (ValueError, TypeError):
+                    raise CBDPError("INVALID_PARAM")
+            ref = str(params.pop("attachment_ref", "") or "")
+            if ref and "attachment_id" not in params:
+                params["attachment_id"] = ref
         if method == "thread.settings.update":
             policy_names = {
                 "approval_policy": {
@@ -1146,6 +1222,8 @@ class CbdpGateway:
             body = params.pop("body", params.pop("text", None))
             if body is not None:
                 params["text"] = body
+            if method in {"turn.start", "queue.add"} and "input_parts" in params:
+                params["input_parts"] = self._decode_input_parts(params["input_parts"])
         if method in {"queue.add", "queue.update"}:
             queue_item_ref = params.pop("queue_item_ref", None)
             if queue_item_ref is not None and "queue_id" not in params:
@@ -1190,6 +1268,37 @@ class CbdpGateway:
                     history_depth = profile_budget(int(self.session.profile or 0)).history_depth
                 params["message_limit"] = max(0, int(history_depth))
         return params
+
+    def _decode_input_parts(self, raw) -> list[dict]:
+        """Decode the ``input_parts(0x015B)`` array into command-layer parts."""
+
+        if not isinstance(raw, (bytes, bytearray)):
+            raise CBDPError("INVALID_PARAM")
+        items = decode_array(raw, TAG_OBJECT)
+        parts: list[dict] = []
+        for _tag, payload in items:
+            fields = decode_tlvs(payload)
+            kind_value = decode_u8(fields.get(TAG_PART_KIND, b"\x00"))
+            kind = {
+                0: "text",
+                1: "file",
+                2: "image",
+                3: "audio",
+                4: "tool_result",
+            }.get(kind_value, "text")
+            part: dict = {"type": kind}
+            if TAG_BODY in fields:
+                part["text"] = decode_utf8(fields[TAG_BODY])
+            if TAG_ATTACHMENT_ID in fields:
+                part["attachment_id"] = decode_utf8(fields[TAG_ATTACHMENT_ID])
+            elif TAG_ATTACHMENT_REF in fields:
+                part["attachment_id"] = str(decode_u32(fields[TAG_ATTACHMENT_REF]))
+            if TAG_CONTENT_REF in fields:
+                part["content_ref"] = decode_utf8(fields[TAG_CONTENT_REF])
+            if TAG_ALT_TEXT in fields:
+                part["alt_text"] = decode_utf8(fields[TAG_ALT_TEXT])
+            parts.append(part)
+        return parts
 
     def _active_snapshot(self, device_id: str) -> dict:
         """Current active thread/turn for one device.

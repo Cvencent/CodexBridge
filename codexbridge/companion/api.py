@@ -18,6 +18,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 from codexbridge import VERSION
 from codexbridge.codex.app_server import AppServerError
 from codexbridge.companion.service import CompanionService
+from codexbridge.companion.attachments import (
+    AttachmentError,
+    MAX_UPLOAD_CHUNK_BYTES,
+)
 from codexbridge.companion.store import DEFAULT_PORT, LEGACY_PORT, CompanionStore
 from codexbridge.ports import validate_companion_port
 from codexbridge.net_gate import ExclusiveBindMixin
@@ -34,6 +38,7 @@ from codexbridge.cbdp.http_transport import (
 from codexbridge.cbdp.tlv import CBDPError
 
 MAX_BODY_BYTES = 64 * 1024
+MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_CHUNK_BYTES * 2 + 64 * 1024
 SSE_HEARTBEAT_SECONDS = 15.0
 # The SSE loops wait on their queue in short slices so a Companion stop is
 # observed within about a second instead of waiting for the full heartbeat
@@ -399,6 +404,27 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             if path == "/api/companion/log":
                 self._send_json(200, {"ok": True, "entries": self.app.service.event_log()})
                 return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "companion", "threads"]
+                and parts[4] == "attachments"
+            ):
+                result = self.app.service.attachments.list(parts[3])
+                self._send_json(200, {"ok": True, **result})
+                return
+            if (
+                len(parts) == 4
+                and parts[:3] == ["api", "companion", "attachments"]
+            ):
+                result = self.app.service.attachments.read_bytes(
+                    parts[3],
+                    offset=int((query.get("offset") or ["0"])[0]),
+                    max_bytes=int((query.get("max_bytes") or ["262144"])[0]),
+                )
+                data = result.pop("data", b"")
+                result["content_base64"] = base64.b64encode(data).decode("ascii")
+                self._send_json(200, {"ok": True, **result})
+                return
             if len(parts) == 4 and parts[:3] == ["api", "companion", "threads"]:
                 detail = self.app.service.read_thread(parts[3])
                 if 'approval' not in device.capabilities():
@@ -407,6 +433,10 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 return
         except ValueError:
             self._error(400, "invalid_request")
+            return
+        except AttachmentError as error:
+            status = 404 if error.code == 'NOT_FOUND' else 400
+            self._error(status, error.code, error.message)
             return
         except AppServerError as error:
             self._error(503, "codex_unavailable", str(error))
@@ -436,7 +466,13 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             self._error(403, 'capability_not_enabled')
             return
         try:
-            payload = self._body()
+            upload_body = (
+                len(parts) >= 2
+                and parts[:3] == ["api", "companion", "uploads"]
+            )
+            payload = self._body(
+                max_bytes=MAX_UPLOAD_BODY_BYTES if upload_body else MAX_BODY_BYTES
+            )
         except ValueError:
             self._error(400, "invalid_body")
             return
@@ -466,11 +502,15 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 model = str(payload.get("model") or "")
                 effort = str(payload.get("effort") or "")
                 mode = str(payload.get("mode") or "start")
+                input_parts = payload.get("input_parts")
+                if input_parts is not None and not isinstance(input_parts, list):
+                    raise ValueError("input_parts")
                 if mode == "steer":
                     result = self.app.service.steer_turn(parts[3], text)
                 elif "queue" in device.capabilities():
                     result = self.app.service.queue_enqueue(
-                        parts[3], text, model=model, effort=effort
+                        parts[3], text, model=model, effort=effort,
+                        input_parts=input_parts,
                     )
                     result["request_id"] = str(payload.get("client_message_id") or "")
                 else:
@@ -480,8 +520,63 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                         model=model,
                         effort=effort,
                         client_message_id=str(payload.get("client_message_id") or ""),
+                        input_parts=input_parts,
                     )
                 self._send_json(200, {"ok": True, **result})
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "companion", "threads"]
+                and parts[4] == "attachments"
+            ):
+                result = self.app.service.attachments.begin_upload(
+                    thread_id=parts[3],
+                    kind=str(payload.get("kind") or ""),
+                    byte_size=payload.get("byte_size"),
+                    content_sha256=str(payload.get("content_sha256") or ""),
+                    filename=str(payload.get("filename") or ""),
+                    mime_type=str(payload.get("mime_type") or ""),
+                    alt_text=str(payload.get("alt_text") or ""),
+                    source=device.phone_id,
+                )
+                self._send_json(201, {"ok": True, **result})
+                return
+            if (
+                len(parts) == 5
+                and parts[:3] == ["api", "companion", "uploads"]
+            ):
+                upload_id = parts[3]
+                action = parts[4]
+                if action == "chunk":
+                    try:
+                        chunk = base64.b64decode(str(payload.get("data") or ""), validate=True)
+                    except (ValueError, TypeError):
+                        raise ValueError("data")
+                    result = self.app.service.attachments.upload_chunk(
+                        upload_id,
+                        int(payload.get("offset")),
+                        chunk,
+                    )
+                    self._send_json(200, {"ok": True, **result})
+                    return
+                if action == "end":
+                    result = self.app.service.attachments.end_upload(
+                        upload_id,
+                        byte_size=payload.get("byte_size"),
+                    )
+                    self._send_json(200, {"ok": True, **result})
+                    return
+                if action == "cancel":
+                    result = self.app.service.attachments.cancel_upload(upload_id)
+                    self._send_json(200, {"ok": True, **result})
+                    return
+            if (
+                len(parts) == 4
+                and parts[:3] == ["api", "companion", "attachments"]
+                and str(payload.get("action") or "") == "remove"
+            ):
+                removed = self.app.service.attachments.remove(parts[3])
+                self._send_json(200, {"ok": True, "removed": removed})
                 return
             if len(parts) == 5 and parts[:3] == ["api", "companion", "threads"] and parts[4] == "interrupt":
                 result = self.app.service.interrupt(parts[3], str(payload.get("turn_id") or ""))
@@ -505,6 +600,17 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         except CommandError as error:
             code = str(error)
             self._error(409 if code in {'request_id_conflict', 'outcome_unknown'} else 400, code)
+            return
+        except AttachmentError as error:
+            status = {
+                'NOT_FOUND': 404,
+                'PAYLOAD_TOO_LARGE': 413,
+                'UPLOAD_OFFSET_MISMATCH': 409,
+                'UPLOAD_INCOMPLETE': 409,
+                'CONTENT_HASH_MISMATCH': 422,
+                'ATTACHMENT_KIND_MISMATCH': 415,
+            }.get(error.code, 400)
+            self._error(status, error.code, error.message)
             return
         except DesktopIpcError as error:
             self._error(503, 'desktop_unavailable', str(error))
@@ -554,13 +660,13 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _body(self) -> dict[str, Any]:
+    def _body(self, *, max_bytes: int = MAX_BODY_BYTES) -> dict[str, Any]:
         length_header = self.headers.get("Content-Length") or "0"
         try:
             length = int(length_header)
         except ValueError as error:
             raise ValueError("content-length") from error
-        if length < 0 or length > MAX_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             raise ValueError("content-length")
         raw = self.rfile.read(length) if length else b""
         if not raw:

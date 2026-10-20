@@ -76,6 +76,16 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   应用的线程策略写入 `%LOCALAPPDATA%\CodexBridge\thread-settings.json`，
   `thread.settings.read` 优先读取这份权威镜像；无法读取上游线程时也仍能返回
   上次生效值。`effort` 同时兼容上游的 `reasoningEffort` 字段名。
+- **2026-10-20 附件实现：** 新增 `%LOCALAPPDATA%\CodexBridge\attachments\` 内容
+  存储与分片上传事务，落地协议中的 `attachment.add/list/remove`（CBDP
+  `0x0060..0x0062`）、`attachment.upload.begin/chunk/end/cancel`
+  （`0x0063..0x0066`）和 `content.read`（`0x00C1`）。`turn.start` / `queue.add`
+  的 `input_parts` 会把图片附件转成 Codex 的 `input_image`（内联 data URL）输入。
+  Companion HTTP 侧新增 `POST /api/companion/threads/<id>/attachments`、
+  `POST /api/companion/uploads/<upload_id>/chunk|end|cancel`、
+  `GET /api/companion/threads/<id>/attachments`、
+  `GET /api/companion/attachments/<id>` 与附件删除接口；手机接入细节见
+  [手机端附件接入说明](docs/CodexBridge-mobile-attachment-api.md)。
 
 ## 1. 范围与角色
 
