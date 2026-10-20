@@ -18,25 +18,6 @@ from codexbridge.companion.queue import QueueService
 from codexbridge.read_state import ReadStateStore
 
 
-def _sandbox_policy_object(value: Any) -> Any:
-    """Translate the compact wire name into the app-server enum object."""
-
-    if isinstance(value, dict):
-        if str(value.get("type") or ""):
-            return dict(value)
-        raise ValueError("sandbox_policy")
-    names = {
-        "read-only": "readOnly",
-        "readOnly": "readOnly",
-        "workspace-write": "workspaceWrite",
-        "workspaceWrite": "workspaceWrite",
-        "danger-full-access": "dangerFullAccess",
-        "dangerFullAccess": "dangerFullAccess",
-    }
-    name = names.get(str(value or ""))
-    if name is None:
-        raise ValueError("sandbox_policy")
-    return {"type": name}
 from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
@@ -69,6 +50,43 @@ from codexbridge.companion.read_cache import (
     TERMINAL_READ_TTL_SECONDS,
     thread_tag,
 )
+
+
+def _sandbox_policy_object(value: Any) -> Any:
+    """Translate the compact wire name into the app-server enum object."""
+
+    if isinstance(value, dict):
+        if str(value.get("type") or ""):
+            return dict(value)
+        raise ValueError("sandbox_policy")
+    names = {
+        "read-only": "readOnly",
+        "readOnly": "readOnly",
+        "workspace-write": "workspaceWrite",
+        "workspaceWrite": "workspaceWrite",
+        "danger-full-access": "dangerFullAccess",
+        "dangerFullAccess": "dangerFullAccess",
+    }
+    name = names.get(str(value or ""))
+    if name is None:
+        raise ValueError("sandbox_policy")
+    return {"type": name}
+
+
+def _sandbox_policy_name(value: Any) -> str:
+    """Canonical device-facing sandbox policy name, for local readback."""
+
+    if isinstance(value, dict):
+        value = value.get("type", "")
+    names = {
+        "read-only": "read-only",
+        "readOnly": "read-only",
+        "workspace-write": "workspace-write",
+        "workspaceWrite": "workspace-write",
+        "danger-full-access": "danger-full-access",
+        "dangerFullAccess": "danger-full-access",
+    }
+    return names.get(str(value or ""), str(value or ""))
 
 SOURCE_KINDS = ["cli", "vscode", "exec", "appServer", "unknown"]
 # Name given to a continuation fork so the desktop can tell it apart from the
@@ -541,6 +559,10 @@ class CompanionService:
         self._fork_tails: dict[str, str] = {}
         self._resumed_lock = threading.Lock()
         self._load_fork_map()
+        self._thread_settings_path = self.data_dir / "thread-settings.json"
+        self._thread_settings: dict[str, dict[str, Any]] = {}
+        self._thread_settings_lock = threading.RLock()
+        self._load_thread_settings()
         self._sessions_root = (
             Path(sessions_root)
             if sessions_root is not None
@@ -1017,6 +1039,95 @@ class CompanionService:
             temporary.replace(self._fork_map_path())
         except OSError:
             return
+
+    def _load_thread_settings(self) -> None:
+        try:
+            payload = json.loads(
+                self._thread_settings_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        threads = payload.get("threads")
+        if not isinstance(threads, dict):
+            return
+        with self._thread_settings_lock:
+            for thread_id, value in threads.items():
+                if not isinstance(thread_id, str) or not isinstance(value, dict):
+                    continue
+                settings = {
+                    key: item
+                    for key, item in value.items()
+                    if key in {
+                        "approval_policy",
+                        "approvals_reviewer",
+                        "sandbox_policy",
+                        "personality",
+                        "settings_revision",
+                    }
+                    and isinstance(item, (str, int))
+                }
+                if settings:
+                    self._thread_settings[thread_id] = settings
+
+    def _save_thread_settings(self) -> None:
+        with self._thread_settings_lock:
+            payload = {
+                "version": 1,
+                "threads": {
+                    thread_id: dict(settings)
+                    for thread_id, settings in self._thread_settings.items()
+                },
+            }
+        try:
+            self._thread_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            # Use a unique temporary file so concurrent settings updates cannot
+            # overwrite each other's write before the atomic replace.
+            temporary = self._thread_settings_path.with_suffix(
+                f".json.{os.getpid()}.{threading.get_ident()}.tmp"
+            )
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            try:
+                temporary.replace(self._thread_settings_path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        except OSError:
+            return
+
+    def _remember_thread_settings(
+        self,
+        thread_id: str,
+        *,
+        approval_policy: str = "",
+        approvals_reviewer: str = "",
+        sandbox_policy: str | dict[str, Any] = "",
+        personality: str = "",
+    ) -> int:
+        """Persist settings the upstream app-server does not return on read."""
+
+        with self._thread_settings_lock:
+            current = self._thread_settings.setdefault(thread_id, {})
+            if approval_policy:
+                current["approval_policy"] = str(approval_policy)
+            if approvals_reviewer:
+                current["approvals_reviewer"] = str(approvals_reviewer)
+            if sandbox_policy:
+                current["sandbox_policy"] = _sandbox_policy_name(sandbox_policy)
+            if personality:
+                current["personality"] = str(personality)
+            revision = int(current.get("settings_revision") or 0) + 1
+            current["settings_revision"] = revision
+        self._save_thread_settings()
+        return revision
+
+    def _thread_settings_snapshot(self, thread_id: str) -> dict[str, Any]:
+        with self._thread_settings_lock:
+            return dict(self._thread_settings.get(thread_id, {}))
 
     def _fork_for(self, thread_id: str) -> str:
         with self._resumed_lock:
@@ -2359,27 +2470,53 @@ class CompanionService:
 
         if not thread_id:
             raise ValueError("thread_id")
-        detail = self._read("thread/read", {"threadId": thread_id, "includeTurns": False})
+        try:
+            detail = self._read(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": False},
+            )
+        except (AppServerError, OSError, ValueError):
+            detail = {}
         thread = detail.get("thread") if isinstance(detail, dict) else None
-        if not isinstance(thread, dict):
-            raise ValueError("thread")
+        thread = thread if isinstance(thread, dict) else {}
         runtime = thread.get("status") if isinstance(thread.get("status"), dict) else {}
+        persisted = self._thread_settings_snapshot(thread_id)
         return {
             "thread_id": thread_id,
             "model": str(thread.get("model") or ""),
-            "effort": str(thread.get("effort") or ""),
+            "effort": str(
+                persisted.get("effort")
+                or thread.get("effort")
+                or thread.get("reasoningEffort")
+                or ""
+            ),
             "cwd": str(thread.get("cwd") or ""),
             "approval_policy": str(
-                thread.get("approvalPolicy") or runtime.get("approvalPolicy") or ""
+                persisted.get("approval_policy")
+                or thread.get("approvalPolicy")
+                or runtime.get("approvalPolicy")
+                or ""
             ),
             "approvals_reviewer": str(
-                thread.get("approvalsReviewer") or runtime.get("approvalsReviewer") or ""
+                persisted.get("approvals_reviewer")
+                or thread.get("approvalsReviewer")
+                or runtime.get("approvalsReviewer")
+                or ""
             ),
             "sandbox_policy": str(
-                thread.get("sandboxPolicy") or runtime.get("sandboxPolicy") or ""
+                persisted.get("sandbox_policy")
+                or thread.get("sandboxPolicy")
+                or runtime.get("sandboxPolicy")
+                or ""
             ),
-            "personality": str(thread.get("personality") or ""),
-            "settings_revision": int(thread.get("settingsRevision") or 0),
+            "personality": str(
+                persisted.get("personality") or thread.get("personality") or ""
+            ),
+            "settings_revision": int(
+                persisted.get("settings_revision")
+                or thread.get("settingsRevision")
+                or 0
+            ),
         }
 
     def update_thread_settings(
@@ -2400,10 +2537,8 @@ class CompanionService:
             [model, effort, approval_policy, approvals_reviewer, sandbox_policy, personality]
         ):
             raise ValueError("settings")
-        owner = None
-        with self._resumed_lock:
-            owner = self._desktop_followed.get(thread_id)
-        if owner and self._desktop is not None:
+        owner = self._desktop_owner(thread_id)
+        if owner:
             applied = self._desktop.update_thread_settings(
                 owner,
                 thread_id,
@@ -2431,11 +2566,20 @@ class CompanionService:
                 params["personality"] = personality
             self._client.request("thread/settings/update", params)
             applied = True
+        revision = 0
+        if applied:
+            revision = self._remember_thread_settings(
+                thread_id,
+                approval_policy=approval_policy,
+                approvals_reviewer=approvals_reviewer,
+                sandbox_policy=sandbox_policy,
+                personality=personality,
+            )
         self.publish({"type": "thread_settings_changed", "thread_id": thread_id})
         return {
             "thread_id": thread_id,
             "applied": bool(applied),
-            "settings_revision": 0,
+            "settings_revision": revision,
         }
 
     def mark_thread_read(self, thread_id: str) -> dict[str, Any]:

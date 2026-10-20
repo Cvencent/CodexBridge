@@ -67,6 +67,15 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   (`{"type":"readOnly"}` / `{"type":"workspaceWrite"}` /
   `{"type":"dangerFullAccess"}`)；Bridge 分别翻译成 app-server 的
   `SandboxPolicy` 对象和桌面 IPC 的点分字符串，设备不需要感知上游差异。
+- **2026-10-20 后续修正：** `thread.settings.update` 与 `turn.start` 使用同一条
+  owner discovery 路径：先通过桌面 IPC 找到线程当前 writer，再由该 writer
+  执行设置更新。桌面创建的线程不会再因为 Bridge 自己的 app-server 不认识而
+  返回 `thread not found`。
+- **2026-10-20 后续修正：** app-server 的 `thread/read` 不返回
+  `approvalPolicy` / `sandboxPolicy` / `approvalsReviewer`。Bridge 会把成功
+  应用的线程策略写入 `%LOCALAPPDATA%\CodexBridge\thread-settings.json`，
+  `thread.settings.read` 优先读取这份权威镜像；无法读取上游线程时也仍能返回
+  上次生效值。`effort` 同时兼容上游的 `reasoningEffort` 字段名。
 
 ## 1. 范围与角色
 

@@ -329,6 +329,62 @@ class CompanionServiceTests(unittest.TestCase):
         self.service.start_turn('t1', '继续修复')
         desktop.update_thread_settings.assert_not_called()
 
+    def test_desktop_owned_settings_update_discovers_the_owner(self) -> None:
+        from unittest.mock import Mock
+        desktop = Mock()
+        desktop.find_thread_owner.return_value = 'owner'
+        desktop.update_thread_settings.return_value = True
+        self.service._desktop = desktop
+
+        result = self.service.update_thread_settings(
+            't1', approval_policy='never', sandbox_policy={'type': 'dangerFullAccess'})
+
+        desktop.find_thread_owner.assert_called_once_with('t1')
+        desktop.update_thread_settings.assert_called_once_with(
+            'owner',
+            't1',
+            model='',
+            effort='',
+            approval_policy='never',
+            approvals_reviewer='',
+            sandbox_policy={'type': 'dangerFullAccess'},
+            personality='',
+        )
+        self.assertTrue(result['applied'])
+
+    def test_thread_settings_read_uses_persisted_effective_values(self) -> None:
+        self.service._remember_thread_settings(
+            't1',
+            approval_policy='on-request',
+            sandbox_policy='danger-full-access',
+            approvals_reviewer='user',
+            personality='pragmatic',
+        )
+
+        result = self.service.read_thread_settings('t1')
+
+        self.assertEqual(result['approval_policy'], 'on-request')
+        self.assertEqual(result['sandbox_policy'], 'danger-full-access')
+        self.assertEqual(result['approvals_reviewer'], 'user')
+        self.assertEqual(result['personality'], 'pragmatic')
+        self.assertGreater(result['settings_revision'], 0)
+
+    def test_thread_settings_read_survives_desktop_only_thread_without_readback(self) -> None:
+        def missing(_params):
+            raise AppServerError('thread not found')
+
+        self.client.responses['thread/read'] = missing
+        self.service._remember_thread_settings(
+            'desktop-only',
+            approval_policy='never',
+            sandbox_policy='workspace-write',
+        )
+
+        result = self.service.read_thread_settings('desktop-only')
+
+        self.assertEqual(result['approval_policy'], 'never')
+        self.assertEqual(result['sandbox_policy'], 'workspace-write')
+
     def test_desktop_snapshot_imports_pending_approval_and_routes_response(self):
         from unittest.mock import Mock
         self.service._desktop = Mock()

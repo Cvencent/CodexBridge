@@ -2705,6 +2705,15 @@ Bridge 内部同时兼容紧凑字符串和
 app-server 的 `SandboxPolicy` 对象与桌面 IPC 的点分字符串。该差异不出现在
 CBDP 线上；设备始终只发送协议枚举。Bridge 的 app-server 初始化必须声明
 `capabilities.experimentalApi=true`，否则上游会拒绝 `thread/settings/update`。
+
+`thread.settings.read` 的策略字段以 Bridge 的持久化镜像为准：app-server 的
+`thread/read` 只返回 `model`、`cwd`、`reasoningEffort`，不返回
+`approvalPolicy`、`sandboxPolicy` 或 `approvalsReviewer`。Bridge 在每次更新成功
+后把 `approval_policy`、`approvals_reviewer`、`sandbox_policy` 和
+`personality` 写入 `%LOCALAPPDATA%\CodexBridge\thread-settings.json`，读取时
+优先返回该镜像，再以线程对象字段作为回退。桌面创建的线程还会先通过与
+`turn.start` 相同的 owner discovery 路由到真实 writer，避免落到不识路该线程的
+Bridge app-server。
 | `thread.metadata.update` | `thread_ref` / `thread_id` | `title`, `metadata_json`, `source_kind` | `thread_ref`, `settings_revision`, `revision` | `[本轮实现]` |
 | `thread.revert` | `thread_ref` / `thread_id`, `revert_to_ref` | `branch_ref`, `force` | `thread_ref`, `branch_ref`, `revision` | `[本轮实现]` |
 | `thread.read_state.update` | `thread_ref` / `thread_id`, `read_at_ms` | `unread_count` | `thread_ref`, `read_states`, `revision` | `[本轮实现]` |
