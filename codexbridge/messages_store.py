@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 # Fields the collector refreshes on every poll that no device renders. Keeping
@@ -43,6 +45,16 @@ IN_FLIGHT_KINDS: frozenset[str] = frozenset({"status", "task"})
 IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
     {"working", "waiting_user", "queued", "starting"}
 )
+
+# Device-facing names are intentionally generic. ``waiting_user`` is the
+# internal Codex/Companion spelling; CBDP clients use ``waiting`` in both
+# message payloads and status snapshots.
+DEVICE_STATUS_NAMES: dict[str, str] = {"waiting_user": "waiting"}
+
+
+def device_status(status: str) -> str:
+    value = str(status or "")
+    return DEVICE_STATUS_NAMES.get(value, value)
 
 
 def is_in_flight(record: "MessageRecord") -> bool:
@@ -120,40 +132,135 @@ class MessageRecord:
 
 
 class MessageStore:
-    def __init__(self, max_messages: int = 200):
+    def __init__(
+        self,
+        max_messages: int = 200,
+        path: Path | str | None = None,
+    ):
         if max_messages <= 0:
             raise ValueError("max_messages must be positive")
         self.max_messages = max_messages
+        self.path = Path(path) if path is not None else None
+        self._lock = threading.RLock()
         self._messages: OrderedDict[str, MessageRecord] = OrderedDict()
+        self.load()
+
+    def load(self) -> None:
+        """Restore terminal results needed for unread counts after restart.
+
+        Live task/status records describe a transient Codex collection cycle,
+        so the collector refreshes them. Terminal results are the notification
+        source for global unread counters and must survive Bridge restarts;
+        otherwise every upgrade silently clears the user's completion alerts.
+        """
+
+        if self.path is None:
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        rows = payload.get("messages")
+        if not isinstance(rows, list):
+            return
+        with self._lock:
+            for item in rows[-self.max_messages:]:
+                if not isinstance(item, dict):
+                    continue
+                message_id = str(item.get("message_id") or "")
+                thread_id = str(item.get("thread_id") or "")
+                status = str(item.get("status") or "")
+                if not message_id or not thread_id or status not in {
+                    "completed",
+                    "failed",
+                }:
+                    continue
+                try:
+                    created_at = float(item.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    created_at = 0.0
+                data = item.get("data")
+                self._messages[message_id] = MessageRecord(
+                    message_id=message_id,
+                    thread_id=thread_id,
+                    kind="result",
+                    status=status,
+                    title=str(item.get("title") or ""),
+                    body=str(item.get("body") or ""),
+                    created_at=created_at,
+                    data=data if isinstance(data, dict) else None,
+                )
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            rows = [
+                {
+                    "message_id": record.message_id,
+                    "thread_id": record.thread_id,
+                    "status": record.status,
+                    "title": record.title,
+                    "body": record.body,
+                    "created_at": record.created_at,
+                    "data": record.data,
+                }
+                for record in self._messages.values()
+                if record.kind == "result"
+                and record.status in {"completed", "failed"}
+            ]
+            payload = {"version": 1, "messages": rows}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+        except OSError:
+            return
 
     def add(self, record: MessageRecord) -> MessageRecord:
-        existing = self._messages.get(record.message_id)
-        if existing is not None:
-            record.read_by.update(existing.read_by)
-            if record.data is None:
-                record.data = existing.data
-        if record.kind in IN_FLIGHT_KINDS:
-            record.seen_at = time.time()
-        if existing is not None:
-            del self._messages[record.message_id]
-        self._messages[record.message_id] = record
-        while len(self._messages) > self.max_messages:
-            self._messages.popitem(last=False)
+        with self._lock:
+            existing = self._messages.get(record.message_id)
+            if existing is not None:
+                record.read_by.update(existing.read_by)
+                if record.data is None:
+                    record.data = existing.data
+            if record.kind in IN_FLIGHT_KINDS:
+                record.seen_at = time.time()
+            if existing is not None:
+                del self._messages[record.message_id]
+            self._messages[record.message_id] = record
+            while len(self._messages) > self.max_messages:
+                self._messages.popitem(last=False)
+            persist = record.kind == "result" and record.status in {
+                "completed",
+                "failed",
+            }
+        if persist:
+            self.save()
         return record
 
     def get(self, message_id: str) -> MessageRecord | None:
-        return self._messages.get(message_id)
+        with self._lock:
+            return self._messages.get(message_id)
 
     def mark_read(self, message_id: str, device_id: str) -> MessageRecord | None:
-        record = self._messages.get(message_id)
-        if record is None:
-            return None
-        record.read_by.add(device_id)
-        return record
+        with self._lock:
+            record = self._messages.get(message_id)
+            if record is None:
+                return None
+            record.read_by.add(device_id)
+            return record
 
     def read_by(self, message_id: str) -> set[str]:
-        record = self._messages.get(message_id)
-        return set(record.read_by) if record is not None else set()
+        with self._lock:
+            record = self._messages.get(message_id)
+            return set(record.read_by) if record is not None else set()
 
     def live_status(self, thread_id: str = "") -> MessageRecord | None:
         """Most recent in-flight status record, or None.
@@ -164,15 +271,18 @@ class MessageStore:
         to the conversation a client is actually watching.
         """
         wanted = str(thread_id or "")
-        fresh = [
-            record
-            for record in self._messages.values()
-            if is_in_flight(record) and is_fresh(record)
-            and (not wanted or str(record.thread_id or "") == wanted)
-        ]
+        with self._lock:
+            fresh = [
+                record
+                for record in self._messages.values()
+                if is_in_flight(record) and is_fresh(record)
+                and (not wanted or str(record.thread_id or "") == wanted)
+            ]
         status_records = [record for record in fresh if record.kind == "status"]
         # A task record carries the same live thread when only one half of the
-        # pair was republished, so it is still a valid answer.
+        # pair was republished, so it is still a valid answer. Keep status
+        # records authoritative for renderable text; status transitions use a
+        # new message id, so a fresh task record is not needed to replace it.
         candidates = status_records or [
             record for record in fresh if record.kind == "task"
         ]
@@ -190,7 +300,8 @@ class MessageStore:
         from the exact same set of records it hands to devices, instead of
         maintaining a second, drift-prone tally.
         """
-        return list(self._messages.values())
+        with self._lock:
+            return list(self._messages.values())
 
     def pending_for(
         self,
@@ -199,11 +310,12 @@ class MessageStore:
         unread_only: bool = True,
     ) -> list[MessageRecord]:
         pending: list[MessageRecord] = []
-        for record in self._messages.values():
-            capability = KIND_CAPABILITY.get(record.kind)
-            if capability is None or capability not in capabilities:
-                continue
-            if unread_only and device_id in record.read_by:
-                continue
-            pending.append(record)
+        with self._lock:
+            for record in self._messages.values():
+                capability = KIND_CAPABILITY.get(record.kind)
+                if capability is None or capability not in capabilities:
+                    continue
+                if unread_only and device_id in record.read_by:
+                    continue
+                pending.append(record)
         return pending

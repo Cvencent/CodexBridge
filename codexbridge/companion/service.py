@@ -16,6 +16,27 @@ from codexbridge.protocol.commands import CommandDispatcher
 from codexbridge.companion.queue import QueueService
 
 from codexbridge.read_state import ReadStateStore
+
+
+def _sandbox_policy_object(value: Any) -> Any:
+    """Translate the compact wire name into the app-server enum object."""
+
+    if isinstance(value, dict):
+        if str(value.get("type") or ""):
+            return dict(value)
+        raise ValueError("sandbox_policy")
+    names = {
+        "read-only": "readOnly",
+        "readOnly": "readOnly",
+        "workspace-write": "workspaceWrite",
+        "workspaceWrite": "workspaceWrite",
+        "danger-full-access": "dangerFullAccess",
+        "dangerFullAccess": "dangerFullAccess",
+    }
+    name = names.get(str(value or ""))
+    if name is None:
+        raise ValueError("sandbox_policy")
+    return {"type": name}
 from codexbridge.codex.app_server import (
     AppServerClient,
     AppServerError,
@@ -2368,7 +2389,7 @@ class CompanionService:
         effort: str = "",
         approval_policy: str = "",
         approvals_reviewer: str = "",
-        sandbox_policy: str = "",
+        sandbox_policy: str | dict[str, Any] = "",
         personality: str = "",
     ) -> dict[str, Any]:
         """Persist thread-level settings, including the approval mode."""
@@ -2405,7 +2426,7 @@ class CompanionService:
             if approvals_reviewer:
                 params["approvalsReviewer"] = approvals_reviewer
             if sandbox_policy:
-                params["sandboxPolicy"] = sandbox_policy
+                params["sandboxPolicy"] = _sandbox_policy_object(sandbox_policy)
             if personality:
                 params["personality"] = personality
             self._client.request("thread/settings/update", params)

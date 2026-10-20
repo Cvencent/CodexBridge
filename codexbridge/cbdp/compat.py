@@ -145,9 +145,10 @@ STATUS_IDS = {
     "failed": 3,
     "interrupted": 4,
     "working": 1,
-    "waiting_user": 0,
-    "queued": 0,
-    "starting": 0,
+    "waiting_user": 1,
+    "waiting": 1,
+    "queued": 1,
+    "starting": 1,
     "done": 2,
 }
 STATUS_NAMES = {

@@ -232,6 +232,23 @@ class _NullClient:
         self.assertEqual(decode_i64(payload[TAG_CREATED_AT_MS]), 2000)
         self.assertEqual(decode_i64(payload[TAG_UPDATED_AT_MS]), 2000)
 
+    def test_waiting_task_message_event_uses_running_status_number(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="task:t1",
+                thread_id="t1",
+                kind="task",
+                status="waiting_user",
+                title="Task",
+                body="waiting",
+                created_at=2.0,
+            )
+        )
+
+        payload = self._events(0x0301)[0].payload
+
+        self.assertEqual(1, decode_u16(payload[TAG_STATUS]))
+
     def test_cbdp_session_receives_committed_event_not_compat_delta(self):
         self.registry.records["dev-1"] = _Record()
         session = _CbdpSession()

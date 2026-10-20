@@ -81,6 +81,9 @@ class CommandDispatcher:
             if field == 'response':
                 if not isinstance(value, dict) or len(json.dumps(value)) > 20000:
                     raise CommandError('invalid_params')
+            elif field == 'sandbox_policy':
+                if not isinstance(value, (str, dict)) or len(json.dumps(value)) > 2000:
+                    raise CommandError('invalid_params')
             elif field in {'limit', 'message_limit', 'approval_id', 'expected_revision', 'read_at_ms'}:
                 if field == 'read_at_ms':
                     if not isinstance(value, int) or isinstance(value, bool) or value < 0:

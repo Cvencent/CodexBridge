@@ -2282,6 +2282,13 @@ running_count, completed_unread_count, failed_unread_count
   应按 §16.1 忽略并在 `ACK` 中推进 cursor。
 - 该事件替代 legacy `codex_state` 字典在 CBDP 会话上的作用；legacy 字典仍保留给
   旧 JSON 设备。
+- **2026-10-20 后续语义修正：** `running_count` 统计当前所有未终结 turn 对应的
+  `working`、`waiting`、`queued`、`starting` 任务，任一集合变化即发布新事件；
+  没有执行中的 turn 时为 `0`。`completed_unread_count` / `failed_unread_count`
+  是稳定 `message_id` 去重后的全局未读终态结果数，只在设备已读水位推进时下降。
+  Bridge 会把终态结果持久化；进程重启、断线重连、事件重放和周期快照不得把
+  计数归零或重复递增。设备以计数相较上一快照“增加”触发一次本地提示音，
+  因此同一终态结果不得产生第二个计数增量。
 
 `queue.changed`：
 
@@ -2690,6 +2697,14 @@ project_ref, project_id, revision
 | `thread.restore` | `thread_ref` / `thread_id` | `force`, `expected_revision` | `thread_ref`, `tombstone`, `revision` | `[本轮实现]` |
 | `thread.settings.read` | `thread_ref` / `thread_id` | 无 | `model_name`, `effort`, `cwd`, `settings_revision` | `[本轮实现]` |
 | `thread.settings.update` | `thread_ref` / `thread_id` | `model_name`, `effort`, `cwd`, `approval_policy`, `approvals_reviewer`, `sandbox_policy`, `personality` | `thread_ref`, `settings_revision`, `revision` | `[本轮实现]` |
+
+`thread.settings.update` 的 `sandbox_policy(0x0127)` 线值仍是
+`0=read-only, 1=workspace-write, 2=danger-full-access, 3=custom`。
+Bridge 内部同时兼容紧凑字符串和
+`{"type":"readOnly"|"workspaceWrite"|"dangerFullAccess"}` 对象，并分别翻译为
+app-server 的 `SandboxPolicy` 对象与桌面 IPC 的点分字符串。该差异不出现在
+CBDP 线上；设备始终只发送协议枚举。Bridge 的 app-server 初始化必须声明
+`capabilities.experimentalApi=true`，否则上游会拒绝 `thread/settings/update`。
 | `thread.metadata.update` | `thread_ref` / `thread_id` | `title`, `metadata_json`, `source_kind` | `thread_ref`, `settings_revision`, `revision` | `[本轮实现]` |
 | `thread.revert` | `thread_ref` / `thread_id`, `revert_to_ref` | `branch_ref`, `force` | `thread_ref`, `branch_ref`, `revision` | `[本轮实现]` |
 | `thread.read_state.update` | `thread_ref` / `thread_id`, `read_at_ms` | `unread_count` | `thread_ref`, `read_states`, `revision` | `[本轮实现]` |

@@ -37,6 +37,15 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、
   `failed_unread_count(0x00BE)`。旧的 `codex_state` 字典无法翻译成 CBDP DELTA，
   之前在 CBDP 会话上被静默丢弃，是首页“运行中”恒为 0 的原因。
+- **2026-10-20 后续修正：** `running` 现在覆盖 `working`、`waiting_user`、
+  `queued`、`starting` 四种未终结状态，并与任务列表的状态集合保持一致。
+  设备公开消息和状态快照把内部 `waiting_user` 统一编码为 `waiting`；嵌套在
+  `data.task` / `data.tasks` 的任务状态也使用同一名称。
+- **2026-10-20 后续修正：** 完成与失败结果是持久化通知记录，写入
+  `%LOCALAPPDATA%\CodexBridge\messages.json`。Bridge 重启后仍按共享
+  `read-state.json` 水位恢复 `completed_unread` / `failed_unread`；同一
+  `message_id` 重发只替换原记录，不会重复累加。只有已读 ACK 或线程已读水位
+  推进时计数才下降，不会因快照重发、重连重放或周期性刷新归零。
 - Companion 审批提交路由修正为 `POST /api/companion/approvals/<request_id>`
   （路径只有 4 段，旧代码按 5 段判断导致恒 404）；请求体带 `response` 时走
   结构化审批，否则走 `decision`。
@@ -51,6 +60,13 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - 新增 `thread.settings.read/update`（CBDP `0x001A/0x001B`），可读写模型、
   effort、cwd 以及 `approval_policy` / `approvals_reviewer` /
   `sandbox_policy` / `personality`。
+- **2026-10-20 后续修正：** 独立 app-server 在 `initialize` 时声明
+  `capabilities.experimentalApi=true`，否则 `thread/settings/update` 会被
+  上游以实验 API 未启用拒绝。`sandbox_policy` 在命令层同时接受协议字符串
+  (`read-only` / `workspace-write` / `danger-full-access`) 与内部标签对象
+  (`{"type":"readOnly"}` / `{"type":"workspaceWrite"}` /
+  `{"type":"dangerFullAccess"}`)；Bridge 分别翻译成 app-server 的
+  `SandboxPolicy` 对象和桌面 IPC 的点分字符串，设备不需要感知上游差异。
 
 ## 1. 范围与角色
 
@@ -707,18 +723,23 @@ ID，不是 Codex 的原始 UUID。
 CodexBridge 应答：
 
 ```json
-{"type":"codex_state","running":1,"done":2,"failed":0,"request_id":7}
+{"type":"codex_state","running":1,"completed_unread":2,"failed_unread":0,"done":2,"failed":0,"request_id":7}
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `type` | string | 是 | 固定为 `codex_state` |
 | `running` | integer | 是 | 当前处于进行中状态的任务数 |
+| `completed_unread` | integer | 是 | 全局未读的完成结果数 |
+| `failed_unread` | integer | 是 | 全局未读的失败结果数 |
 | `done` | integer | 是 | 已完成的最近结果数 |
 | `failed` | integer | 是 | 失败的结果数 |
 | `request_id` | integer | 否 | 仅当请求携带时回显 |
 
-计数由 CodexBridge 从统一消息存储实时聚合，不需要设备维护第二套统计。
+`done` / `failed` 是兼容别名，分别与 `completed_unread` / `failed_unread`
+相同。计数由 CodexBridge 从统一消息存储实时聚合，不需要设备维护第二套统计。
+终态结果按稳定 `message_id` 去重并持久化，进程重启或设备重连不会重复递增；
+计数只会在已读水位推进后下降。
 设备应自行控制拉取频率（例如前台 15 秒、息屏 60 秒），避免频繁唤醒射频。
 设备上线时 CodexBridge 额外主动下发一次快照，避免刚重连时界面空白。
 未授权事件返回 `capability_not_enabled`。
@@ -742,7 +763,7 @@ CodexBridge 应答：
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `thread_id` | string | 当前线程，最长 64 字节 |
-| `status` | string | `working`、`waiting_user`、`queued`、`starting` 之一 |
+| `status` | string | `working`、`waiting`、`queued`、`starting` 之一 |
 | `current_action` | string | 当前动作；长度按第 7.4 节的设备正文预算裁剪 |
 | `turn_id` | string | 当前轮次，最长 40 字节；设备可用它判断"有没有新进展" |
 | `plan_completed` / `plan_total` | integer | 计划进度，缺省为 `0` |
@@ -860,7 +881,7 @@ CodexBridge 记录 `read_by`，并向其他支持 `read_ack` 的在线设备发�
   `read_state`，重连的设备也不再重放这些消息。
 
 进行中的状态（`kind` 为 `status` 或 `task`，`status` 为 `working`、
-`waiting_user`、`queued`、`starting`）不属于"已消费的通知"：即使手机已经读过，
+`waiting`、`queued`、`starting`）不属于"已消费的通知"：即使手机已经读过，
 它仍然会重放给新连接的设备，也仍然能被 `codex_state_request` 拉到。否则设备会
 因为别人读过而再也看不到"任务还在跑"。
 

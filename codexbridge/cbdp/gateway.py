@@ -231,6 +231,7 @@ def _thread_state(status: str) -> int:
         "working": 1,
         "running": 1,
         "waiting_user": 1,
+        "waiting": 1,
         "queued": 1,
         "starting": 1,
         "completed": 2,
@@ -266,7 +267,10 @@ def _message_status(status: str) -> int:
         "pending": 0,
         "working": 1,
         "streaming": 1,
-        "starting": 0,
+        "waiting_user": 1,
+        "waiting": 1,
+        "queued": 1,
+        "starting": 1,
         "completed": 2,
         "done": 2,
         "failed": 3,
@@ -350,6 +354,11 @@ PARAM_TAGS = {
     "active_turn_ref": 0x0171,
     "active_revision": 0x0173,
     "guidance_text": 0x0109,
+    "effort": 0x0124,
+    "approval_policy": 0x0125,
+    "approvals_reviewer": 0x0126,
+    "sandbox_policy": 0x0127,
+    "personality": 0x0128,
 }
 
 
@@ -997,6 +1006,12 @@ class CbdpGateway:
                     result[name] = decode_i64(raw)
                 elif name == "decision":
                     result[name] = decode_u8(raw)
+                elif name in {
+                    "approval_policy",
+                    "approvals_reviewer",
+                    "sandbox_policy",
+                }:
+                    result[name] = decode_u8(raw)
                 elif name == "response":
                     # response is a nested TLV; keep it opaque for the caller.
                     result[name] = raw
@@ -1099,6 +1114,34 @@ class CbdpGateway:
 
     def _normalize_params(self, method, params):
         params = dict(params)
+        if method == "thread.settings.update":
+            policy_names = {
+                "approval_policy": {
+                    0: "untrusted",
+                    1: "on-failure",
+                    2: "on-request",
+                    3: "never",
+                    4: "granular",
+                },
+                "approvals_reviewer": {
+                    0: "user",
+                    1: "auto",
+                    2: "guardian",
+                },
+                "sandbox_policy": {
+                    0: "read-only",
+                    1: "workspace-write",
+                    2: "danger-full-access",
+                    3: "custom",
+                },
+            }
+            for field, names in policy_names.items():
+                value = params.get(field)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    name = names.get(int(value))
+                    if name is None:
+                        raise CBDPError("INVALID_PARAM")
+                    params[field] = name
         if method in {"turn.start", "turn.steer", "queue.add", "queue.update"}:
             body = params.pop("body", params.pop("text", None))
             if body is not None:

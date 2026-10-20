@@ -94,6 +94,11 @@ class StaleCountsTest(unittest.TestCase):
             record.seen_at = time.time() - IN_FLIGHT_STALE_AFTER_SECONDS - 1
         self.assertEqual(0, self.hub.counts()["running"])
 
+    def test_starting_task_counts_as_running(self):
+        self.hub.publish(task_record(status="starting"))
+
+        self.assertEqual(1, self.hub.counts()["running"])
+
     def test_terminal_counters_are_not_age_limited(self):
         self.hub.publish(MessageRecord("result:t1:5", "t1", "result",
                                        "completed", "结果", "正文", 5.0))

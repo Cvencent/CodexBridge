@@ -12,6 +12,7 @@ from codexbridge.messages_store import (
     KIND_CAPABILITY,
     MessageRecord,
     MessageStore,
+    device_status,
     is_fresh,
     is_in_flight,
 )
@@ -282,9 +283,10 @@ class BridgeHub:
                     "failed": 3,
                     "interrupted": 4,
                     "working": 1,
-                    "waiting_user": 0,
-                    "queued": 0,
-                    "starting": 0,
+                    "waiting_user": 1,
+                    "waiting": 1,
+                    "queued": 1,
+                    "starting": 1,
                     "done": 2,
                 }.get(str(record.status or ""), 0)
             ),
@@ -345,7 +347,7 @@ class BridgeHub:
         for record in records:
             if record.kind == "task":
                 if (
-                    record.status in {"working", "waiting_user", "queued"}
+                    record.status in {"working", "waiting_user", "queued", "starting"}
                     and is_in_flight(record)
                     and is_fresh(record, now)
                 ):
@@ -1441,7 +1443,7 @@ class BridgeHub:
             "type": "codex_status_snapshot",
             "thread_id": clip_utf8(str(live.thread_id or ""),
                                    max_bytes=SNAPSHOT_ID_BYTES),
-            "status": clip_utf8(str(live.status or ""),
+            "status": clip_utf8(device_status(str(live.status or "")),
                                 max_bytes=SNAPSHOT_STATUS_BYTES),
             "current_action": clip_utf8(
                 str(task.get("current_action") or live.body or ""),
@@ -1487,11 +1489,36 @@ class BridgeHub:
             "message_id": record.message_id,
             "thread_id": record.thread_id,
             "kind": record.kind,
-            "status": record.status,
+            "status": device_status(record.status),
             "title": record.title,
             "body": record.body,
             "created_at": record.created_at,
         }
         if isinstance(record.data, dict):
-            payload["data"] = record.data
+            payload["data"] = BridgeHub._device_facing_data(record.data)
         return payload
+
+    @staticmethod
+    def _device_facing_data(data: dict) -> dict:
+        """Translate internal status names in nested task snapshots."""
+
+        prepared = dict(data)
+        for key in ("task", "result"):
+            task = prepared.get(key)
+            if isinstance(task, dict):
+                prepared[key] = {
+                    **task,
+                    "status": device_status(str(task.get("status") or "")),
+                }
+        tasks = prepared.get("tasks")
+        if isinstance(tasks, list):
+            prepared["tasks"] = [
+                {
+                    **task,
+                    "status": device_status(str(task.get("status") or "")),
+                }
+                if isinstance(task, dict)
+                else task
+                for task in tasks
+            ]
+        return prepared

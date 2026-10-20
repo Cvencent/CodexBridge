@@ -125,6 +125,41 @@ class FakeThreadDispatcher:
 
 
 class CbdpGatewayTests(unittest.TestCase):
+    def test_thread_settings_update_decodes_policy_enums_to_names(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+
+        gateway = CbdpGateway.__new__(CbdpGateway)
+        params = gateway._normalize_params(
+            "thread.settings.update",
+            gateway._decode_params(
+                decode_tlvs(
+                    encode_tlvs(
+                        [
+                            (0x0022, utf8("t1")),
+                            (0x0124, utf8("high")),
+                            (0x0125, u8(3)),
+                            (0x0126, u8(1)),
+                            (0x0127, u8(2)),
+                            (0x0128, utf8("pragmatic")),
+                        ]
+                    )
+                )
+            ),
+        )
+
+        self.assertEqual("t1", params["thread_id"])
+        self.assertEqual("high", params["effort"])
+        self.assertEqual("never", params["approval_policy"])
+        self.assertEqual("auto", params["approvals_reviewer"])
+        self.assertEqual("danger-full-access", params["sandbox_policy"])
+        self.assertEqual("pragmatic", params["personality"])
+
+    def test_task_message_status_numbers_match_the_running_set(self):
+        from codexbridge.cbdp.gateway import _message_status
+
+        for status in ("working", "waiting", "waiting_user", "queued", "starting"):
+            self.assertEqual(1, _message_status(status))
+
     def setUp(self):
         self.dispatcher = FakeDispatcher()
         tmp = tempfile.TemporaryDirectory()

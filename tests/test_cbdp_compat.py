@@ -47,6 +47,12 @@ from codexbridge.cbdp.tlv import (
 
 
 class CbdpCompatTests(unittest.TestCase):
+    def test_live_task_states_map_to_running(self):
+        from codexbridge.cbdp.compat import _legacy_status
+
+        for status in ("working", "waiting", "waiting_user", "queued", "starting"):
+            self.assertEqual(1, _legacy_status(status))
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

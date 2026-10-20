@@ -26,6 +26,7 @@ from codexbridge.devices.manager import DeviceManager
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.devices.session import CbdpDeviceSession
 from codexbridge.hub import BridgeHub
+from codexbridge.messages_store import MessageStore
 from codexbridge.cbdp.events import EventSpine
 from codexbridge.cbdp.gateway import CbdpGateway
 from codexbridge.cbdp.http_transport import CbdpHttpBroker
@@ -427,8 +428,10 @@ def main(argv: list[str] | None = None) -> int:
     references = ReferenceRegistry(data_dir / "cbdp-refs.sqlite3")
     subscriptions = SubscriptionManager(event_spine)
     leases = LeaseManager()
+    messages = MessageStore(data_dir / "messages.json")
     hub = BridgeHub(
         registry,
+        store=messages,
         speech=speech,
         codex_catalog=codex_catalog,
         read_state=read_state,

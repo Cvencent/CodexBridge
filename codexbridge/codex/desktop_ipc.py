@@ -18,6 +18,27 @@ from pathlib import Path
 from typing import Any
 
 
+_SANDBOX_POLICY_NAMES = {
+    "read-only": "read-only",
+    "readOnly": "read-only",
+    "workspace-write": "workspace-write",
+    "workspaceWrite": "workspace-write",
+    "danger-full-access": "danger-full-access",
+    "dangerFullAccess": "danger-full-access",
+}
+
+
+def _sandbox_policy_wire_name(value: Any) -> str:
+    """Desktop IPC expects the dotted string name for sandbox policies."""
+
+    if isinstance(value, dict):
+        value = value.get("type", "")
+    name = str(value or "")
+    if name not in _SANDBOX_POLICY_NAMES:
+        raise DesktopIpcError(f"Unsupported sandbox policy: {name}")
+    return _SANDBOX_POLICY_NAMES[name]
+
+
 def _desktop_text_inputs(request: dict[str, Any]) -> dict[str, Any]:
     inputs = request.get('input')
     if not isinstance(inputs, list):
@@ -386,7 +407,7 @@ class DesktopIpcClient:
                                model: str = '', effort: str = '',
                                approval_policy: str = '',
                                approvals_reviewer: str = '',
-                               sandbox_policy: str = '',
+                               sandbox_policy: str | dict[str, Any] = '',
                                personality: str = '') -> bool:
         """Persist explicit model/effort choices before a desktop-owned turn.
 
@@ -404,7 +425,7 @@ class DesktopIpcClient:
         if approvals_reviewer:
             settings['approvalsReviewer'] = str(approvals_reviewer)
         if sandbox_policy:
-            settings['sandboxPolicy'] = str(sandbox_policy)
+            settings['sandboxPolicy'] = _sandbox_policy_wire_name(sandbox_policy)
         if personality:
             settings['personality'] = str(personality)
         if not settings:

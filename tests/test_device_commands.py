@@ -243,10 +243,21 @@ class DeviceCommandTests(unittest.TestCase):
         self.assertEqual(read['result']['thread_id'], 't1')
         updated = self.commands.execute('device-a', {'control'}, {
             'request_id': 'rs2', 'method': 'thread.settings.update',
-            'params': {'thread_id': 't1', 'approval_policy': 'never'},
+            'params': {
+                'thread_id': 't1',
+                'approval_policy': 'never',
+                # The app-server uses an internally tagged SandboxPolicy enum.
+                # Devices send the same compact object as the wire schema.
+                'sandbox_policy': {'type': 'dangerFullAccess'},
+            },
         })
         self.assertTrue(updated['ok'])
         self.assertTrue(updated['result']['applied'])
+        call = self.service.calls[-1]
+        self.assertEqual(
+            {'type': 'dangerFullAccess'},
+            call[2]['sandbox_policy'],
+        )
 
     def test_thread_rename_uses_shared_dispatch(self):
         result = self.commands.execute('device-a', {'control'}, {

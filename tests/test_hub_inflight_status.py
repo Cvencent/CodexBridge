@@ -104,7 +104,36 @@ class InFlightStatusTest(unittest.TestCase):
     def test_waiting_user_snapshot_is_visible_to_the_device(self):
         self.hub.publish(live_task(status="waiting_user", action="等你回话"))
         snap = [m for m in self.pull() if m.get("type") == "codex_status_snapshot"]
-        self.assertEqual("waiting_user", snap[0]["status"])
+        self.assertEqual("waiting", snap[0]["status"])
+
+    def test_device_message_status_uses_the_generic_waiting_name(self):
+        self.hub.publish(live_task(status="waiting_user", action="等你回话"))
+        messages = [m for m in self.session.sent if m.get("type") == "message"]
+
+        self.assertEqual("waiting", messages[-1]["status"])
+
+    def test_nested_task_list_status_uses_the_generic_waiting_name(self):
+        task = record(
+            "task",
+            "waiting_user",
+            "任务一",
+            message_id="task:t1",
+            data={
+                "task": {"thread_id": "t1", "status": "waiting_user"},
+                "tasks": [
+                    {"thread_id": "t1", "status": "waiting_user"},
+                    {"thread_id": "t2", "status": "working"},
+                ],
+            },
+        )
+        self.hub.publish(task)
+
+        message = [m for m in self.session.sent if m.get("type") == "message"][-1]
+        self.assertEqual("waiting", message["data"]["task"]["status"])
+        self.assertEqual(
+            ["waiting", "working"],
+            [item["status"] for item in message["data"]["tasks"]],
+        )
 
     def test_snapshot_fits_one_wire_line(self):
         long = "很长的动作" * 80

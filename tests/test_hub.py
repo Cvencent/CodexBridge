@@ -1,8 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
-from codexbridge.messages_store import MessageRecord
+from codexbridge.messages_store import MessageRecord, MessageStore
+from codexbridge.read_state import ReadStateStore
 
 
 class FakeSession:
@@ -403,6 +406,52 @@ class HubTest(unittest.TestCase):
                 "failed": 1,
             },
         )
+
+    def test_terminal_unread_counts_survive_a_bridge_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            read_state = ReadStateStore(root / "read-state.json")
+            first = BridgeHub(
+                DeviceRegistry(None),
+                store=MessageStore(path=root / "messages.json"),
+                read_state=read_state,
+            )
+            first.publish(
+                MessageRecord(
+                    "result:t1:10",
+                    "t1",
+                    "result",
+                    "completed",
+                    "完成",
+                    "正文",
+                    10.0,
+                )
+            )
+            first.publish(
+                MessageRecord(
+                    "result:t2:20",
+                    "t2",
+                    "result",
+                    "failed",
+                    "失败",
+                    "正文",
+                    20.0,
+                )
+            )
+
+            restarted = BridgeHub(
+                DeviceRegistry(None),
+                store=MessageStore(path=root / "messages.json"),
+                read_state=ReadStateStore(root / "read-state.json"),
+            )
+
+            self.assertEqual(1, restarted.counts()["completed_unread"])
+            self.assertEqual(1, restarted.counts()["failed_unread"])
+
+            restarted.read_state.mark_message("result:t1:10")
+
+            self.assertEqual(0, restarted.counts()["completed_unread"])
+            self.assertEqual(1, restarted.counts()["failed_unread"])
 
     def test_replay_state_pushes_codex_state_to_status_devices(self):
         self.hub.publish(

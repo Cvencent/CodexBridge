@@ -55,6 +55,8 @@ class SharedServerTests(unittest.TestCase):
             self.assertEqual(init["name"], "Codex Desktop")
             self.assertEqual(init["title"], "CodexBridge")
             self.assertEqual(init["version"], VERSION)
+            params = request.call_args.args[1]
+            self.assertTrue(params["capabilities"]["experimentalApi"])
 
     def test_stale_socket_file_is_not_treated_as_a_live_desktop(self):
         with tempfile.TemporaryDirectory() as folder:

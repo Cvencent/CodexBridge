@@ -278,7 +278,11 @@ class AppServerClient:
                 "name": "Codex Desktop",
                 "title": "CodexBridge",
                 "version": VERSION,
-            }
+            },
+            # thread/settings/update is gated by the app-server's experimental
+            # capability. The phone's approval-mode control cannot work
+            # without this opt-in, even though the method itself is present.
+            "capabilities": {"experimentalApi": True},
         })
         self.notify("initialized", {})
 
