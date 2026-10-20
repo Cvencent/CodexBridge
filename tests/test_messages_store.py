@@ -7,6 +7,10 @@ from codexbridge.messages_store import MessageRecord, MessageStore
 
 
 class MessageStoreTest(unittest.TestCase):
+    def test_path_is_not_accepted_as_the_positional_maximum(self):
+        with self.assertRaises(TypeError):
+            MessageStore(Path("messages.json"))
+
     def test_terminal_results_survive_store_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "messages.json"

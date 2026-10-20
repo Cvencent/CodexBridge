@@ -137,6 +137,8 @@ class MessageStore:
         max_messages: int = 200,
         path: Path | str | None = None,
     ):
+        if isinstance(max_messages, (str, Path)):
+            raise TypeError("max_messages must be an integer; use path= for persistence")
         if max_messages <= 0:
             raise ValueError("max_messages must be positive")
         self.max_messages = max_messages

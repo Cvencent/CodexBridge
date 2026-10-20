@@ -428,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     references = ReferenceRegistry(data_dir / "cbdp-refs.sqlite3")
     subscriptions = SubscriptionManager(event_spine)
     leases = LeaseManager()
-    messages = MessageStore(data_dir / "messages.json")
+    messages = MessageStore(path=data_dir / "messages.json")
     hub = BridgeHub(
         registry,
         store=messages,
