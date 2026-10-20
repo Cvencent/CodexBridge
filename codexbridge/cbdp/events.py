@@ -209,6 +209,37 @@ class EventSpine:
         if not destination.exists() or destination.stat().st_size <= 0:
             raise sqlite3.DatabaseError("event store recovery produced no database")
 
+    @staticmethod
+    def _visible_event_count(path):
+        """Return the row count visible through ``path`` and its live WAL.
+
+        Opening a WAL database normally replays committed frames from the
+        sidecar. The count is kept only as a recovery guard, never as the
+        replacement source.
+        """
+
+        connection = None
+        try:
+            connection = sqlite3.connect(str(path), timeout=5.0)
+            row = connection.execute("SELECT COUNT(*) FROM events").fetchone()
+            return int(row[0] or 0)
+        finally:
+            if connection is not None:
+                connection.close()
+
+    @staticmethod
+    def _checkpoint(path):
+        """Fold committed WAL frames into the main file before rebuilding."""
+
+        connection = None
+        try:
+            connection = sqlite3.connect(str(path), timeout=5.0)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.commit()
+        finally:
+            if connection is not None:
+                connection.close()
+
     def _create_empty_database(self, path):
         path = Path(path)
         try:
@@ -222,6 +253,63 @@ class EventSpine:
             connection.commit()
         finally:
             connection.close()
+
+    def _rescue_copy(self, source, destination):
+        """Copy readable event rows into a fresh database.
+
+        This is the fallback when ``VACUUM INTO`` cannot rebuild a damaged
+        file. Reading the table without using the broken indexes lets SQLite
+        recover rows whose index pages are corrupt; unreadable page ranges are
+        skipped one row at a time rather than crashing startup.
+        """
+
+        destination = Path(destination)
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        source_connection = None
+        destination_connection = None
+        copied = 0
+        try:
+            source_connection = sqlite3.connect(str(source), timeout=5.0)
+            destination_connection = sqlite3.connect(str(destination))
+            destination_connection.execute("PRAGMA journal_mode=WAL")
+            self._create_schema(destination_connection)
+            cursor = source_connection.execute(
+                "SELECT event_id, global_seq, topic_id, topic_seq, revision, "
+                "event_type, qos, payload, created_at_ms FROM events"
+            )
+            while True:
+                try:
+                    row = cursor.fetchone()
+                except sqlite3.DatabaseError:
+                    # A damaged page in the table scan: preserve the rows read
+                    # so far instead of replacing the store with an empty one.
+                    break
+                if row is None:
+                    break
+                try:
+                    destination_connection.execute(
+                        "INSERT OR IGNORE INTO events("
+                        "event_id, global_seq, topic_id, topic_seq, revision, "
+                        "event_type, qos, payload, created_at_ms"
+                        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        row,
+                    )
+                    copied += 1
+                except sqlite3.DatabaseError:
+                    continue
+            destination_connection.commit()
+        finally:
+            if destination_connection is not None:
+                destination_connection.close()
+            if source_connection is not None:
+                source_connection.close()
+        if copied <= 0:
+            raise sqlite3.DatabaseError("event store row rescue copied no events")
+        if self._quick_check(destination) != "ok":
+            raise sqlite3.DatabaseError("rescued event store failed quick_check")
 
     def _recover(self, path):
         """Rebuild a corrupt event store without discarding the broken file.
@@ -243,12 +331,42 @@ class EventSpine:
             shutil.copy2(path, backup)
             self._backup_sidecars(path, backup)
             self.recovery_backup = backup
-            self._vacuum_copy(path, temp)
-            if self._quick_check(temp) != "ok":
-                raise sqlite3.DatabaseError("recovered event store failed quick_check")
+            visible_count = None
+            try:
+                visible_count = self._visible_event_count(path)
+            except sqlite3.DatabaseError:
+                # Some corruption prevents even a count. In that case the
+                # rebuilt database is validated only by quick_check.
+                pass
+            try:
+                # WAL holds the recent committed history. Fold it into the
+                # main file while the forensic sidecar copies still exist;
+                # otherwise VACUUM can rebuild only the older main-file rows.
+                self._checkpoint(path)
+            except sqlite3.DatabaseError:
+                # A damaged WAL must not block the row-level rescue below.
+                pass
+            try:
+                self._vacuum_copy(path, temp)
+                if self._quick_check(temp) != "ok":
+                    raise sqlite3.DatabaseError(
+                        "recovered event store failed quick_check"
+                    )
+                if visible_count is not None:
+                    recovered_count = self._visible_event_count(temp)
+                    if recovered_count < visible_count:
+                        raise sqlite3.DatabaseError(
+                            "recovered event store lost rows: %d < %d"
+                            % (recovered_count, visible_count)
+                        )
+            except (OSError, sqlite3.DatabaseError) as vacuum_error:
+                self.recovery_error = str(vacuum_error) or type(vacuum_error).__name__
+                self._rescue_copy(path, temp)
+                self.recovery_mode = "row_rescue"
             self._remove_sidecars(path)
             os.replace(temp, path)
-            self.recovery_mode = "vacuum"
+            if self.recovery_mode != "row_rescue":
+                self.recovery_mode = "vacuum"
         except (OSError, sqlite3.DatabaseError) as error:
             self.recovery_error = str(error) or type(error).__name__
             if self.recovery_backup is not None:

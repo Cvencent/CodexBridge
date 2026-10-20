@@ -4456,11 +4456,13 @@ Bridge 的故障恢复语义：
 - Bridge 打开事件库前必须执行 `PRAGMA quick_check`。返回 `ok` 时不得改动数据文件，
   也不得创建备份。
 - 校验失败时，先把主库及现有 `-wal` / `-shm` 复制为
-  `cbdp-events.sqlite3.corrupt-<时间戳>`，再对原库执行 `VACUUM INTO`；重建结果必须
-  再次通过 `quick_check` 后才能原子替换原库。替换前必须移除旧侧车文件，避免旧 WAL
-  再次覆盖新库。
-- 若 `VACUUM INTO` 仍失败，Bridge 必须保留损坏备份并新建空事件库继续启动；不得
-  静默删除唯一副本，也不得让整个 Bridge 因索引损坏无法启动。
+  `cbdp-events.sqlite3.corrupt-<时间戳>`，先执行 WAL checkpoint 把已提交的近期事件
+  合并进主库，再对原库执行 `VACUUM INTO`。重建结果必须再次通过 `quick_check`，
+  且事件行数不得少于恢复前通过主库和 WAL 可见的行数，之后才能原子替换原库。
+  替换前必须移除旧侧车文件，避免旧 WAL 再次覆盖新库。
+- 若 `VACUUM INTO` 失败或丢失行，Bridge 必须逐行扫描事件表并把可读行写入新库。
+  只有逐行救援也失败时，才保留损坏备份并新建空事件库继续启动；不得静默删除唯一
+  副本，也不得让整个 Bridge 因索引损坏无法启动。
 - 恢复成功后，`global_seq` / `topic_seq` / `revision` 继续从恢复库的最大值递增，
   设备已有的 cursor 语义不变。原先仍可读取的历史事件不应因重建而丢失。
 - 运行期间若存储页再次报错，`SUBSCRIBE` 返回
