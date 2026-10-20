@@ -499,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
         references=references,
         active_state=hub.active_state,
         set_active_state=hub.set_active_state,
+        event_spine=event_spine,
+        subscriptions=subscriptions,
     )
     companion = CompanionApi(
         companion_service,

@@ -151,6 +151,8 @@ class CbdpHttpBroker:
         references=None,
         active_state=None,
         set_active_state=None,
+        event_spine=None,
+        subscriptions=None,
         ttl: float = SESSION_TTL_SECONDS,
     ):
         self._commands = commands
@@ -159,6 +161,8 @@ class CbdpHttpBroker:
         self._references = references
         self._active_state = active_state
         self._set_active_state = set_active_state
+        self._event_spine = event_spine
+        self._subscriptions = subscriptions
         self._ttl = float(ttl)
         self._sessions: dict[str, CbdpHttpSession] = {}
         self._lock = threading.RLock()
@@ -223,6 +227,8 @@ class CbdpHttpBroker:
             references=self._references,
             active_state=self._active_state,
             set_active_state=self._set_active_state,
+            event_spine=self._event_spine,
+            subscriptions=self._subscriptions,
             pairing_token=lambda _device_id: token,
             capability_policy=lambda _device_id: capabilities,
             transport_allowed=lambda _device_id: (1 << 64) - 1,

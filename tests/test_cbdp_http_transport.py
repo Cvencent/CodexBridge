@@ -227,6 +227,30 @@ class CbdpHttpTransportTests(unittest.TestCase):
         gateway.set_active_state("phone-http-1", "t2", "u2")
         self.assertEqual(recorded["value"][1:], ("t2", "u2"))
 
+    def test_broker_gateway_shares_the_event_spine(self) -> None:
+        # Without the shared spine the Companion gateway creates its own empty
+        # one, so SUBSCRIBE has nothing to replay and summary events such as
+        # system.codex_state never reach a phone.
+        from codexbridge.cbdp.events import EventSpine
+        from codexbridge.cbdp.subscriptions import SubscriptionManager
+
+        spine = EventSpine(None)
+        self.addCleanup(spine.close)
+        subscriptions = SubscriptionManager(spine)
+        broker = CbdpHttpBroker(
+            commands=lambda: self.service.commands,
+            capability_for=lambda phone_id: {"tasks"},
+            event_spine=spine,
+            subscriptions=subscriptions,
+        )
+        gateway = broker._gateway("phone-http-1", "token")
+        self.assertIs(gateway.event_spine, spine)
+        self.assertIs(gateway.subscriptions, subscriptions)
+        event = spine.append(0x50000003, 0x0704, 1, {})
+        result = gateway.subscriptions.subscribe("phone-http-1", 0x50000003, 0, 1, 0)
+        self.assertTrue(result.recoverable)
+        self.assertIn(event.global_seq, [item.global_seq for item in result.replay])
+
     def test_ws_route_exists_and_requires_upgrade(self) -> None:
         paired = self.pair()
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
