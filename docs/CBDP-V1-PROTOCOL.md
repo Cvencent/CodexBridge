@@ -4487,6 +4487,24 @@ Bridge 的故障恢复语义：
 - 验收要求：`PRAGMA quick_check` 为 `ok`；AUTH_OK 后 summary `SUBSCRIBE` 收到
   `RESULT`；随后收到包含 `running_count` 的 `system.codex_state(0x0704)`。
 
+### 19.11 手机回复桌面活跃线程的 owner 路由（2026-10-21 后续修正）
+
+手机 Companion 写入必须和桌面 Codex 共用同一 writer，不能因为 Bridge 注入共享
+app-server 就跳过 DesktopIPC owner discovery：
+
+- `CompanionService` 的 `client_factory` 只决定 Bridge 自己的 app-server 来源，
+  不再表示“与桌面隔离”。隔离必须由显式 `isolated=True` 表达，仅测试和嵌入式
+  调用使用。
+- 生产 `start_turn` 必须先调用 `_desktop_owner(thread_id)`。发现桌面 owner 时，
+  通过 `thread-follower-start-turn` 交给桌面 Codex；桌面端实时显示手机输入和
+  Codex 回复，手机流式输出来自同一个 turn。
+- 没有桌面 owner 时，手机新建或独立的线程仍使用 Bridge app-server，行为不变。
+- 已知的桌面线程若 owner discovery 暂时失败，必须返回错误并保持写入未发送，
+  不得清掉 writer lock 后退回第二套 app-server。两个 app-server 同时写同一线程
+  会产生竞争、turn 卡死和中途停止。
+- 验收要求：桌面打开活跃会话时，手机回复立即出现在桌面；手机流式回复完整结束；
+  `thread.read` 的消息列表与桌面一致，无需重启或重新打开桌面会话。
+
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

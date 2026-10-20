@@ -53,6 +53,7 @@ class SharedClientLifecycleTests(unittest.TestCase):
                 cwd=Path(temp),
                 client_factory=lambda command, cwd: client,
                 close_client_on_stop=False,
+                isolated=True,
             )
             service.start()
             service.stop()
@@ -149,12 +150,53 @@ class CompanionServiceTests(unittest.TestCase):
 
     def test_owner_discovery_uses_oldest_due_thread(self):
         from unittest.mock import patch
-        self.service._client_factory = None
+        self.service._isolated = False
         self.service._desktop_discovery_due = {'t1': 10, 't2': 1}
         with patch.object(self.service, 'list_threads', return_value={'threads': [
                 {'thread_id': 't1'}, {'thread_id': 't2'}]}), patch.object(self.service, '_desktop_owner') as discover:
             self.service.poll_thread_changes()
         discover.assert_called_once_with('t2')
+
+    def test_isolated_service_skips_desktop_owner_discovery(self):
+        self.service._isolated = True
+        with mock.patch(
+            'codexbridge.codex.desktop_ipc.DesktopIpcClient'
+        ) as desktop_client:
+            self.assertIsNone(self.service._desktop_owner('t1'))
+        desktop_client.assert_not_called()
+
+    def test_production_service_discovers_desktop_owner(self):
+        from codexbridge.codex.desktop_ipc import DesktopIpcClient
+
+        class _DesktopStub(DesktopIpcClient):
+            generation = 1
+
+            def __init__(self):
+                self.started = 0
+                self.owners = []
+                self.events = queue.Queue()
+
+            def start(self):
+                self.started += 1
+
+            def find_thread_owner(self, thread_id):
+                self.owners.append(thread_id)
+                return 'owner-1'
+
+            def follow_thread(self, owner, thread_id):
+                return None
+
+            def close(self):
+                return None
+
+        self.service._isolated = False
+        with mock.patch(
+            'codexbridge.codex.desktop_ipc.DesktopIpcClient',
+            _DesktopStub,
+        ):
+            self.assertEqual(self.service._desktop_owner('t1'), 'owner-1')
+        self.assertEqual(self.service._desktop.started, 1)
+        self.assertEqual(self.service._desktop.owners, ['t1'])
 
     def test_desktop_event_failure_does_not_kill_event_pump(self):
         from unittest.mock import Mock
@@ -575,6 +617,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
 
     def test_thread_read_retries_on_stale_list_turns(self) -> None:
@@ -596,6 +639,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: next(clients),
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             detail = service.read_thread("t1")
@@ -800,6 +844,7 @@ class CompanionServiceTests(unittest.TestCase):
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
             read_state=read_state,
+            isolated=True,
         )
         try:
             service.list_threads(limit=10)  # populate the log cache
@@ -860,6 +905,7 @@ class CompanionServiceTests(unittest.TestCase):
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
             show_intermediate_events=True,
+            isolated=True,
         )
         try:
             detail = service.read_thread("t1")
@@ -1238,6 +1284,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             detail = restarted.read_thread("t1")
@@ -1305,6 +1352,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             result = service.start_turn("t1", "\u7ee7\u7eed")
@@ -1351,6 +1399,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             detail = service.read_thread("t1")
@@ -1380,6 +1429,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             detail = service.read_thread("t1")
@@ -1753,6 +1803,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             forks = {"n": 0}
@@ -1899,6 +1950,7 @@ class CompanionServiceTests(unittest.TestCase):
             client_factory=factory,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
         try:
             service.start_turn("t1", "第一次")
@@ -1925,6 +1977,7 @@ class CompanionServiceTests(unittest.TestCase):
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
             read_state=read_state,
+            isolated=True,
         )
         try:
             self.assertEqual(service.read_thread("t1")["thread"]["status"], "completed")
@@ -2017,6 +2070,7 @@ class CompanionServiceTests(unittest.TestCase):
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
             show_intermediate_events=True,
+            isolated=True,
         )
         try:
             started = service._event_payload({

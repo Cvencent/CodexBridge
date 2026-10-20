@@ -195,6 +195,7 @@ class CbdpHubEventTests(unittest.TestCase):
             self.root,
             self.root,
             client_factory=lambda command, cwd: _NullClient(),
+            isolated=True,
         )
         self.addCleanup(service.stop)
         service._cbdp_event_spine = self.events

@@ -24,6 +24,7 @@ def make_service(client: FakeClient, temp: str) -> CompanionService:
         client_factory=lambda command, cwd: client,
         desktop_state_path=Path(temp) / "missing.json",
         sessions_root=Path(temp) / "sessions",
+        isolated=True,
     )
 
 

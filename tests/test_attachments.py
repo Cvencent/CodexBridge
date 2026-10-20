@@ -77,6 +77,7 @@ class InputPartTranslationTests(unittest.TestCase):
             data_dir=Path(self.temp.name),
             cwd=Path(self.temp.name),
             client_factory=lambda command, cwd: None,
+            isolated=True,
         )
 
     def tearDown(self) -> None:

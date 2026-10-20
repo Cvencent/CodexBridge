@@ -484,11 +484,13 @@ class CompanionService:
         read_state: ReadStateStore | None = None,
         show_intermediate_events: bool | Callable[[], bool] = False,
         close_client_on_stop: bool = True,
+        isolated: bool = False,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
         self.codex_command = codex_command
         self._client_factory = client_factory
+        self._isolated = bool(isolated)
         self._close_client_on_stop = bool(close_client_on_stop)
         self._creation_client_factory = self._make_client if client_factory is None else None
         self._desktop = None
@@ -681,7 +683,7 @@ class CompanionService:
             row["thread_id"]: row
             for row in self.list_threads(limit=80, refresh=True)["threads"]
         }
-        if self._client_factory is None:
+        if not self._isolated:
             for thread_id in sorted(current, key=lambda key: self._desktop_discovery_due.get(key, 0)):
                 if self._stop.is_set():
                     break
@@ -2923,8 +2925,10 @@ class CompanionService:
         from codexbridge.codex.desktop_ipc import DesktopIpcClient, DesktopIpcError
         if self._stop.is_set():
             raise DesktopIpcError('Companion stopped')
-        # Custom app-server factories are isolated from the user's live desktop.
-        if self._desktop is None and self._client_factory is not None:
+        # Tests and embedders can explicitly isolate this service from the
+        # user's live desktop. Production keeps discovery enabled even though
+        # it injects a shared app-server client factory.
+        if self._desktop is None and self._isolated:
             return None
         for attempt in range(2):
             try:

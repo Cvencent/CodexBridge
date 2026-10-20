@@ -31,6 +31,7 @@ class ReadCacheWiringTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             sessions_root=Path(self.temp.name) / "sessions",
+            isolated=True,
         )
 
     def tearDown(self) -> None:

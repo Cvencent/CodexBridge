@@ -189,6 +189,7 @@ class CompanionApiTests(unittest.TestCase):
             client_factory=lambda command, cwd: self.client,
             desktop_state_path=Path(self.temp.name) / "missing.json",
             show_intermediate_events=lambda: self.store.show_intermediate_events,
+            isolated=True,
         )
         self.api = CompanionApi(self.service, self.store, host="127.0.0.1", port=0)
         self.api.start()

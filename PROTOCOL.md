@@ -118,6 +118,11 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   的 `DELTA`。订阅后的新事件由 gateway 统一投递，Hub 的 attach 重放也只对匹配
   订阅调用 `send_event()`；会话层再次校验订阅，避免其他调用点把未订阅事件直接
   推给设备。未订阅事件不得占用设备网络与 lwIP 接收缓冲。
+- **2026-10-21 后续修正：** 手机写入桌面活跃线程前必须执行 DesktopIPC owner
+  discovery。`CompanionService` 只有显式 `isolated=True` 时才跳过桌面发现；生产
+  环境即使注入共享 app-server，也要先查桌面 owner，并通过
+  `thread-follower-start-turn` 把手机回复交给桌面 Codex。这样桌面端能实时看到
+  手机输入和回复，线程也不会被第二个 app-server writer 竞争截断。
 
 ## 1. 范围与角色
 
