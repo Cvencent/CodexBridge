@@ -222,7 +222,7 @@ Content-Type: application/json
 
 | HTTP | `error` | 含义 |
 | --- | --- | --- |
-| 400 | `INVALID_PARAM` | 缺字段、分片为空、参数类型错误 |
+| 400 | `INVALID_PARAM` / `invalid_body` / `invalid_request` | 缺字段、分片为空、参数类型错误或 JSON 无法解析 |
 | 403 | `capability_not_enabled` | 手机未声明 `attachment` 能力 |
 | 404 | `NOT_FOUND` | 上传事务或附件不存在 |
 | 409 | `UPLOAD_OFFSET_MISMATCH` | 分片 offset 与当前进度不一致 |
