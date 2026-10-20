@@ -122,6 +122,31 @@ def thread_detail(thread_id: str = "t1"):
 
 
 class CompanionServiceTests(unittest.TestCase):
+    def test_threads_list_filters_by_project_cwd(self) -> None:
+        listing = {
+            "threads": [
+                {"thread_id": "a", "title": "A", "cwd": r"D:\proj\one"},
+                {"thread_id": "b", "title": "B", "cwd": r"D:\proj\one\sub"},
+                {"thread_id": "c", "title": "C", "cwd": r"D:\proj\two"},
+            ],
+            "next_cursor": None,
+        }
+        with mock.patch.object(self.service, "_list_page", return_value=listing), \
+                mock.patch.object(
+                    self.service,
+                    "list_projects",
+                    return_value={"projects": [
+                        {"project_id": "p1", "name": "One", "cwd": r"D:\proj\one",
+                         "roots": [r"D:\proj\one"]},
+                    ]},
+                ):
+            result = self.service.list_threads(project_id="p1")
+
+        self.assertEqual(
+            [row["thread_id"] for row in result["threads"]],
+            ["a", "b"],
+        )
+
     def test_owner_discovery_uses_oldest_due_thread(self):
         from unittest.mock import patch
         self.service._client_factory = None

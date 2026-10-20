@@ -86,6 +86,15 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   `GET /api/companion/threads/<id>/attachments`、
   `GET /api/companion/attachments/<id>` 与附件删除接口；手机接入细节见
   [手机端附件接入说明](docs/CodexBridge-mobile-attachment-api.md)。
+- **2026-10-20 后续修正：** `threads.list` 现在接受 `project_ref(0x0122)`：Bridge
+  经持久引用表解析成 `project_id`，再按该项目的 `roots` 与线程 `cwd` 前缀匹配过滤；
+  引用无法解析返回 `NOT_FOUND`，不再落成 `INTERNAL`。`threads.list` 的可选参数因此为
+  `limit`、`search`、`cursor`、`project_id`。
+- **2026-10-20 后续修正：** 设备在订阅
+  `system.thread_summaries(0x50000003)` 的 `summary` scope 时，若回放窗口内没有
+  `system.codex_state(0x0704)`，Bridge 会在回放结束前补发最新一条聚合计数事件。
+  这样即使设备在 attach 之后才发出 `SUBSCRIBE`，首页“运行中/完成/失败”也不会
+  永久停在 0。
 
 ## 1. 范围与角色
 

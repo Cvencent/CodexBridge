@@ -146,6 +146,7 @@ from codexbridge.cbdp.constants import (
 from codexbridge.cbdp.events import EventSpine, event_scope
 from codexbridge.cbdp.frame import Frame, encode_frame
 from codexbridge.cbdp.leases import LeaseConflictError, LeaseManager
+from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
 from codexbridge.cbdp.subscriptions import SubscriptionLimitError, SubscriptionManager
 from codexbridge.protocol.commands import CommandError
 from codexbridge.cbdp.tlv import (
@@ -205,6 +206,9 @@ METHOD_IDS = {
     0x0066: "attachment.upload.cancel",
     0x00C1: "content.read",
 }
+
+# system.codex_state: aggregate running/unread counters on the summary topic.
+EVENT_CODEX_STATE = 0x0704
 METHOD_CAPABILITIES = {
     0x0001: "status",
     0x0002: "tasks",
@@ -397,6 +401,7 @@ PARAM_TAGS = {
     "max_bytes": 0x001A,
     "alt_text": 0x0166,
     "input_parts": 0x015B,
+    "project_ref": 0x0122,
 }
 
 
@@ -992,6 +997,27 @@ class CbdpGateway:
                 )
             for event in result.replay:
                 self._emit(self._delta_frame(event))
+            # Aggregated Home counters are state, not history. A device that
+            # subscribes after attach can otherwise miss the single live
+            # codex_state event because the bounded replay window is filled by
+            # unrelated summary events. Always finish the replay with the
+            # newest aggregate snapshot.
+            if (
+                int(topic_id) == SYSTEM_THREAD_SUMMARIES_TOPIC
+                and int(scope) == 0
+                and not any(
+                    int(event.event_type) == EVENT_CODEX_STATE
+                    for event in result.replay
+                )
+            ):
+                latest = self.event_spine.latest_event(
+                    lambda item: (
+                        int(item.topic_id) == int(topic_id)
+                        and int(item.event_type) == EVENT_CODEX_STATE
+                    )
+                )
+                if latest is not None:
+                    self._emit(self._delta_frame(latest))
             self._result(request_id, 0, {
                 TAG_TOPIC_ID: u32(topic_id),
                 TAG_SCOPE: u8(scope),
@@ -1038,7 +1064,10 @@ class CbdpGateway:
                     result[name] = decode_u64(raw) if len(raw) == 8 else decode_u32(raw)
                 elif name == "history_depth":
                     result[name] = decode_u16(raw)
-                elif name in {"thread_ref", "active_thread_ref", "active_turn_ref", "approval_ref"}:
+                elif name in {
+                    "thread_ref", "active_thread_ref", "active_turn_ref",
+                    "approval_ref", "project_ref",
+                }:
                     result[name] = decode_u32(raw)
                 elif name == "read_at_ms":
                     result[name] = decode_i64(raw)
@@ -1172,6 +1201,13 @@ class CbdpGateway:
 
     def _normalize_params(self, method, params):
         params = dict(params)
+        if "project_ref" in params:
+            project_id = self._external_from_ref("project", int(params.pop("project_ref")))
+            if not project_id:
+                raise CBDPError("NOT_FOUND")
+            if "project_id" in params and params["project_id"] != project_id:
+                raise ValueError("project selectors disagree")
+            params["project_id"] = project_id
         if method in {"turn.start", "queue.add"} and "input_parts" in params:
             params["input_parts"] = self._decode_input_parts(params["input_parts"])
         if method.startswith("attachment."):
@@ -1390,6 +1426,21 @@ class CbdpGateway:
         else:
             params["cursor"] = restored
         return params
+
+    def _external_from_ref(self, kind: str, ref: int) -> str:
+        """Resolve a persisting reference of any supported kind back to its id."""
+
+        if not ref:
+            return ""
+        if self.references is not None:
+            try:
+                external = str(self.references.external_id(kind, int(ref)) or "")
+            except Exception:  # noqa: BLE001 - bad refs must map to NOT_FOUND
+                external = ""
+            if external:
+                return external
+        with self._lock:
+            return str(self._ref_external.get((str(kind), int(ref)), ""))
 
     def _thread_from_ref(self, ref: int) -> str:
         """Resolve a CBDP thread_ref through the persistent reference registry."""

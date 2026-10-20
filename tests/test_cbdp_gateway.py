@@ -71,6 +71,7 @@ from codexbridge.cbdp.frame import Frame
 from codexbridge.cbdp.gateway import CbdpGateway
 from codexbridge.cbdp.refs import ReferenceRegistry
 from codexbridge.cbdp.tlv import (
+    CBDPError,
     decode_array,
     decode_u16,
     decode_utf8,
@@ -125,6 +126,73 @@ class FakeThreadDispatcher:
 
 
 class CbdpGatewayTests(unittest.TestCase):
+    def test_summary_subscribe_replays_current_codex_state(self):
+        from codexbridge.cbdp.events import EventSpine
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+        from codexbridge.cbdp.subscriptions import SubscriptionManager
+        from codexbridge.cbdp.constants import TAG_RUNNING_COUNT
+        from codexbridge.cbdp.constants import TAG_EVENT, TAG_EVENT_TYPE
+
+        spine = EventSpine(None)
+        for index in range(30):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, 1, {})
+        spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0704, 1,
+                     {TAG_RUNNING_COUNT: u16(3)})
+        for index in range(30):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, 1, {})
+        subscriptions = SubscriptionManager(spine)
+        subscriptions.set_queue_depth("dev-1", 4)
+        gateway = CbdpGateway(commands=lambda: None, event_spine=spine,
+                              subscriptions=subscriptions)
+        gateway.session = type("S", (), {
+            "device_id": "dev-1", "generation": 1, "ready": True,
+            "session_id": b"x" * 16, "authenticated": True, "profile": 0,
+        })()
+        emitted = []
+        gateway._emit = lambda frame: emitted.append(frame)
+
+        gateway._handle_subscribe(Frame(
+            message_type=TYPE_SUBSCRIBE,
+            flags=FLAG_REQUEST,
+            header={
+                TAG_REQUEST_ID: u32(7),
+                0x0030: u32(SYSTEM_THREAD_SUMMARIES_TOPIC),
+                0x0031: u8(0),
+                0x0032: u8(1),
+                0x0033: u64(0),
+            },
+        ))
+
+        event_types = [
+            decode_u16(frame.header[TAG_EVENT_TYPE])
+            for frame in emitted
+            if TAG_EVENT_TYPE in frame.header
+        ]
+        self.assertIn(0x0704, event_types)
+
+    def test_threads_list_project_ref_resolves_to_project_id(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        class Dispatcher:
+            def __init__(self):
+                self.requests = []
+
+            def execute(self, device_id, capabilities, request):
+                self.requests.append(request)
+                return {"ok": True, "result": {"threads": [], "next_cursor": 0}}
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(commands=lambda: Dispatcher(), references=refs)
+        ref = gateway._ref("project", "proj-1")
+
+        params = gateway._normalize_params("threads.list", {"project_ref": ref})
+
+        self.assertEqual(params, {"project_id": "proj-1"})
+        with self.assertRaises(CBDPError) as caught:
+            gateway._normalize_params("threads.list", {"project_ref": 999999})
+        self.assertEqual(caught.exception.name, "NOT_FOUND")
+
     def test_thread_settings_update_decodes_policy_enums_to_names(self):
         from codexbridge.cbdp.gateway import CbdpGateway
 

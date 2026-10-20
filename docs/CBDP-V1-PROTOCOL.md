@@ -4427,6 +4427,22 @@ API 的行为。
   文本部件按顺序插入。`body` 与 `input_parts` 同时出现仍返回 `INVALID_PARAM`。
 - 手机 Companion HTTP 的完整接入流程见
   [CodexBridge-mobile-attachment-api.md](CodexBridge-mobile-attachment-api.md)。
+
+### 19.9 `threads.list` 项目过滤与聚合计数补发（2026-10-20）
+
+联调发现设备在选中项目后无法列出任务，且首页计数长期为 0。Bridge 侧修正：
+
+- `threads.list(0x0002)` 接受可选 `project_ref(0x0122)`。Gateway 通过持久引用表把
+  引用解析为 `project_id`；解析失败返回 `NOT_FOUND`，不得落成 `INTERNAL`。
+  解析成功后按该项目的 `roots` 对线程 `cwd` 做前缀匹配；`project_id` 与
+  `project_name` 两种持久键都可解析。`threads.list` 的可选参数为
+  `limit`、`search`、`cursor`、`project_id`。
+- 设备订阅 `system.thread_summaries(0x50000003)` 的 `summary` scope 时，若本次
+  回放窗口内没有 `system.codex_state(0x0704)`，Bridge 必须在回放结束前补发最新
+  一条 `system.codex_state`。原因是 attach 时的直推可能早于设备的 `SUBSCRIBE`，
+  而 `cursor = 0` 只回放有界的最新窗口。补发使用同一 `topic_id`、`summary` scope
+  与 `state` QoS，字段仍为 `running_count(0x00BC)`、
+  `completed_unread_count(0x00BD)`、`failed_unread_count(0x00BE)`。
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

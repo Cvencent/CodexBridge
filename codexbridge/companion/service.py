@@ -1983,11 +1983,19 @@ class CompanionService:
         search: str = "",
         cursor: str | None = None,
         refresh: bool = False,
+        project_id: str = "",
     ) -> dict[str, Any]:
         # A plain listing is answered from one shared page. Fetching per caller
         # meant the phone re-read the whole task list on every poll even though
         # the watcher had refreshed the identical rows seconds earlier, because
         # the read cache keys on the request params.
+        if project_id:
+            return self._project_threads(
+                project_id,
+                limit=limit,
+                search=search,
+                refresh=refresh,
+            )
         if not search and not cursor:
             page = self._list_page(refresh=refresh)
             want = max(1, min(int(limit or 40), 80))
@@ -1998,6 +2006,67 @@ class CompanionService:
             }
         return self._list_page(limit=limit, search=search, cursor=cursor,
                                refresh=refresh)
+
+    def _project_threads(
+        self,
+        project_id: str,
+        *,
+        limit: int = 40,
+        search: str = "",
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Return threads whose working directory belongs to one project."""
+
+        wanted = str(project_id or "")
+        if not wanted:
+            return {"threads": [], "next_cursor": None}
+        projects = self.list_projects().get("projects") or []
+        project = next(
+            (
+                row for row in projects
+                if isinstance(row, dict)
+                and str(row.get("project_id") or "") == wanted
+            ),
+            None,
+        )
+        if project is None:
+            # A reference may point at the project name when the desktop stored
+            # the project without an explicit id.
+            project = next(
+                (
+                    row for row in projects
+                    if isinstance(row, dict) and str(row.get("name") or "") == wanted
+                ),
+                None,
+            )
+        roots = [
+            str(path).rstrip("\\/").lower()
+            for path in (project or {}).get("roots") or []
+            if str(path or "").strip()
+        ]
+        want = max(1, min(int(limit or 40), 80))
+        rows = self._list_page(refresh=refresh).get("threads") or []
+        search_text = str(search or "").strip().lower()
+        matched: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            cwd = str(row.get("cwd") or "").rstrip("\\/").lower()
+            if not cwd or not any(
+                cwd == root or cwd.startswith(root + "\\") or cwd.startswith(root + "/")
+                for root in roots
+            ):
+                continue
+            if search_text and search_text not in " ".join(
+                str(row.get(key) or "").lower()
+                for key in ("thread_id", "title", "preview", "workspace")
+            ):
+                continue
+            matched.append(row)
+        return {
+            "threads": matched[:want],
+            "next_cursor": None,
+        }
 
     def _list_page(
         self,

@@ -13,7 +13,7 @@ class CommandError(ValueError):
 # method: (required capability, required fields, optional fields)
 COMMANDS = {
     'status.read': ('status', (), ()),
-    'threads.list': ('tasks', (), ('limit', 'search', 'cursor')),
+    'threads.list': ('tasks', (), ('limit', 'search', 'cursor', 'project_id')),
     'thread.read': ('tasks', ('thread_id',), ('message_limit',)),
     'thread.start': ('control', (), ('cwd', 'model')),
     'thread.rename': ('control', ('thread_id', 'title'), ()),
