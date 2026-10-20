@@ -30,7 +30,7 @@ from codexbridge.cbdp.constants import (
     TAG_COMPLETED_UNREAD,
     TAG_FAILED_UNREAD,
 )
-from codexbridge.cbdp.events import EventSpine
+from codexbridge.cbdp.events import EventSpine, event_scope
 from codexbridge.cbdp.projection import ProjectionStore
 from codexbridge.cbdp.refs import ReferenceRegistry, SYSTEM_DEVICES_TOPIC
 from codexbridge.cbdp.tlv import (
@@ -83,6 +83,30 @@ class _CbdpSession(_Session):
 
     def send_event(self, event):
         self.sent_events.append(event)
+
+
+class _GatewaySubscriptionStub:
+    def __init__(self, subscribed, session=None):
+        self.subscribed = bool(subscribed)
+        self.session = session
+        self.queries = []
+        self.delivered = []
+
+    def has_subscription(self, topic_id, scope):
+        self.queries.append((int(topic_id), int(scope)))
+        return self.subscribed
+
+    def deliver_event(self, event):
+        self.delivered.append(event)
+        if self.has_subscription(
+            int(event.topic_id), event_scope(int(event.event_type))
+        ) and self.session is not None:
+            self.session.send_event(event)
+
+
+class _NullClient:
+    def close(self):
+        return None
 
 
 class CbdpHubEventTests(unittest.TestCase):
@@ -190,12 +214,6 @@ class CbdpHubEventTests(unittest.TestCase):
         fields = events[0].payload
         self.assertEqual(fields[0x0087], b"\x04")  # mcp_tool
         self.assertEqual(fields[0x0028], b"ap-9")
-
-
-class _NullClient:
-    def close(self):
-        return None
-
     def test_message_events_share_the_thread_topic_and_scope(self):
         from codexbridge.cbdp.events import event_scope
 
@@ -249,11 +267,15 @@ class _NullClient:
 
         self.assertEqual(1, decode_u16(payload[TAG_STATUS]))
 
-    def test_cbdp_session_receives_committed_event_not_compat_delta(self):
+    def test_cbdp_subscription_receives_event_once_not_from_hub_broadcast(self):
         self.registry.records["dev-1"] = _Record()
         session = _CbdpSession()
+        gateway = _GatewaySubscriptionStub(True, session)
+        session.gateway = gateway
         self.hub.attach("dev-1", session)
         self.addCleanup(self.hub.detach, "dev-1")
+        session.sent_events.clear()
+        gateway.delivered.clear()
 
         self.hub.publish(
             MessageRecord(
@@ -267,22 +289,86 @@ class _NullClient:
             )
         )
 
-        # The CBDP session must get the committed Event Spine record (which
-        # carries event_id/global_seq/topic_seq/revision and the real topic),
-        # never a synthesised compatibility message.
-        self.assertEqual(len(session.sent_events), 1)
-        event = session.sent_events[0]
+        # _append_event() delegates the single subscription copy to the
+        # gateway. The Hub broadcast must not send the same event a second time.
+        message_events = [
+            item for item in session.sent_events if item.event_type in {0x0301, 0x0302}
+        ]
+        self.assertEqual(len(message_events), 1)
+        event = message_events[0]
         self.assertEqual(event.topic_id, self.refs.topic_for("t1"))
         self.assertGreater(event.global_seq, 0)
         self.assertGreater(event.topic_seq, 0)
         self.assertGreater(event.revision, 0)
         self.assertEqual(len(event.event_id), 16)
+        self.assertEqual(gateway.queries.count((event.topic_id, event_scope(event.event_type))), 1)
         # No compatibility "message"/"read_state" envelope may be synthesised
         # for a CBDP session; aggregate state messages are still allowed.
         self.assertFalse(
             any(
                 item.get("type") in {"message", "read_state"}
                 for item in session.sent_messages
+            )
+        )
+
+    def test_unsubscribed_cbdp_event_is_not_sent(self):
+        event = self.events.append(
+            self.refs.topic_for("t1"),
+            0x0301,
+            QOS_CRITICAL,
+            {},
+        )
+        session = _CbdpSession()
+        gateway = _GatewaySubscriptionStub(False)
+        session.gateway = gateway
+
+        self.hub._deliver_cbdp_event(session, event)
+
+        self.assertEqual(session.sent_events, [])
+        self.assertEqual(gateway.queries, [(event.topic_id, event_scope(event.event_type))])
+
+    def test_broadcast_does_not_emit_second_hub_delta_for_cbdp(self):
+        self.registry.records["dev-1"] = _Record()
+        session = _CbdpSession()
+        gateway = _GatewaySubscriptionStub(True, session)
+        session.gateway = gateway
+        self.hub.attach("dev-1", session)
+        self.addCleanup(self.hub.detach, "dev-1")
+        session.sent_events.clear()
+        gateway.delivered.clear()
+
+        self.hub.publish(
+            MessageRecord(
+                message_id="m-broadcast",
+                thread_id="t-broadcast",
+                kind="result",
+                status="completed",
+                title="Answer",
+                body="hello",
+                created_at=2.0,
+            )
+        )
+
+        self.assertEqual(
+            len([item for item in session.sent_events if item.event_type in {0x0301, 0x0302}]),
+            1,
+        )
+
+    def test_attach_time_codex_state_does_not_bypass_summary_subscription(self):
+        from codexbridge.cbdp.events import SCOPE_SUMMARY
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+
+        session = _CbdpSession()
+        session.gateway = _GatewaySubscriptionStub(False)
+
+        self.hub._send_codex_state_event(session)
+
+        self.assertEqual(session.sent_events, [])
+        self.assertTrue(
+            any(
+                item.event_type == 0x0704
+                and item.topic_id == SYSTEM_THREAD_SUMMARIES_TOPIC
+                for item in self._events(0x0704)
             )
         )
 

@@ -1,8 +1,9 @@
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from codexbridge.cbdp.constants import TYPE_PING
+from codexbridge.cbdp.constants import TYPE_DELTA, TYPE_PING
 from codexbridge.cbdp.frame import Frame, encode_frame
 from codexbridge.devices.session import CbdpDeviceSession
 
@@ -49,6 +50,7 @@ class _GatewayStub:
         self.started = 0
         self.session = None
         self.subscriptions = _SubscriptionsStub()
+        self.allowed_subscriptions = set()
 
     def bind_transport(self, transport):
         self.transport = transport
@@ -59,6 +61,12 @@ class _GatewayStub:
 
     def handle_frame(self, frame):
         self.frames.append(frame)
+
+    def has_subscription(self, topic_id, scope):
+        return (int(topic_id), int(scope)) in self.allowed_subscriptions
+
+    def delta_frame(self, event):
+        return Frame(message_type=TYPE_DELTA, topic_id=int(event.topic_id))
 
 
 class CbdpSessionFramingTests(unittest.TestCase):
@@ -120,6 +128,43 @@ class CbdpSessionFramingTests(unittest.TestCase):
 
         self.assertEqual(sock.sent, [encode_frame(frame)])
         self.assertFalse(sock.sent[0].startswith(b"{"))
+
+    def test_send_event_drops_unsubscribed_topic(self):
+        gateway = _GatewayStub()
+        session = CbdpDeviceSession(
+            "127.0.0.1",
+            8765,
+            "abcdefghijklmnop",
+            device_id="dev-1",
+            gateway=gateway,
+        )
+        sock = _SocketStub([])
+        session._socket = sock
+        event = SimpleNamespace(topic_id=0x10000008, event_type=0x0301)
+
+        sent = session.send_event(event)
+
+        self.assertFalse(sent)
+        self.assertEqual(sock.sent, [])
+
+    def test_send_event_emits_matching_subscription(self):
+        gateway = _GatewayStub()
+        gateway.allowed_subscriptions.add((0x10000008, 1))
+        session = CbdpDeviceSession(
+            "127.0.0.1",
+            8765,
+            "abcdefghijklmnop",
+            device_id="dev-1",
+            gateway=gateway,
+        )
+        sock = _SocketStub([])
+        session._socket = sock
+        event = SimpleNamespace(topic_id=0x10000008, event_type=0x0301)
+
+        sent = session.send_event(event)
+
+        self.assertTrue(sent)
+        self.assertEqual(len(sock.sent), 1)
 
 
 if __name__ == "__main__":

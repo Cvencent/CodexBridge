@@ -502,7 +502,7 @@ class BridgeHub:
             event = None
         if event is None:
             try:
-                event = self.event_spine.append(
+                self._append_event(
                     SYSTEM_THREAD_SUMMARIES_TOPIC,
                     EVENT_CODEX_STATE,
                     QOS_STATE,
@@ -510,10 +510,8 @@ class BridgeHub:
                 )
             except Exception:
                 return
-        try:
-            send_event(event)
-        except (OSError, RuntimeError):
             return
+        self._deliver_cbdp_event(session, event)
 
     def _publish_codex_state(self) -> None:
         """Append one aggregate-count event for CBDP summary subscribers.
@@ -1192,8 +1190,10 @@ class BridgeHub:
             ]
         for session in targets:
             if getattr(session, "is_cbdp", False):
-                if event is not None:
-                    self._deliver_cbdp_event(session, event)
+                # The event was already delivered by _append_event() through
+                # CbdpGateway.deliver_event(). Sending here would duplicate a
+                # subscription frame and, historically, also leaked events to
+                # devices that had never subscribed to the topic.
                 continue
             self._send_to(session, payload)
 
@@ -1345,10 +1345,9 @@ class BridgeHub:
             ]
         for device_id, session in targets:
             if getattr(session, "is_cbdp", False):
-                # A CBDP device must never receive a synthesised DELTA. If the
-                # event spine is unavailable the frame is dropped instead.
-                if event is not None:
-                    self._deliver_cbdp_event(session, event)
+                # _append_event() already handed this committed event to every
+                # registered gateway, which filters by the device's own topic
+                # and scope. Never synthesise a second Hub-originated DELTA.
                 continue
             self._send_to(
                 session,
@@ -1386,13 +1385,18 @@ class BridgeHub:
 
     @staticmethod
     def _deliver_cbdp_event(session, event) -> None:
-        """Send one committed event unless the subscription path already did."""
+        """Replay one committed event only through an active subscription.
+
+        New events are delivered centrally by ``_append_event`` through
+        ``CbdpGateway.deliver_event``. This helper is reserved for replaying an
+        older event (for example attach-time state) and must never turn an
+        unsubscribed event into an unsolicited DELTA.
+        """
 
         gateway = getattr(session, "gateway", None)
-        if gateway is not None and gateway.has_subscription(
+        if gateway is None or not gateway.has_subscription(
             int(event.topic_id), event_scope(int(event.event_type))
         ):
-            # deliver_event() already emitted the subscription copy.
             return
         try:
             session.send_event(event)

@@ -17,6 +17,7 @@ from codexbridge.cbdp.constants import (
 )
 from codexbridge.cbdp.tlv import CBDPError
 from codexbridge.cbdp.compat import CompatContext, to_cbdp
+from codexbridge.cbdp.events import event_scope
 from codexbridge.cbdp.frame import (
     Frame,
     FrameReassembler,
@@ -149,18 +150,28 @@ class CbdpDeviceSession:
         self._heartbeat_seconds = heartbeat_seconds
         self._reassembler = FrameReassembler(self._max_frame_bytes)
 
-    def send_event(self, event) -> None:
+    def send_event(self, event) -> bool:
         """Send one committed Event Spine event as a protocol-valid DELTA.
 
         Using the gateway's own encoder guarantees the frame carries
         ``event_id``/``global_seq``/``topic_seq``/``revision``, the real
         ``topic_id`` and a non-zero transport ``seq``. The compatibility
         translator must not synthesise DELTA frames for CBDP sessions.
+
+        A committed event may leave the Bridge only while the device owns an
+        active subscription for its topic/scope. Returning ``False`` makes the
+        non-delivery explicit for attach-time replay callers.
         """
 
         if self.gateway is None:
             raise RuntimeError("CBDP gateway not configured")
+        has_subscription = getattr(self.gateway, "has_subscription", None)
+        if not callable(has_subscription) or not has_subscription(
+            int(event.topic_id), event_scope(int(event.event_type))
+        ):
+            return False
         self._send_frame(self.gateway.delta_frame(event))
+        return True
 
     def send(self, message: dict) -> None:
         """Send a legacy-shaped message through the CBDP compatibility path.

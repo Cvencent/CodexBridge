@@ -1796,6 +1796,11 @@ coalesced_count
 重复订阅相同键时，Bridge 必须幂等处理并返回当前 cursor。超出
 `max_subscriptions` 时返回 `BUSY`。
 
+订阅是事件投递的硬边界：除 `SUBSCRIBE` 的显式回放结果外，Bridge 不得向设备
+发送任何未订阅 `(topic_id, scope)` 的 `DELTA`。`send_event()` 或等价会话发送
+入口也必须再次校验订阅，不能只依赖调用方过滤。设备可以据此丢弃未订阅帧，
+但 Bridge 不应先占用网络和接收缓冲再让设备丢弃。
+
 省略 `cursor` 等价于 `cursor = 0`，即从该 topic 的历史起点回放全部事件。
 只想接收新事件的客户端必须先拿到当前 cursor 再订阅，不能依赖“省略即只推新
 事件”。回放可能包含上百条 `DELTA`，Bridge 必须在设备工作线程里发送回放，

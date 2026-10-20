@@ -114,6 +114,10 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   替换成功后，`SUBSCRIBE` 的主题回放查询必须使用新索引恢复正常。若运行期间仍
   出现存储错误，`ERROR(INTERNAL)` 必须带
   `reason=event_store_unavailable`，设备可据此重试而不会再收到无信息的 INTERNAL。
+- **2026-10-20 后续修正：** CBDP 会话只能收到自己已订阅 `(topic_id, scope)`
+  的 `DELTA`。订阅后的新事件由 gateway 统一投递，Hub 的 attach 重放也只对匹配
+  订阅调用 `send_event()`；会话层再次校验订阅，避免其他调用点把未订阅事件直接
+  推给设备。未订阅事件不得占用设备网络与 lwIP 接收缓冲。
 
 ## 1. 范围与角色
 
