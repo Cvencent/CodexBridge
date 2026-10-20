@@ -2282,6 +2282,14 @@ running_count, completed_unread_count, failed_unread_count
   应按 §16.1 忽略并在 `ACK` 中推进 cursor。
 - 该事件替代 legacy `codex_state` 字典在 CBDP 会话上的作用；legacy 字典仍保留给
   旧 JSON 设备。
+- **2026-10-20 后续修正（跨端已读）：** 桌面 Codex 打开任务也会推进共享已读水位。
+  Bridge 读取本机 `~/.codex/.codex-global-state.json` 的
+  `thread-user-activity-times-v1` 与 `electron-thread-read-state-v1.unreadByIdentity`；
+  线程有桌面活动且不在桌面未读集合中、且桌面状态已晚于该线程最新终态结果时，
+  视为桌面已读，实体化为
+  `message.read` / 线程已读水位，并在 summary 主题发布新的 `system.codex_state`。
+  手机和两个 ESP 因此会同时收到已读撤回，`completed_unread_count` /
+  `failed_unread_count` 减一并落回空闲，不会各自停在旧计数。
 - **2026-10-20 后续语义修正：** `running_count` 统计当前所有未终结 turn 对应的
   `working`、`waiting`、`queued`、`starting` 任务，任一集合变化即发布新事件；
   没有执行中的 turn 时为 `0`。`completed_unread_count` / `failed_unread_count`
@@ -4437,11 +4445,13 @@ API 的行为。
   解析成功后按该项目的 `roots` 对线程 `cwd` 做前缀匹配；`project_id` 与
   `project_name` 两种持久键都可解析。`threads.list` 的可选参数为
   `limit`、`search`、`cursor`、`project_id`。
-- 设备订阅 `system.thread_summaries(0x50000003)` 的 `summary` scope 时，若本次
-  回放窗口内没有 `system.codex_state(0x0704)`，Bridge 必须在回放结束前补发最新
-  一条 `system.codex_state`。原因是 attach 时的直推可能早于设备的 `SUBSCRIBE`，
-  而 `cursor = 0` 只回放有界的最新窗口。补发使用同一 `topic_id`、`summary` scope
-  与 `state` QoS，字段仍为 `running_count(0x00BC)`、
+- 设备订阅 `system.thread_summaries(0x50000003)` 的 `summary` scope 时，Bridge
+  必须在回放结束前补齐当前 `system.codex_state(0x0704)`，即使窗口里已有旧计数也
+  要用当前值覆盖。若最新计数事件已在回放窗口内，直接补发；若在窗口外但 global_seq
+  已大于设备 cursor，直接补发该已提交事件；若窗口外旧事件的 global_seq 不大于
+  cursor（例如 cursor = 0 的最新窗口已越过它），Bridge 追加一条内容相同的新事件
+  再补发，保证 DELTA 的 `global_seq` 严格大于设备刚报告的 cursor。补发使用同一
+  `topic_id`、`summary` scope 与 `state` QoS，字段仍为 `running_count(0x00BC)`、
   `completed_unread_count(0x00BD)`、`failed_unread_count(0x00BE)`。
 
 ### 19.10 事件库自检与恢复（2026-10-20 后续修正）

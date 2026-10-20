@@ -172,6 +172,148 @@ class CbdpGatewayTests(unittest.TestCase):
         ]
         self.assertIn(0x0704, event_types)
 
+    def test_summary_subscribe_with_stale_cursor_replays_latest_codex_state(self):
+        from codexbridge.cbdp.events import EventSpine
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+        from codexbridge.cbdp.subscriptions import SubscriptionManager
+        from codexbridge.cbdp.constants import (
+            TAG_EVENT_PAYLOAD,
+            TAG_EVENT_TYPE,
+            TAG_RUNNING_COUNT,
+        )
+
+        spine = EventSpine(None)
+        # The device's cursor predates an old state event by two unrelated
+        # events, so the bounded replay window includes that stale state but
+        # not the current one.
+        spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+        cursor = spine.append(
+            SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {}
+        )
+        spine.append(
+            SYSTEM_THREAD_SUMMARIES_TOPIC,
+            0x0704,
+            QOS_STATE,
+            {TAG_RUNNING_COUNT: u16(3)},
+        )
+        for _ in range(12):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+        spine.append(
+            SYSTEM_THREAD_SUMMARIES_TOPIC,
+            0x0704,
+            QOS_STATE,
+            {TAG_RUNNING_COUNT: u16(7)},
+        )
+        for _ in range(12):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+
+        subscriptions = SubscriptionManager(spine)
+        subscriptions.set_queue_depth("dev-1", 4)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            event_spine=spine,
+            subscriptions=subscriptions,
+        )
+        gateway.session = type("S", (), {
+            "device_id": "dev-1",
+            "generation": 1,
+            "ready": True,
+            "session_id": b"x" * 16,
+            "authenticated": True,
+            "profile": 0,
+        })()
+        emitted = []
+        gateway._emit = lambda frame: emitted.append(frame)
+
+        gateway._handle_subscribe(Frame(
+            message_type=TYPE_SUBSCRIBE,
+            flags=FLAG_REQUEST,
+            header={
+                TAG_REQUEST_ID: u32(8),
+                0x0030: u32(SYSTEM_THREAD_SUMMARIES_TOPIC),
+                0x0031: u8(0),
+                0x0032: u8(QOS_STATE),
+                0x0033: u64(cursor.global_seq),
+            },
+        ))
+
+        running_counts = []
+        for frame in emitted:
+            payload = frame.header.get(TAG_EVENT_PAYLOAD)
+            if payload is None or frame.header.get(TAG_EVENT_TYPE) != u16(0x0704):
+                continue
+            running_counts.append(
+                decode_u16(decode_tlvs(payload)[TAG_RUNNING_COUNT])
+            )
+        self.assertIn(3, running_counts)
+        self.assertEqual(7, running_counts[-1])
+
+    def test_summary_replay_never_emits_a_cursor_below_the_snapshot(self):
+        from codexbridge.cbdp.events import EventSpine
+        from codexbridge.cbdp.refs import SYSTEM_THREAD_SUMMARIES_TOPIC
+        from codexbridge.cbdp.subscriptions import SubscriptionManager
+        from codexbridge.cbdp.constants import TAG_RUNNING_COUNT
+
+        spine = EventSpine(None)
+        spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+        cursor = spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+        spine.append(
+            SYSTEM_THREAD_SUMMARIES_TOPIC,
+            0x0704,
+            QOS_STATE,
+            {TAG_RUNNING_COUNT: u16(3)},
+        )
+        for _ in range(12):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+        spine.append(
+            SYSTEM_THREAD_SUMMARIES_TOPIC,
+            0x0704,
+            QOS_STATE,
+            {TAG_RUNNING_COUNT: u16(7)},
+        )
+        for _ in range(12):
+            spine.append(SYSTEM_THREAD_SUMMARIES_TOPIC, 0x0101, QOS_STATE, {})
+
+        subscriptions = SubscriptionManager(spine)
+        subscriptions.set_queue_depth("dev-1", 4)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            event_spine=spine,
+            subscriptions=subscriptions,
+        )
+        gateway.session = type("S", (), {
+            "device_id": "dev-1",
+            "generation": 1,
+            "ready": True,
+            "session_id": b"x" * 16,
+            "authenticated": True,
+            "profile": 0,
+        })()
+        emitted = []
+        gateway._emit = lambda frame: emitted.append(frame)
+
+        gateway._handle_subscribe(Frame(
+            message_type=TYPE_SUBSCRIBE,
+            flags=FLAG_REQUEST,
+            header={
+                TAG_REQUEST_ID: u32(9),
+                0x0030: u32(SYSTEM_THREAD_SUMMARIES_TOPIC),
+                0x0031: u8(0),
+                0x0032: u8(QOS_STATE),
+                0x0033: u64(cursor.global_seq),
+            },
+        ))
+
+        deltas = [frame for frame in emitted if frame.message_type == 0x0A]
+        self.assertTrue(all(frame.header[0x0034] >= u64(cursor.global_seq) for frame in deltas))
+        running = []
+        for frame in deltas:
+            if frame.header.get(0x0037) != u16(0x0704):
+                continue
+            payload = decode_tlvs(frame.header[0x0038])
+            running.append(decode_u16(payload[TAG_RUNNING_COUNT]))
+        self.assertEqual(7, running[-1])
+
     def test_threads_list_project_ref_resolves_to_project_id(self):
         from codexbridge.cbdp.gateway import CbdpGateway
         from codexbridge.cbdp.refs import ReferenceRegistry

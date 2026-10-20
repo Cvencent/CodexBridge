@@ -90,11 +90,21 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   经持久引用表解析成 `project_id`，再按该项目的 `roots` 与线程 `cwd` 前缀匹配过滤；
   引用无法解析返回 `NOT_FOUND`，不再落成 `INTERNAL`。`threads.list` 的可选参数因此为
   `limit`、`search`、`cursor`、`project_id`。
+- **2026-10-20 后续修正：** Codex 桌面端读取任务也计入全局已读。Bridge 读取
+  `~/.codex/.codex-global-state.json` 中 `thread-user-activity-times-v1` 与
+  `electron-thread-read-state-v1.unreadByIdentity`：线程有桌面操作记录、且不在桌面
+  未读集合中时，Bridge 按同一 `read-state.json` 水位把该线程推进为已读，并向手机
+  和在线 ESP 广播 `read_state` 与空闲线程状态；`completed_unread` /
+  `failed_unread` 同步减少。桌面未读集合是权威依据：线程不在其中即视为桌面已读；
+  但桌面状态文件必须晚于该线程最新终态结果，避免在桌面尚未归类新结果时提前清掉。
 - **2026-10-20 后续修正：** 设备在订阅
-  `system.thread_summaries(0x50000003)` 的 `summary` scope 时，若回放窗口内没有
-  `system.codex_state(0x0704)`，Bridge 会在回放结束前补发最新一条聚合计数事件。
-  这样即使设备在 attach 之后才发出 `SUBSCRIBE`，首页“运行中/完成/失败”也不会
-  永久停在 0。
+  `system.thread_summaries(0x50000003)` 的 `summary` scope 时，Bridge 总会在
+  回放结束前补齐当前聚合计数；即使回放窗口里已有旧的 `system.codex_state(0x0704)`，
+  也会以当前计数覆盖。若最新计数事件在本次回放窗口内，直接补发；若在窗口外但
+  global_seq 已大于设备 cursor，直接补发该事件；若窗口外的旧事件 global_seq 不大于
+  cursor（例如 cursor = 0 的最新窗口已越过它），Bridge 追加一条内容相同的新事件再
+  补发，保证 DELTA 的 `global_seq` 严格大于设备刚报告的 cursor。这样两台 cursor
+  不同的 ESP 不会各自停在历史计数上，首页“运行中/完成/失败”也不会永久停在 0。
 - **2026-10-20 后续修正：** Bridge 启动时会用 `PRAGMA quick_check` 校验
   `cbdp-events.sqlite3`。校验失败时，先把主库及 WAL/SHM 备份为
   `cbdp-events.sqlite3.corrupt-<时间戳>`，先把已提交 WAL 合并进主库，再用

@@ -23,6 +23,7 @@ from codexbridge.devices.discovery import (
     discover,
 )
 from codexbridge.devices.manager import DeviceManager
+from codexbridge.desktop_read import sync_desktop_read_state
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.devices.session import CbdpDeviceSession
 from codexbridge.hub import BridgeHub
@@ -656,6 +657,10 @@ def main(argv: list[str] | None = None) -> int:
 
     def poll_speech() -> None:
         while not stop.wait(0.25):
+            # The Codex desktop is one of the clients in the unified device
+            # protocol. When a completed task is opened there, import that read
+            # so the phone and both ESPs retire the same badge and count.
+            sync_desktop_read_state(read_state, store=messages)
             hub.poll_speech()
             hub.poll_events()
 

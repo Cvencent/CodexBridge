@@ -1011,15 +1011,14 @@ class CbdpGateway:
             # Aggregated Home counters are state, not history. A device that
             # subscribes after attach can otherwise miss the single live
             # codex_state event because the bounded replay window is filled by
-            # unrelated summary events. Always finish the replay with the
-            # newest aggregate snapshot.
+            # unrelated summary events. Older windows may also contain a stale
+            # codex_state while the current one has fallen outside the window.
+            # Always finish the replay with the newest aggregate snapshot so
+            # two devices with different cursors cannot display different
+            # counts for the same host state.
             if (
                 int(topic_id) == SYSTEM_THREAD_SUMMARIES_TOPIC
                 and int(scope) == 0
-                and not any(
-                    int(event.event_type) == EVENT_CODEX_STATE
-                    for event in result.replay
-                )
             ):
                 latest = self.event_spine.latest_event(
                     lambda item: (
@@ -1028,7 +1027,26 @@ class CbdpGateway:
                     )
                 )
                 if latest is not None:
-                    self._emit(self._delta_frame(latest))
+                    replayed = {
+                        int(event.global_seq) for event in result.replay
+                    }
+                    if int(latest.global_seq) not in replayed:
+                        if int(latest.global_seq) <= int(result.cursor):
+                            # A fresh subscriber is given the newest window,
+                            # whose cursor can already be past an older state
+                            # event. Append the current payload so the DELTA
+                            # stays strictly newer than the reported cursor.
+                            try:
+                                latest = self.event_spine.append(
+                                    int(latest.topic_id),
+                                    int(latest.event_type),
+                                    int(latest.qos),
+                                    latest.payload,
+                                )
+                            except Exception:
+                                latest = None
+                        if latest is not None:
+                            self._emit(self._delta_frame(latest))
             self._result(request_id, 0, {
                 TAG_TOPIC_ID: u32(topic_id),
                 TAG_SCOPE: u8(scope),
