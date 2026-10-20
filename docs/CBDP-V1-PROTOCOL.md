@@ -4423,7 +4423,7 @@ API 的行为。
   `ATTACHMENT_KIND_MISMATCH`。
 - `content.read(0x00C1)` 返回分页内容，`content_encoding` 为 `base64`。
 - `turn.start(0x0005)` 与 `queue.add(0x0030)` 的 `input_parts(0x015B)` 已解析：
-  元素 tag 为 `0x00A0`，图片部件转成 Codex `input_image` + inline data URL，
+  元素 tag 为 `0x00A0`，图片部件转成 Codex `{"type":"image","url":<inline data URL>}`，
   文本部件按顺序插入。`body` 与 `input_parts` 同时出现仍返回 `INVALID_PARAM`。
 - 手机 Companion HTTP 的完整接入流程见
   [CodexBridge-mobile-attachment-api.md](CodexBridge-mobile-attachment-api.md)。

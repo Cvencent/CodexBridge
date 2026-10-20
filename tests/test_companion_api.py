@@ -151,8 +151,8 @@ class CompanionApiTests(unittest.TestCase):
         turn = [call for call in self.client.requests if call[0] == "turn/start"][-1]
         inputs = turn[1]["input"]
         self.assertEqual(inputs[0], {"type": "text", "text": "看一下"})
-        self.assertEqual(inputs[1]["type"], "input_image")
-        self.assertTrue(inputs[1]["image_url"].startswith("data:image/png;base64,"))
+        self.assertEqual(inputs[1]["type"], "image")
+        self.assertTrue(inputs[1]["url"].startswith("data:image/png;base64,"))
 
         status, listing = self.request(
             "GET", "/api/companion/threads/t1/attachments", token=token

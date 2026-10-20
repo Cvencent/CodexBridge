@@ -183,7 +183,7 @@ Content-Type: application/json
 只发图片不带文字也可以，此时省略 `text`。未上传完成的 `attachment_id` 返回
 `400 attachment_not_found`。
 
-发送后 Bridge 会把图片转成 Codex 内联输入（`input_image` + data URL），
+发送后 Bridge 会把图片转成 Codex 内联输入（`{"type":"image","url":"data:<mime>;base64,..."}`），
 手机端不需要自己构造 base64 输入结构。
 
 ## 7. 查看与读取附件

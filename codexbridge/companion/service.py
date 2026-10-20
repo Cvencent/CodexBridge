@@ -634,9 +634,11 @@ class CompanionService:
                 raise ValueError("unsupported_attachment_kind")
             result.append(
                 {
-                    "type": "input_image",
-                    "image_url": self.attachments.data_url(record.attachment_id),
-                    "detail": str(part.get("detail") or "original"),
+                    # Codex app-server serializes UserInput::Image as
+                    # {"type":"image","url":...}. "input_image" is an OpenAI
+                    # message-content type and is rejected by turn/start.
+                    "type": "image",
+                    "url": self.attachments.data_url(record.attachment_id),
                 }
             )
         merged = "\n".join(text_parts).strip() or (text or "").strip()

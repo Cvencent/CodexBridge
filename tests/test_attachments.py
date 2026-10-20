@@ -104,9 +104,8 @@ class InputPartTranslationTests(unittest.TestCase):
         )
 
         self.assertEqual(inputs[0], {"type": "text", "text": "看图"})
-        self.assertEqual(inputs[1]["type"], "input_image")
-        self.assertTrue(inputs[1]["image_url"].startswith("data:image/png;base64,"))
-        self.assertEqual(inputs[1]["detail"], "original")
+        self.assertEqual(inputs[1]["type"], "image")
+        self.assertTrue(inputs[1]["url"].startswith("data:image/png;base64,"))
 
     def test_missing_attachment_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
