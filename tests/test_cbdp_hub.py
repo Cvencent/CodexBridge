@@ -58,6 +58,9 @@ class _Registry:
     def get(self, device_id):
         return self.records.get(device_id)
 
+    def all(self):
+        return list(self.records.values())
+
 
 class _Record:
     profile = 2
@@ -132,6 +135,7 @@ class CbdpHubEventTests(unittest.TestCase):
             event_spine=self.events,
             projection=self.projection,
             references=self.refs,
+            presence_grace_seconds=0.0,
         )
 
     def _events(self, event_type):
@@ -536,6 +540,80 @@ class CbdpHubEventTests(unittest.TestCase):
             self.assertEqual(decode_u8(payload[TAG_PROFILE]), 2)
             self.assertEqual(len(payload[TAG_LAST_SEEN_MS]), 8)
             self.assertNotIn(TAG_STATUS, payload)
+
+    def test_duplicate_and_failed_detach_do_not_repeat_offline(self):
+        self.registry.records["dev-1"] = _Record()
+        session = _Session()
+
+        # A dial that never attached must not publish device.offline.
+        self.assertFalse(self.hub.detach("dev-1", session))
+        self.assertEqual(self._events(0x0602), [])
+
+        self.hub.attach("dev-1", session)
+        self.assertTrue(self.hub.detach("dev-1", session))
+        self.assertFalse(self.hub.detach("dev-1", session))
+        self.assertEqual(len(self._events(0x0602)), 1)
+
+    def test_stale_session_cannot_detach_the_replacement(self):
+        self.registry.records["dev-1"] = _Record()
+        old = _Session()
+        new = _Session()
+        self.hub.attach("dev-1", old)
+
+        # A stale thread finishing late must not remove the live replacement.
+        self.assertFalse(self.hub.detach("dev-1", new))
+        self.assertIs(self.hub._sessions["dev-1"], old)
+        self.hub.attach("dev-1", new)
+        self.assertFalse(self.hub.detach("dev-1", old))
+        self.assertIs(self.hub._sessions["dev-1"], new)
+        self.assertEqual(self._events(0x0602), [])
+
+    def test_short_reconnect_does_not_publish_an_offline_event(self):
+        import time
+
+        self.registry.records["dev-1"] = _Record()
+        hub = BridgeHub(
+            self.registry,
+            event_spine=self.events,
+            projection=self.projection,
+            references=self.refs,
+            presence_grace_seconds=0.05,
+        )
+        first = _Session()
+        second = _Session()
+
+        hub.attach("dev-1", first)
+        hub.detach("dev-1", first)
+        time.sleep(0.01)
+        hub.attach("dev-1", second)
+        time.sleep(0.12)
+
+        self.assertEqual(len(self._events(0x0601)), 1)
+        self.assertEqual(self._events(0x0602), [])
+        self.assertIs(hub._sessions["dev-1"], second)
+
+    def test_fresh_companion_phone_counts_as_online(self):
+        import time
+
+        phone = type("Phone", (), {
+            "device_id": "phone-1",
+            "kind": "phone",
+            "transport": "companion_http",
+            "last_seen": time.time() - 5,
+        })()
+        stale = type("Phone", (), {
+            "device_id": "phone-2",
+            "kind": "phone",
+            "transport": "companion_http",
+            "last_seen": time.time() - 600,
+        })()
+        self.registry.records["phone-1"] = phone
+        self.registry.records["phone-2"] = stale
+
+        online = self.hub.online_device_ids()
+
+        self.assertIn("phone-1", online)
+        self.assertNotIn("phone-2", online)
 
     def test_policy_change_uses_devices_topic_and_applied_policy(self):
         self.registry.records["dev-1"] = _Record()

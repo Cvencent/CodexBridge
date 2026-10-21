@@ -40,6 +40,13 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - **2026-10-21 后续修正：** 当当前聚合计数没有对应的历史
   `system.codex_state(0x0704)` 时，Bridge 会追加一条最新事件并立即投递给发起
   订阅/拉取的会话；旧实现只追加、不投递，设备重连后仍会停留在 0。
+- **2026-10-21 后续修正：** `device.online(0x0601)` / `device.offline(0x0602)`
+  改为边沿触发并带 8 秒在线迟滞。失败拨号、重复 detach 和旧会话晚到清理不再
+  重复发布离线事件；宽限窗口内重连不会产生一次假离线。旧会话也不能移除已经
+  接替它的新会话。
+- **2026-10-21 后续修正：** 手机 Companion 的 SSE/WebSocket 心跳会刷新
+  `last_seen`。管理接口按 120 秒窗口把最近活跃的 `companion_http` 手机视为在线，
+  不再只依赖设备 TCP 会话表。
 - 首页聚合计数在 CBDP 上改用独立事件 `system.codex_state(0x0704)`，在
   `system.thread_summaries(0x50000003)` 的 `summary` scope、`state` QoS 下发，
   携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、

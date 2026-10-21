@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -65,6 +66,7 @@ class AdminApiTest(unittest.TestCase):
             token_hash="a" * 64,
             supported=["status", "queue"],
             enabled=["status", "queue"],
+            last_seen=time.time(),
         )
         status, payload = handle_request(
             "GET",
@@ -84,6 +86,8 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(by_id["d1"]["kind"], "hardware")
         self.assertEqual(by_id["phone-1"]["kind"], "phone")
         self.assertTrue(by_id["phone-1"]["has_token"])
+        self.assertTrue(by_id["phone-1"]["online"])
+        self.assertFalse(by_id["d1"]["online"])
 
     def test_capabilities_update_filters_unknown(self):
         body = json.dumps({"device_id": "d1", "enabled": ["status", "nope"]}).encode()

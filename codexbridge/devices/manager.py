@@ -402,9 +402,12 @@ class DeviceManager:
             self._last_seen_saved_at[device_id] = monotonic_now
 
     def _offline(self, device_id: str, session: Any) -> None:
-        self.hub.detach(device_id)
         with self._lock:
-            if self._sessions.get(device_id) is session:
-                self._sessions.pop(device_id, None)
-                self._threads.pop(device_id, None)
+            if self._sessions.get(device_id) is not session:
+                # The session already finished or a newer dial replaced it.
+                # Either way it must not detach the current live connection.
+                return
+            self._sessions.pop(device_id, None)
+            self._threads.pop(device_id, None)
             self._last_seen_saved_at.pop(device_id, None)
+        self.hub.detach(device_id, session)

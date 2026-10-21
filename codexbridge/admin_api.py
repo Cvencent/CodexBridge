@@ -97,10 +97,14 @@ def handle_request(
             status = codex_status() if codex_status is not None else {}
             return 200, {"ok": True, "codex": status}
         if method == "GET" and path == "/api/admin/devices":
-            sessions = getattr(hub, "_sessions", {})
+            online_ids = (
+                hub.online_device_ids()
+                if callable(getattr(hub, "online_device_ids", None))
+                else getattr(hub, "_sessions", {})
+            )
             return 200, {
                 "ok": True,
-                "devices": registry.public_all(online_ids=sessions),
+                "devices": registry.public_all(online_ids=online_ids),
             }
         if method == "GET" and path == "/api/admin/pairing":
             values = query.get("device_id", [])

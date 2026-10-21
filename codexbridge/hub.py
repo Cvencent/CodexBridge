@@ -178,6 +178,11 @@ CATALOG_BACKED_EVENTS = frozenset(
 )
 
 
+# HTTP/SSE phones refresh their registry timestamp on every stream heartbeat,
+# so a couple of missed beats should not flip them offline.
+PHONE_PRESENCE_TTL_SECONDS = 120.0
+
+
 class BridgeHub:
     def __init__(
         self,
@@ -191,6 +196,7 @@ class BridgeHub:
         projection=None,
         subscriptions=None,
         references=None,
+        presence_grace_seconds: float = 8.0,
     ):
         self.registry = registry
         self.store = store or MessageStore()
@@ -210,6 +216,14 @@ class BridgeHub:
         self.subscriptions = subscriptions
         self.references = references
         self._sessions: dict[str, Any] = {}
+        # A socket drop is not always a human-visible disconnect: Wi-Fi power
+        # save and a fast reconnect routinely produce a sub-second gap. Keep
+        # the presence event back for a short grace window and cancel it when
+        # the same device reattaches.
+        self._presence_grace_seconds = max(0.0, float(presence_grace_seconds))
+        self._presence_online: set[str] = set()
+        self._presence_timers: dict[str, threading.Timer] = {}
+        self._presence_generation: dict[str, int] = {}
         self._event_subscriptions: dict[str, Any] = {}
         self._incoming_commands: dict[str, dict] = {}
         self._lock = threading.RLock()
@@ -731,7 +745,21 @@ class BridgeHub:
             self.register_cbdp_gateway(device_id, gateway)
         profile = self._device_profile(device_id, session)
         with self._lock:
+            timer = self._presence_timers.pop(device_id, None)
+            if timer is not None:
+                timer.cancel()
+            # Bump the generation so a timer that already fired but has not
+            # taken the lock yet cannot publish an offline event after this
+            # attach succeeded.
+            self._presence_generation[device_id] = (
+                self._presence_generation.get(device_id, 0) + 1
+            )
             self._sessions[device_id] = session
+            first_online = device_id not in self._presence_online
+            if first_online:
+                self._presence_online.add(device_id)
+        if not first_online:
+            return
         self._append_event(
             SYSTEM_DEVICES_TOPIC,
             0x0601,
@@ -744,10 +772,24 @@ class BridgeHub:
             },
         )
 
-    def detach(self, device_id: str) -> None:
-        self.unregister_cbdp_gateway(device_id)
+    def detach(self, device_id: str, session: Any = None) -> bool:
+        """Detach one session and publish offline after a presence grace window.
+
+        ``session`` protects a live replacement from a stale thread's cleanup:
+        only the session that currently owns the device may remove it. Calling
+        detach twice, or for a dial that never came online, is a no-op and must
+        not append another ``device.offline`` event.
+        """
+
         with self._lock:
-            session = self._sessions.pop(device_id, None)
+            current = self._sessions.get(device_id)
+            if current is None:
+                return False
+            if session is not None and current is not session:
+                # An old connection finished after a newer one took over.
+                return False
+            self.unregister_cbdp_gateway(device_id)
+            self._sessions.pop(device_id, None)
             self._incoming_commands.pop(device_id, None)
             # A device that went away has no one left to answer, so its queued
             # work must not keep wait_idle() (or the depth counter) occupied.
@@ -755,7 +797,44 @@ class BridgeHub:
             # detached session are already no-ops.
             self._depth.pop(device_id, None)
             self._unsubscribe_events(device_id)
-        profile = self._device_profile(device_id, session)
+            profile = self._device_profile(device_id, current)
+            generation = self._presence_generation.get(device_id, 0) + 1
+            self._presence_generation[device_id] = generation
+            should_publish = device_id in self._presence_online
+            timer = None
+            publish_now = should_publish and self._presence_grace_seconds <= 0
+            if should_publish and not publish_now:
+                timer = threading.Timer(
+                    self._presence_grace_seconds,
+                    self._publish_offline_after_grace,
+                    args=(device_id, profile, generation),
+                )
+                timer.daemon = True
+                old = self._presence_timers.pop(device_id, None)
+                if old is not None:
+                    old.cancel()
+                self._presence_timers[device_id] = timer
+        if timer is not None:
+            timer.start()
+        elif publish_now:
+            self._publish_offline_after_grace(device_id, profile, generation)
+        return True
+
+    def _publish_offline_after_grace(
+        self,
+        device_id: str,
+        profile: int,
+        generation: int,
+    ) -> None:
+        with self._lock:
+            if self._presence_generation.get(device_id) != generation:
+                return
+            if device_id in self._sessions:
+                return
+            if device_id not in self._presence_online:
+                return
+            self._presence_online.discard(device_id)
+            self._presence_timers.pop(device_id, None)
         self._append_event(
             SYSTEM_DEVICES_TOPIC,
             0x0602,
@@ -767,6 +846,32 @@ class BridgeHub:
                 TAG_LAST_SEEN_MS: i64(self._device_last_seen_ms(device_id)),
             },
         )
+
+    def online_device_ids(self) -> set[str]:
+        """Return devices that should render as online right now.
+
+        Long-lived TCP sessions are authoritative. Phones talk over stateless
+        HTTP/SSE, so their freshness timestamp is the only available liveness
+        signal; an open SSE stream refreshes it on every heartbeat.
+        """
+
+        now = time.time()
+        with self._lock:
+            online = set(self._sessions)
+        for record in self.registry.all():
+            if record.device_id in online:
+                continue
+            kind = str(getattr(record, "kind", "") or "")
+            transport = str(getattr(record, "transport", "") or "")
+            if kind != "phone" and transport != "companion_http":
+                continue
+            seen = getattr(record, "last_seen", None)
+            try:
+                if seen is not None and now - float(seen) <= PHONE_PRESENCE_TTL_SECONDS:
+                    online.add(record.device_id)
+            except (TypeError, ValueError):
+                continue
+        return online
 
     def _unsubscribe_events(self, device_id: str) -> None:
         target = self._event_subscriptions.pop(device_id, None)

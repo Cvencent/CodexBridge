@@ -728,6 +728,11 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     raw = session.queue.get(timeout=SSE_WAIT_SLICE_SECONDS)
                 except queue.Empty:
                     if time.monotonic() - last_heartbeat >= SSE_HEARTBEAT_SECONDS:
+                        # An SSE stream can stay open for an hour. Its periodic
+                        # ping is the only regular proof that the phone is
+                        # still here, so refresh presence with the same beat.
+                        if current is not None:
+                            self.app.store.touch(current.phone_id)
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
                         last_heartbeat = time.monotonic()
@@ -775,6 +780,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     [self.connection], [], [], SSE_HEARTBEAT_SECONDS
                 )
                 if not readable:
+                    session.touch()
+                    self.app.store.touch(session.device_id)
                     self.wfile.write(encode_ws_frame(b"", opcode=0x9))
                     self.wfile.flush()
                     continue
@@ -849,6 +856,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     payload = target.get(timeout=SSE_WAIT_SLICE_SECONDS)
                 except queue.Empty:
                     if time.monotonic() - last_heartbeat >= SSE_HEARTBEAT_SECONDS:
+                        session.touch()
+                        self.app.store.touch(session.device_id)
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
                         last_heartbeat = time.monotonic()
