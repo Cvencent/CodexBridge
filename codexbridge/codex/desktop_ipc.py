@@ -19,24 +19,26 @@ from typing import Any
 
 
 _SANDBOX_POLICY_NAMES = {
-    "read-only": "read-only",
-    "readOnly": "read-only",
-    "workspace-write": "workspace-write",
-    "workspaceWrite": "workspace-write",
-    "danger-full-access": "danger-full-access",
-    "dangerFullAccess": "danger-full-access",
+    "read-only": "readOnly",
+    "readOnly": "readOnly",
+    "workspace-write": "workspaceWrite",
+    "workspaceWrite": "workspaceWrite",
+    "danger-full-access": "dangerFullAccess",
+    "dangerFullAccess": "dangerFullAccess",
 }
 
 
-def _sandbox_policy_wire_name(value: Any) -> str:
-    """Desktop IPC expects the dotted string name for sandbox policies."""
+def _sandbox_policy_wire_name(value: Any) -> dict[str, Any]:
+    """Desktop IPC expects the internally tagged sandbox enum object."""
 
     if isinstance(value, dict):
-        value = value.get("type", "")
-    name = str(value or "")
-    if name not in _SANDBOX_POLICY_NAMES:
-        raise DesktopIpcError(f"Unsupported sandbox policy: {name}")
-    return _SANDBOX_POLICY_NAMES[name]
+        if str(value.get("type") or ""):
+            return dict(value)
+        raise DesktopIpcError("sandbox_policy")
+    name = _SANDBOX_POLICY_NAMES.get(str(value or ""))
+    if name is None:
+        raise DesktopIpcError(f"Unsupported sandbox policy: {value}")
+    return {"type": name}
 
 
 def _desktop_text_inputs(request: dict[str, Any]) -> dict[str, Any]:

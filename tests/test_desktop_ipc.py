@@ -103,7 +103,7 @@ class DesktopIpcTests(unittest.TestCase):
             'threadSettings': {'model': 'Auto/Kimi-K3', 'effort': 'high'},
         })
 
-    def test_owner_routed_sandbox_policy_uses_the_desktop_string_shape(self):
+    def test_owner_routed_sandbox_policy_uses_the_desktop_enum_object(self):
         client = DesktopIpcClient()
         response = {
             'resultType': 'success', 'result': {'applied': True},
@@ -117,7 +117,24 @@ class DesktopIpcTests(unittest.TestCase):
 
         self.assertEqual(
             request.call_args.args[1]['threadSettings']['sandboxPolicy'],
-            'danger-full-access',
+            {'type': 'dangerFullAccess'},
+        )
+
+    def test_owner_routed_sandbox_policy_preserves_the_enum_object(self):
+        client = DesktopIpcClient()
+        response = {
+            'resultType': 'success', 'result': {'applied': True},
+        }
+        with patch.object(client, '_request', return_value=response) as request:
+            client.update_thread_settings(
+                'owner-id',
+                'thread-1',
+                sandbox_policy={'type': 'workspaceWrite'},
+            )
+
+        self.assertEqual(
+            request.call_args.args[1]['threadSettings']['sandboxPolicy'],
+            {'type': 'workspaceWrite'},
         )
 
     def test_settings_update_tolerates_nested_result(self):
