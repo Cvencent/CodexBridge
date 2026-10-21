@@ -156,7 +156,17 @@ def records_from_snapshot(
     result_thread = str(result.get("thread_id") or "")
     result_status = str(result.get("status") or "")
     completed_at = float(result.get("completed_at_epoch") or 0)
-    if result_thread and result_status in {"completed", "failed"}:
+    if result_thread and result_status in {
+        "completed",
+        "failed",
+        "interrupted",
+        "cancelled",
+        "canceled",
+    }:
+        result_status = {
+            "cancelled": "interrupted",
+            "canceled": "interrupted",
+        }.get(result_status, result_status)
         message_id = f"result:{result_thread}:{int(completed_at)}"
         result["message_id"] = message_id
         records.append(

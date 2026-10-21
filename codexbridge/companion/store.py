@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import threading
 import time
@@ -22,6 +23,7 @@ PAIRING_MAX_ATTEMPTS = 5
 PHONE_TOKEN_BYTES = 32
 PHONE_TOKEN_PREFIX = "cbp_"
 MAX_PHONES = 16
+_REPLACE_ATTEMPTS = 8
 # How long a phone may keep using a token it already holds after the same
 # installation pairs again. Re-pairing mints a new secret, and a phone whose
 # pair response was lost mid-write would otherwise be locked out for good:
@@ -78,6 +80,21 @@ def _new_token() -> str:
     return PHONE_TOKEN_PREFIX + raw.decode("ascii").rstrip("=")
 
 
+class CompanionStoreError(RuntimeError):
+    """Raised when the pairing file cannot be read or safely replaced."""
+
+
+def _replace_with_retry(source: str, destination: Path) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.02 * (attempt + 1))
+
+
 @dataclass
 class PhoneRecord:
     phone_id: str
@@ -128,6 +145,8 @@ class CompanionStore:
         self._code_expires_at = 0.0
         self._code_attempts = 0
         self._lock = threading.RLock()
+        self._loaded_from_disk = self.path is None or not self.path.exists()
+        self.load_warning = ""
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
@@ -135,19 +154,63 @@ class CompanionStore:
             return
         try:
             raw = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except FileNotFoundError:
+            with self._lock:
+                recovered = self._recover_from_registry()
+                self._loaded_from_disk = True
+            if recovered:
+                self.save()
             return
+        except UnicodeDecodeError as error:
+            return self._recover_corrupt_store(
+                "companion store is not UTF-8: %s" % error
+            )
+        except OSError as error:
+            raise CompanionStoreError(
+                "cannot read companion store %s: %s" % (self.path, error)
+            ) from error
         try:
             payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return
+        except json.JSONDecodeError as error:
+            return self._recover_corrupt_store(
+                "companion store is not valid JSON: %s" % error
+            )
         if not isinstance(payload, dict):
-            return
+            return self._recover_corrupt_store(
+                "companion store root must be an object"
+            )
         with self._lock:
             migrated = self._apply_payload(payload)
+            recovered = self._recover_from_registry()
             self._sync_all_to_registry()
-        if migrated:
+            self._loaded_from_disk = True
+        if migrated or recovered:
             self.save()
+
+    def _recover_corrupt_store(self, warning: str) -> None:
+        backup = self._quarantine_broken_file()
+        self.load_warning = warning
+        if backup is not None:
+            self.load_warning += "; backup=%s" % backup
+        with self._lock:
+            self._recover_from_registry()
+            self._loaded_from_disk = True
+        self.save()
+
+    def _quarantine_broken_file(self) -> Path | None:
+        if self.path is None or not self.path.exists():
+            return None
+        backup = self.path.with_suffix(self.path.suffix + ".corrupt.bak")
+        index = 1
+        while backup.exists():
+            backup = self.path.with_suffix(self.path.suffix + ".corrupt.%d.bak" % index)
+            index += 1
+        try:
+            self.path.replace(backup)
+        except OSError:
+            return None
+        self._loaded_from_disk = True
+        return backup
 
     def _apply_payload(self, payload: dict) -> bool:
         migrated = False
@@ -214,20 +277,30 @@ class CompanionStore:
             return
         try:
             raw = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except FileNotFoundError:
+            self._loaded_from_disk = True
             return
+        except (OSError, UnicodeDecodeError) as error:
+            raise CompanionStoreError(
+                "cannot reload companion store %s: %s" % (self.path, error)
+            ) from error
         try:
             payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return
+        except json.JSONDecodeError as error:
+            self._quarantine_broken_file()
+            raise CompanionStoreError(
+                "companion store is not valid JSON: %s" % error
+            ) from error
         if not isinstance(payload, dict):
-            return
+            self._quarantine_broken_file()
+            raise CompanionStoreError("companion store root must be an object")
         # Treat the merge as reload-only. If an older-format file temporarily
         # has no phone while this instance still holds a newer in-memory
         # record, retain the in-memory copy instead of letting the next save
         # erase it. Newer records on disk still win by last_seen below.
         before = dict(self.phones)
         migrated = self._apply_payload(payload)
+        self._recover_from_registry()
         for phone_id, record in before.items():
             current = self.phones.get(phone_id)
             if current is None or record.last_seen > current.last_seen:
@@ -242,6 +315,7 @@ class CompanionStore:
             }
         recovered = any(phone_id not in disk_phone_ids for phone_id in before)
         self._sync_all_to_registry()
+        self._loaded_from_disk = True
         if migrated or recovered:
             self.save()
 
@@ -278,6 +352,10 @@ class CompanionStore:
         if self.path is None:
             return
         with self._lock:
+            if not self._loaded_from_disk:
+                raise CompanionStoreError(
+                    "refusing to overwrite a companion store that was not loaded"
+                )
             payload = {
                 "version": 1,
                 "enabled": self.enabled,
@@ -302,16 +380,27 @@ class CompanionStore:
                     "expires_at": self._code_expires_at if self._code_expires_at > time.time() else 0,
                 },
             }
+        temporary_name = ""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temporary.replace(self.path)
-        except OSError:
-            return
+            temporary_name = str(temporary)
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _replace_with_retry(temporary_name, self.path)
+            temporary_name = ""
+        except OSError as error:
+            raise CompanionStoreError(
+                "cannot save companion store %s: %s" % (self.path, error)
+            ) from error
+        finally:
+            if temporary_name:
+                try:
+                    Path(temporary_name).unlink()
+                except OSError:
+                    pass
 
     # -------------------------------------------------------------- settings
     def negotiate(self, phone_id: str, supported: list[str]) -> list[str]:
@@ -422,6 +511,34 @@ class CompanionStore:
             return
         for record in self.phones.values():
             self._sync_phone_to_registry(record)
+
+    def _recover_from_registry(self) -> bool:
+        if self.registry is None:
+            return False
+        try:
+            rows = self.registry.all()
+        except (AttributeError, TypeError, ValueError):
+            return False
+        recovered = False
+        for row in rows:
+            if str(getattr(row, "kind", "")) != "phone":
+                continue
+            phone_id = str(getattr(row, "device_id", "") or "")
+            token_hash = str(getattr(row, "token_hash", "") or "")
+            if not phone_id or len(token_hash) != 64 or phone_id in self.phones:
+                continue
+            last_seen = getattr(row, "last_seen", 0) or 0.0
+            self.phones[phone_id] = PhoneRecord(
+                phone_id=phone_id,
+                name=str(getattr(row, "name", "") or ""),
+                token_hash=token_hash,
+                created_at=float(last_seen),
+                last_seen=float(last_seen),
+                enabled=set(getattr(row, "enabled", set()) or set()) & PHONE_CAPABILITIES,
+                client_id=str(getattr(row, "client_id", "") or ""),
+            )
+            recovered = True
+        return recovered
 
     def _remove_from_registry(self, phone_id: str) -> None:
         if self.registry is None:

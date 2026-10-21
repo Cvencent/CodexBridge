@@ -135,6 +135,22 @@ class CodexRecordTests(unittest.TestCase):
             },
         )
 
+    def test_interrupted_snapshot_is_published_as_a_result(self):
+        snapshot = {
+            "generated_at_epoch": 1_000,
+            "result": _task(
+                "stopped-thread",
+                "interrupted",
+                completed_at=950,
+                assistant="stopped",
+            ),
+        }
+        result = next(
+            record for record in records_from_snapshot(snapshot) if record.kind == "result"
+        )
+        self.assertEqual(result.status, "interrupted")
+        self.assertEqual(result.body, "stopped")
+
 
 class FakeSource:
     def __init__(self, snapshot):

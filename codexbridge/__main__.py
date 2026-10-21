@@ -41,6 +41,7 @@ from codexbridge.companion import (
     CompanionDiscovery,
     CompanionService,
     CompanionStore,
+    CompanionStoreError,
 )
 from codexbridge.console import emit
 from codexbridge.net_gate import port_is_in_use
@@ -479,7 +480,13 @@ def main(argv: list[str] | None = None) -> int:
     codex_state = _CodexState()
 
     companion_store = CompanionStore(data_dir / "companion.json", registry=registry)
-    companion_store.load()
+    try:
+        companion_store.load()
+    except CompanionStoreError as error:
+        print(f"手机配对存储读取失败：{error}")
+        raise
+    if companion_store.load_warning:
+        print(f"手机配对存储已恢复：{companion_store.load_warning}")
     companion_service = CompanionService(
         data_dir,
         codex_cwd,

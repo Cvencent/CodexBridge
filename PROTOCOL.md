@@ -123,6 +123,17 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   环境即使注入共享 app-server，也要先查桌面 owner，并通过
   `thread-follower-start-turn` 把手机回复交给桌面 Codex。这样桌面端能实时看到
   手机输入和回复，线程也不会被第二个 app-server writer 竞争截断。
+- **2026-10-21 后续修正：** CBDP 结果记录现在同时写入线程 scope 的 turn 终态
+  事件：`turn.completed(0x0203)`、`turn.failed(0x0204)`、
+  `turn.interrupted(0x0205)`，QoS 为 `critical`。事件携带 thread/turn/message
+  id、status、title、summary、body 和 completed_at_ms，供设备按具体任务提醒；
+  同一 `turn_id` 只写一次。`system.codex_state(0x0704)` 继续保留，只负责首页
+  聚合计数，不再承担“哪条任务完成”的推断职责。
+- **2026-10-21 后续修正：** `companion.json` 的配对记录改为失败关闭加载：读取
+  异常时拒绝覆盖原文件；JSON/UTF-8 损坏时先隔离为
+  `companion.json.corrupt*.bak`，再从 `devices.json` 的 phone 投影恢复可恢复的
+  令牌记录。保存使用 fsync + 原子替换并带 Windows 重试。Bridge 重启或升级不得
+  因空内存状态覆盖已有手机配对令牌。
 
 ## 1. 范围与角色
 

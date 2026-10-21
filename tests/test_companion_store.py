@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from codexbridge.companion.store import (
+    CompanionStoreError,
     DEFAULT_PORT,
     LEGACY_PORT,
     PAIRING_CODE_TTL_SECONDS,
@@ -18,6 +19,50 @@ from codexbridge.devices.registry import DeviceRegistry
 
 
 class CompanionStoreTests(unittest.TestCase):
+    def test_corrupt_companion_file_is_quarantined_not_overwritten(self) -> None:
+        self.path.write_text('{"phones": [', encoding="utf-8")
+        broken = self.path.read_text(encoding="utf-8")
+        store = CompanionStore(self.path)
+
+        store.load()
+
+        backups = list(self.path.parent.glob("companion.json.corrupt*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), broken)
+        self.assertTrue(self.path.exists())
+        self.assertIn("not valid JSON", store.load_warning)
+
+    def test_unloaded_store_refuses_to_overwrite_disk(self) -> None:
+        self.store.claim(self.store.pairing_code()["code"], "keep-me")
+        raw = self.path.read_text(encoding="utf-8")
+        fresh = CompanionStore(self.path)
+
+        with self.assertRaises(CompanionStoreError):
+            fresh.save()
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), raw)
+
+    def test_missing_companion_file_recovers_phone_from_registry(self) -> None:
+        self.registry.upsert_phone(
+            "phone-registry",
+            name="Recovered",
+            token_hash="d" * 64,
+            enabled=["status", "attachment"],
+            last_seen=123.0,
+            client_id="install-recovered",
+        )
+        self.registry.save()
+        self.path.unlink(missing_ok=True)
+
+        restored = CompanionStore(self.path, registry=self.registry)
+        restored.load()
+
+        record = restored.phones["phone-registry"]
+        self.assertEqual(record.token_hash, "d" * 64)
+        self.assertEqual(record.capabilities(), {"status", "attachment"})
+        self.assertEqual(record.client_id, "install-recovered")
+        self.assertTrue(self.path.exists())
+
     def test_phone_negotiates_optional_capabilities_and_persists_them(self):
         paired = self.store.claim(self.store.pairing_code()['code'], 'phone')
         phone_id = paired['phone_id']

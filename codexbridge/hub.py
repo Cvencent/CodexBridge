@@ -5,6 +5,7 @@ import queue
 import json
 import time
 import uuid
+from collections import deque
 from typing import Any
 
 from codexbridge.devices.registry import DeviceRegistry
@@ -45,6 +46,7 @@ from codexbridge.cbdp.constants import (
     TAG_TURN_ID,
     TAG_TURN_REF,
     TAG_UPDATED_AT_MS,
+    TAG_COMPLETED_AT_MS,
     TAG_RUNNING_COUNT,
     TAG_COMPLETED_UNREAD,
     TAG_FAILED_UNREAD,
@@ -75,6 +77,14 @@ from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
 
 EVENT_CODEX_STATE = 0x0704
+EVENT_TURN_COMPLETED = 0x0203
+EVENT_TURN_FAILED = 0x0204
+EVENT_TURN_INTERRUPTED = 0x0205
+TURN_TERMINAL_EVENTS = {
+    "completed": EVENT_TURN_COMPLETED,
+    "failed": EVENT_TURN_FAILED,
+    "interrupted": EVENT_TURN_INTERRUPTED,
+}
 
 
 DEVICE_EVENT_CAPABILITY: dict[str, str] = {
@@ -208,6 +218,12 @@ class BridgeHub:
         self._depth: dict[str, int] = {}
         self._cbdp_message_events: dict[str, tuple[str, int]] = {}
         self._cbdp_gateways: dict[str, Any] = {}
+        # Terminal turn notifications are keyed by (thread_id, turn_id) so a
+        # collector periodically republishing the same snapshot cannot replay
+        # the same completion sound/notice. A missing turn_id falls back to the
+        # terminal result message_id, which is already stable per completion.
+        self._cbdp_terminal_turns: set[tuple[str, str]] = set()
+        self._cbdp_terminal_order: deque[tuple[str, str]] = deque()
 
     def _cbdp_ref(self, kind: str, external_id: str) -> int:
         if self.references is None or not external_id:
@@ -555,6 +571,8 @@ class BridgeHub:
                 event = self._append_message_event(
                     record, appended=previous is None
                 )
+            if record.kind == "result" and record.status in TURN_TERMINAL_EVENTS:
+                self._append_turn_terminal_event(record)
             capability = KIND_CAPABILITY.get(record.kind)
             if capability is None:
                 return
@@ -565,6 +583,64 @@ class BridgeHub:
                 # Push them as soon as a task enters or leaves the terminal
                 # set so every connected device updates at the same time.
                 self._broadcast_codex_state()
+
+    def _append_turn_terminal_event(self, record: MessageRecord) -> None:
+        """Append one thread-scoped terminal event for a result record.
+
+        The collector republishes stable result snapshots, so the turn terminal
+        event is emitted once per ``turn_id`` (falling back to the stable result
+        message id when an old snapshot lacks a turn id).
+        """
+
+        if not record.thread_id:
+            return
+        event_type = TURN_TERMINAL_EVENTS.get(str(record.status or ""))
+        if event_type is None or self.event_spine is None:
+            return
+        data = record.data if isinstance(record.data, dict) else {}
+        task = data.get("task") if isinstance(data.get("task"), dict) else {}
+        turn_id = str(task.get("turn_id") or "")
+        identity = turn_id or str(record.message_id or "")
+        if not identity:
+            return
+        key = (str(record.thread_id), identity)
+        if key in self._cbdp_terminal_turns:
+            return
+
+        payload = {
+            TAG_THREAD_ID: utf8(str(record.thread_id)),
+            TAG_THREAD_REF: u32(self._cbdp_ref("thread", record.thread_id)),
+            TAG_STATUS: u16(
+                {"completed": 2, "failed": 3, "interrupted": 4}[
+                    str(record.status)
+                ]
+            ),
+            TAG_KIND: u8(1),
+            TAG_BODY: utf8(str(record.body or "")),
+            TAG_SUMMARY: utf8(str(record.title or "")),
+            TAG_TITLE: utf8(str(record.title or "")),
+        }
+        if turn_id:
+            payload[TAG_TURN_ID] = utf8(turn_id)
+            payload[TAG_TURN_REF] = u32(self._cbdp_ref("turn", turn_id))
+        if record.message_id:
+            payload[TAG_MESSAGE_ID] = utf8(str(record.message_id))
+        completed_at = float(task.get("completed_at_epoch") or 0)
+        if completed_at <= 0:
+            completed_at = float(record.created_at or 0)
+        if completed_at > 0:
+            payload[TAG_COMPLETED_AT_MS] = i64(int(completed_at * 1000))
+
+        self._append_event(
+            self._cbdp_topic(record.thread_id),
+            event_type,
+            QOS_CRITICAL,
+            payload,
+        )
+        self._cbdp_terminal_turns.add(key)
+        self._cbdp_terminal_order.append(key)
+        while len(self._cbdp_terminal_order) > 4096:
+            self._cbdp_terminal_turns.discard(self._cbdp_terminal_order.popleft())
 
     def _device_profile(self, device_id: str, session: Any = None) -> int:
         record = self.registry.get(device_id)

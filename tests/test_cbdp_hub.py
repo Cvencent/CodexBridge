@@ -7,7 +7,9 @@ from codexbridge.cbdp.constants import (
     QOS_CRITICAL,
     QOS_STATE,
     TAG_APPLIED_POLICY,
+    TAG_BODY,
     TAG_BODY_REF,
+    TAG_COMPLETED_AT_MS,
     TAG_CREATED_AT_MS,
     TAG_DEVICE_ID,
     TAG_DEVICE_REF,
@@ -15,6 +17,7 @@ from codexbridge.cbdp.constants import (
     TAG_KIND,
     TAG_LAST_SEEN_MS,
     TAG_MESSAGE_REF,
+    TAG_MESSAGE_ID,
     TAG_POLICY_REASON,
     TAG_POLICY_VERSION,
     TAG_PROFILE,
@@ -23,7 +26,10 @@ from codexbridge.cbdp.constants import (
     TAG_SENDER,
     TAG_STATUS,
     TAG_SUMMARY,
+    TAG_THREAD_ID,
     TAG_THREAD_REF,
+    TAG_TITLE,
+    TAG_TURN_ID,
     TAG_TURN_REF,
     TAG_UPDATED_AT_MS,
     TAG_RUNNING_COUNT,
@@ -302,7 +308,9 @@ class CbdpHubEventTests(unittest.TestCase):
         self.assertGreater(event.topic_seq, 0)
         self.assertGreater(event.revision, 0)
         self.assertEqual(len(event.event_id), 16)
-        self.assertEqual(gateway.queries.count((event.topic_id, event_scope(event.event_type))), 1)
+        delivered_types = [item.event_type for item in session.sent_events]
+        self.assertEqual(delivered_types.count(0x0301), 1)
+        self.assertEqual(delivered_types.count(0x0203), 1)
         # No compatibility "message"/"read_state" envelope may be synthesised
         # for a CBDP session; aggregate state messages are still allowed.
         self.assertFalse(
@@ -327,6 +335,85 @@ class CbdpHubEventTests(unittest.TestCase):
 
         self.assertEqual(session.sent_events, [])
         self.assertEqual(gateway.queries, [(event.topic_id, event_scope(event.event_type))])
+
+    def test_result_writes_thread_scoped_turn_completed_event(self):
+        from codexbridge.cbdp.events import SCOPE_THREAD, event_scope
+
+        self.hub.publish(
+            MessageRecord(
+                message_id="result:t1:1791000100",
+                thread_id="t1",
+                kind="result",
+                status="completed",
+                title="Answer",
+                body="hello world",
+                created_at=1791000100,
+                data={
+                    "task": {
+                        "thread_id": "t1",
+                        "turn_id": "turn-1",
+                        "completed_at_epoch": 1791000100,
+                    }
+                },
+            )
+        )
+
+        events = self._events(0x0203)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.topic_id, self.refs.topic_for("t1"))
+        self.assertEqual(event_scope(event.event_type), SCOPE_THREAD)
+        payload = event.payload
+        self.assertEqual(payload[TAG_THREAD_ID], b"t1")
+        self.assertEqual(payload[TAG_TURN_ID], b"turn-1")
+        self.assertEqual(decode_u16(payload[TAG_STATUS]), 2)
+        self.assertEqual(payload[TAG_BODY], b"hello world")
+        self.assertEqual(payload[TAG_SUMMARY], b"Answer")
+        self.assertEqual(payload[TAG_TITLE], b"Answer")
+        self.assertEqual(payload[TAG_MESSAGE_ID], b"result:t1:1791000100")
+        self.assertEqual(decode_i64(payload[TAG_COMPLETED_AT_MS]), 1791000100000)
+
+    def test_failed_result_writes_turn_failed_event(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="result:t1:1791000101",
+                thread_id="t1",
+                kind="result",
+                status="failed",
+                title="Failed",
+                body="boom",
+                created_at=1791000101,
+                data={"task": {"turn_id": "turn-failed"}},
+            )
+        )
+        event = self._events(0x0204)[0]
+        self.assertEqual(decode_u16(event.payload[TAG_STATUS]), 3)
+        self.assertEqual(event.payload[TAG_BODY], b"boom")
+
+    def test_terminal_event_is_idempotent_per_turn(self):
+        first = MessageRecord(
+            message_id="result:t1:1791000100",
+            thread_id="t1",
+            kind="result",
+            status="completed",
+            title="Answer",
+            body="first",
+            created_at=1791000100,
+            data={"task": {"turn_id": "turn-1"}},
+        )
+        second = MessageRecord(
+            message_id="result:t1:1791000100",
+            thread_id="t1",
+            kind="result",
+            status="completed",
+            title="Answer",
+            body="second",
+            created_at=1791000100,
+            data={"task": {"turn_id": "turn-1"}},
+        )
+        self.hub.publish(first)
+        self.hub.publish(second)
+        self.assertEqual(len(self._events(0x0203)), 1)
 
     def test_broadcast_does_not_emit_second_hub_delta_for_cbdp(self):
         self.registry.records["dev-1"] = _Record()

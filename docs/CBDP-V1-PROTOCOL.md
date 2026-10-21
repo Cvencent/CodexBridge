@@ -4505,6 +4505,47 @@ app-server 就跳过 DesktopIPC owner discovery：
 - 验收要求：桌面打开活跃会话时，手机回复立即出现在桌面；手机流式回复完整结束；
   `thread.read` 的消息列表与桌面一致，无需重启或重新打开桌面会话。
 
+### 19.12 turn 终态事件（2026-10-21 后续修正）
+
+聚合计数 `system.codex_state(0x0704)` 只描述首页徽标数量，不能可靠表达“哪一条
+任务刚刚完成”。Bridge 在结果记录落库时同时写线程 scope 的终态事件：
+
+| 结果状态 | event_type | scope | qos |
+|---|---|---|---|
+| `completed` | `turn.completed(0x0203)` | `thread` | `critical` |
+| `failed` | `turn.failed(0x0204)` | `thread` | `critical` |
+| `interrupted` | `turn.interrupted(0x0205)` | `thread` | `critical` |
+
+- topic 使用该结果的 `thread_id` 对应 topic，不使用 summary topic。设备选中任务后
+  已订阅该线程 topic + `thread` scope，不需要新增订阅。
+- Payload 使用既有 tag：`THREAD_ID(0x0022)`、`THREAD_REF(0x0021)`、
+  `TURN_ID(0x0024)`、`TURN_REF(0x0023)`、`KIND(0x0045)`、`STATUS(0x0044)`、
+  `TITLE(0x0040)`、`SUMMARY(0x0041)`、`BODY(0x0042)`、
+  `MESSAGE_ID(0x0026)`、`COMPLETED_AT_MS(0x004E)`。`BODY` 为主显示字段，
+  `SUMMARY` 为回退。
+- 同一 `thread_id + turn_id` 只写一次；缺少 turn_id 时退化为稳定的 result
+  `message_id` 去重。collector 周期重复发布同一结果不得重复产生终态事件。
+- `0x0704` 聚合计数字段和 summary scope 语义保持不变。客户端应优先用
+  `0x0203/0x0204/0x0205` 做逐任务提醒，用 `0x0704` 更新数量徽标。
+- 验收要求：4 秒内连续完成两条不同任务必须产生两条不同 turn 终态事件；其它
+  客户端已读导致 `completed_unread` 回落再上涨时，不应仅凭计数重复提醒。
+
+### 19.13 手机配对令牌持久化（2026-10-21 后续修正）
+
+`%LOCALAPPDATA%\CodexBridge\companion.json` 是手机长期令牌的唯一主存储，
+`devices.json` 中的 phone 记录是可用于恢复的投影。重启或升级必须保持令牌不变：
+
+- `CompanionStore.load()` 在文件不存在时允许从空状态启动，但必须先尝试从
+  `devices.json` 的 phone 记录恢复 token_hash、client_id、enabled 和 last_seen。
+- 读取权限/IO 异常必须失败关闭，未成功加载磁盘状态时 `save()` 不得覆盖原文件。
+- JSON 或 UTF-8 损坏时先把原文件隔离为 `companion.json.corrupt*.bak`，记录
+  `load_warning`，再从 registry 恢复并写出新的健康文件；不得静默丢弃后直接用
+  一条新配对覆盖全部旧记录。
+- 保存必须先写同目录临时文件、fsync，再原子替换正式文件；Windows 短暂占用时
+  必须有限重试，最终失败要返回明确错误，不得静默丢失。
+- 验收要求：配对一部手机，重启 Bridge，手机旧令牌仍可授权；15 条手机记录在
+  重启后仍保持 15 条，除非用户显式删除。
+
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

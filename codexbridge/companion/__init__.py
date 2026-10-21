@@ -9,6 +9,12 @@ lived token, then talk HTTP + SSE.
 from codexbridge.companion.api import CompanionApi
 from codexbridge.companion.discovery import CompanionDiscovery
 from codexbridge.companion.service import CompanionService
-from codexbridge.companion.store import CompanionStore
+from codexbridge.companion.store import CompanionStore, CompanionStoreError
 
-__all__ = ["CompanionApi", "CompanionDiscovery", "CompanionService", "CompanionStore"]
+__all__ = [
+    "CompanionApi",
+    "CompanionDiscovery",
+    "CompanionService",
+    "CompanionStore",
+    "CompanionStoreError",
+]
