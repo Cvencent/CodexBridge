@@ -88,6 +88,16 @@ class ProjectionStoreTests(unittest.TestCase):
         self.assertEqual(message.kind, 1)
         self.assertEqual(message.status, 2)
 
+    def test_message_event_creates_the_thread_row_when_no_thread_event_arrived(self):
+        # Reproduces the real corruption where ``messages`` had rows but
+        # ``threads`` stayed empty because the host never emitted 0x0101.
+        self.append_and_apply(MESSAGE_APPENDED, message_payload())
+
+        thread = self.projection.get_thread("thread-1")
+        self.assertIsNotNone(thread)
+        self.assertEqual(thread.status, 0)
+        self.assertEqual(thread.updated_at_ms, 2001)
+
     def test_thread_title_revision_is_monotonic(self):
         self.append_and_apply(THREAD_CREATED, thread_payload())
         event = self.events.append(

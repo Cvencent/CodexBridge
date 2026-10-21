@@ -460,6 +460,39 @@ class CbdpHubEventTests(unittest.TestCase):
             )
         )
 
+    def test_codex_state_appended_for_a_new_count_is_delivered(self):
+        # The old code appended a fresh 0x0704 and returned without sending it,
+        # so a device that reconnected after the count changed never saw the
+        # value it had just asked for.
+        session = _CbdpSession()
+        gateway = _GatewaySubscriptionStub(True, session)
+        session.gateway = gateway
+
+        self.hub._send_codex_state_event(session)
+
+        delivered = [item for item in session.sent_events if item.event_type == 0x0704]
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0].payload[TAG_RUNNING_COUNT], b"\x00\x00")
+
+    def test_publishing_a_message_emits_a_thread_created_event(self):
+        self.hub.publish(
+            MessageRecord(
+                message_id="m-thread",
+                thread_id="t-thread",
+                kind="task",
+                status="working",
+                title="Thread title",
+                body="working",
+                created_at=3.0,
+            )
+        )
+
+        created = self._events(0x0101)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].payload[TAG_THREAD_ID], b"t-thread")
+        self.assertEqual(created[0].payload[TAG_TITLE], b"Thread title")
+        self.assertEqual(self.projection.get_thread("t-thread").title, "Thread title")
+
     def test_unchanged_message_fingerprint_does_not_append_twice(self):
         record = MessageRecord(
             message_id="m1",

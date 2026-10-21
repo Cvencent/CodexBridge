@@ -77,6 +77,10 @@ from codexbridge.protocol.commands import CommandError
 from codexbridge.read_state import ReadStateStore
 
 EVENT_CODEX_STATE = 0x0704
+EVENT_THREAD_CREATED = 0x0101
+EVENT_THREAD_UPDATED = 0x0102
+EVENT_THREAD_TITLE_CHANGED = 0x0103
+EVENT_THREAD_STATUS_CHANGED = 0x0104
 EVENT_TURN_COMPLETED = 0x0203
 EVENT_TURN_FAILED = 0x0204
 EVENT_TURN_INTERRUPTED = 0x0205
@@ -224,6 +228,7 @@ class BridgeHub:
         # terminal result message_id, which is already stable per completion.
         self._cbdp_terminal_turns: set[tuple[str, str]] = set()
         self._cbdp_terminal_order: deque[tuple[str, str]] = deque()
+        self._cbdp_thread_state: dict[str, tuple[str, int]] = {}
 
     def _cbdp_ref(self, kind: str, external_id: str) -> int:
         if self.references is None or not external_id:
@@ -518,7 +523,7 @@ class BridgeHub:
             event = None
         if event is None:
             try:
-                self._append_event(
+                event = self._append_event(
                     SYSTEM_THREAD_SUMMARIES_TOPIC,
                     EVENT_CODEX_STATE,
                     QOS_STATE,
@@ -526,6 +531,11 @@ class BridgeHub:
                 )
             except Exception:
                 return
+            # _append_event() only fans out to already-registered gateways.
+            # Attach-time callers can reach this branch before their session is
+            # registered, so deliver the freshly appended state explicitly.
+            if event is not None:
+                self._deliver_cbdp_event(session, event)
             return
         self._deliver_cbdp_event(session, event)
 
@@ -568,6 +578,7 @@ class BridgeHub:
                 return
             event = None
             if self.event_spine is not None:
+                self._append_thread_state_event(record)
                 event = self._append_message_event(
                     record, appended=previous is None
                 )
@@ -583,6 +594,60 @@ class BridgeHub:
                 # Push them as soon as a task enters or leaves the terminal
                 # set so every connected device updates at the same time.
                 self._broadcast_codex_state()
+
+    def _append_thread_state_event(self, record: MessageRecord) -> None:
+        """Mirror one record onto the canonical CBDP thread event stream.
+
+        Thread lists are built from ``thread.created`` / ``thread.updated`` on
+        the thread-summary topic; message and turn events alone never populate a
+        device's thread projection. Publish the thread state once per real
+        title/status change instead of on every collector tick.
+        """
+
+        thread_id = str(record.thread_id or "")
+        if not thread_id or self.event_spine is None:
+            return
+        status = {
+            "pending": 0,
+            "streaming": 1,
+            "working": 1,
+            "waiting_user": 1,
+            "waiting": 1,
+            "queued": 1,
+            "starting": 1,
+            "completed": 2,
+            "done": 2,
+            "failed": 3,
+            "interrupted": 4,
+            "archived": 5,
+        }.get(str(record.status or ""), 6)
+        title = str(record.title or "")
+        previous = self._cbdp_thread_state.get(thread_id)
+        if previous == (title, status):
+            return
+        created_at_ms = int(float(record.created_at or 0) * 1000)
+        payload = {
+            TAG_THREAD_ID: utf8(thread_id),
+            TAG_THREAD_REF: u32(self._cbdp_ref("thread", thread_id)),
+            TAG_TITLE: utf8(title),
+            TAG_STATUS: u16(status),
+            TAG_REVISION: u64(int(record.data.get("revision", 0)) if isinstance(record.data, dict) else 0),
+            TAG_CREATED_AT_MS: i64(created_at_ms),
+            TAG_UPDATED_AT_MS: i64(created_at_ms),
+        }
+        event_type = (
+            EVENT_THREAD_CREATED if previous is None else EVENT_THREAD_UPDATED
+        )
+        try:
+            self._append_event(
+                SYSTEM_THREAD_SUMMARIES_TOPIC,
+                event_type,
+                QOS_STATE,
+                payload,
+            )
+        except Exception:
+            return
+        self._cbdp_thread_state[thread_id] = (title, status)
 
     def _append_turn_terminal_event(self, record: MessageRecord) -> None:
         """Append one thread-scoped terminal event for a result record.

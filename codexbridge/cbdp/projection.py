@@ -34,6 +34,9 @@ EVENT_THREAD_TITLE_CHANGED = 0x0103
 EVENT_THREAD_STATUS_CHANGED = 0x0104
 EVENT_MESSAGE_APPENDED = 0x0301
 EVENT_MESSAGE_UPDATED = 0x0302
+EVENT_TURN_COMPLETED = 0x0203
+EVENT_TURN_FAILED = 0x0204
+EVENT_TURN_INTERRUPTED = 0x0205
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,51 @@ class ProjectionStore:
         value = payload.get(tag)
         return default if value is None else decode(value)
 
+    def _upsert_thread(
+        self,
+        thread_id: str,
+        *,
+        title: str = "",
+        status: int | None = None,
+        revision: int | None = None,
+        created_at_ms: int | None = None,
+        updated_at_ms: int | None = None,
+    ) -> None:
+        """Create or refresh one thread row from any thread-bearing event.
+
+        Message and turn events carry the thread id as well. Projecting only
+        the dedicated thread events left ``threads`` empty whenever the host
+        had not emitted one, which made every consumer that reads that table
+        see zero conversations.
+        """
+
+        if not thread_id or self._connection is None:
+            return
+        previous = self._thread_row(thread_id)
+        if previous is None:
+            row = (
+                thread_id,
+                str(title or ""),
+                max(0, int(status or 0)),
+                max(0, int(revision or 0)),
+                max(0, int(created_at_ms or 0)),
+                max(0, int(updated_at_ms or 0)),
+            )
+        else:
+            row = (
+                thread_id,
+                str(title) if str(title or "") else previous[1],
+                max(0, int(status)) if status is not None else previous[2],
+                max(int(revision or 0), previous[3]),
+                max(0, int(created_at_ms or 0)) or previous[4],
+                max(0, int(updated_at_ms or 0)) or previous[5],
+            )
+        self._connection.execute(
+            "INSERT OR REPLACE INTO threads VALUES(?,?,?,?,?,?)",
+            row,
+        )
+        self._connection.commit()
+
     def apply(self, event) -> None:
         payload = event.payload
         with self._lock:
@@ -130,11 +178,14 @@ class ProjectionStore:
                     payload, TAG_UPDATED_AT_MS, decode_i64, previous[5] if previous else event.created_at_ms
                 )
                 if self._connection is not None:
-                    self._connection.execute(
-                        "INSERT OR REPLACE INTO threads VALUES(?,?,?,?,?,?)",
-                        (thread_id, title, status, revision, created, updated),
+                    self._upsert_thread(
+                        thread_id,
+                        title=title,
+                        status=status,
+                        revision=revision,
+                        created_at_ms=created,
+                        updated_at_ms=updated,
                     )
-                    self._connection.commit()
                 return
             if event.event_type in {EVENT_MESSAGE_APPENDED, EVENT_MESSAGE_UPDATED}:
                 message_id = self._text(payload, TAG_MESSAGE_ID)
@@ -161,6 +212,40 @@ class ProjectionStore:
                         (message_id, thread_id, turn_id, kind, status, body, revision, created, updated),
                     )
                     self._connection.commit()
+                    self._upsert_thread(
+                        thread_id,
+                        title=self._text(payload, TAG_TITLE),
+                        # A message's status describes the message, not the
+                        # thread, so leave the thread status untouched.
+                        revision=revision,
+                        created_at_ms=created,
+                        updated_at_ms=updated,
+                    )
+                return
+            if event.event_type in {
+                EVENT_TURN_COMPLETED,
+                EVENT_TURN_FAILED,
+                EVENT_TURN_INTERRUPTED,
+            }:
+                thread_id = self._text(payload, TAG_THREAD_ID)
+                if not thread_id:
+                    return
+                completed = self._number(
+                    payload,
+                    TAG_UPDATED_AT_MS,
+                    decode_i64,
+                    event.created_at_ms,
+                )
+                self._upsert_thread(
+                    thread_id,
+                    title=self._text(payload, TAG_TITLE)
+                    or self._text(payload, TAG_SUMMARY),
+                    status=self._number(payload, TAG_STATUS, decode_u16, 0),
+                    revision=self._number(
+                        payload, TAG_REVISION, decode_u64, event.revision
+                    ),
+                    updated_at_ms=completed,
+                )
 
     def _thread_row(self, thread_id):
         if self._connection is None:

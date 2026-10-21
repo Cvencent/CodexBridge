@@ -32,6 +32,14 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - `SUBSCRIBE` 省略 `cursor` 等价于 `cursor = 0`（从历史起点回放）。回放改由每设备工作线程发送，socket 读取循环在回放期间继续排空设备上行，避免录音被截断。
 - `AUDIO_BEGIN` / `SEND_BEGIN` 不要求先 `thread.claim`；writer lease 与上行选线程无关。`thread_ref` 在 `BEGIN` 时解析，解析失败返回 `NOT_FOUND`，不会再落成 `UNSUPPORTED_FEATURE`。
 - CBDP 会话对未预期异常返回 `ERROR(INTERNAL)` 并保持连接，不再因单帧异常断开。
+- **2026-10-21 后续修正：** Bridge 现在按协议发布 thread 事件：线程首次出现
+  写 `thread.created(0x0101)`，标题或状态变化写 `thread.updated(0x0102)`，
+  同一标题与状态不重复发布。此前只写 message/turn 事件，导致
+  `cbdp-projection.sqlite3` 的 `threads` 表长期为 0，设备侧线程投影同样为空。
+  投影层现在也会从 message 与 turn 终态事件兜底生成 thread 行。
+- **2026-10-21 后续修正：** 当当前聚合计数没有对应的历史
+  `system.codex_state(0x0704)` 时，Bridge 会追加一条最新事件并立即投递给发起
+  订阅/拉取的会话；旧实现只追加、不投递，设备重连后仍会停留在 0。
 - 首页聚合计数在 CBDP 上改用独立事件 `system.codex_state(0x0704)`，在
   `system.thread_summaries(0x50000003)` 的 `summary` scope、`state` QoS 下发，
   携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、
