@@ -175,6 +175,8 @@ class CompanionServiceTests(unittest.TestCase):
                 self.started = 0
                 self.owners = []
                 self.events = queue.Queue()
+                self._client_id = "stub-owner"
+                self._error = ""
 
             def start(self):
                 self.started += 1
@@ -833,6 +835,37 @@ class CompanionServiceTests(unittest.TestCase):
 
         self.assertEqual(result["thread"]["status"], "working")
         self.assertEqual(result["task"]["status"], "working")
+
+    def test_recent_interrupted_turn_without_completion_still_counts_active(self) -> None:
+        now = int(time.time())
+        self.client.responses["thread/read"] = {
+            "thread": {
+                **thread_row("t2"),
+                "turns": [{
+                    "id": "turn-live",
+                    "status": "interrupted",
+                    "updatedAt": now - 5,
+                }],
+            }
+        }
+
+        self.assertEqual(self.service._active_turn_id("t2"), "turn-live")
+
+    def test_stale_interrupted_turn_does_not_block_queue_dispatch(self) -> None:
+        now = int(time.time())
+        self.client.responses["thread/read"] = {
+            "thread": {
+                **thread_row("t2"),
+                "turns": [{
+                    "id": "turn-dead",
+                    "status": "interrupted",
+                    "updatedAt": now - int(LOG_ACTIVE_SECONDS) - 30,
+                }],
+            }
+        }
+
+        self.assertEqual(self.service._active_turn_id("t2"), "")
+        self.assertFalse(self.service._queue_thread_active("t2"))
 
     def test_list_threads_marks_read_completion_idle(self) -> None:
         self._write_rollout("t2", "task_complete", seconds_ago=30)

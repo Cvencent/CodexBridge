@@ -4546,6 +4546,20 @@ app-server 就跳过 DesktopIPC owner discovery：
 - 验收要求：配对一部手机，重启 Bridge，手机旧令牌仍可授权；15 条手机记录在
   重启后仍保持 15 条，除非用户显式删除。
 
+### 19.14 队列派发与死 turn 兜底（2026-10-21 后续修正）
+
+手机文本进入待发送队列后，Bridge 只有在目标线程没有活跃 turn 时才派发。桌面
+Codex 与 Bridge 曾因双 writer 竞争产生一个被杀死、但没有 `completedAt` 的
+`interrupted` turn；旧逻辑把它永久视为活跃，队列再也不派发，`on_turn_finished`
+也永远不触发。协议侧要求：
+
+- 陈旧窗口内仍有活动的 `interrupted` turn 可以视为活跃，防止真正的桌面 turn
+  被队列并发写入。
+- 超过 `LOG_ACTIVE_SECONDS`（150 秒）仍无终态时间或新活动的 `interrupted`
+  turn 必须视为已死亡，释放该线程的队列，继续派发待发送项。
+- 队列不得因为单条失败项或陈旧 turn 永久暂停；新增消息、删除失败项、真实 turn
+  完成或陈旧窗口到期都应解除对应线程的阻塞。
+
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
 | 活动线程与恢复 | `cross_device_active`, `resume` | `active_state.read/set`, `events.since` | `active.*`, `events.since.result`, `resume.required` | `0x0170..0x0176`, `0x00A5` | panel/full | `active_state.read/set` `[本轮实现]`；`events.since` 与 `resume.*` `[本轮不实现]` |

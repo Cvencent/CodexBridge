@@ -134,6 +134,10 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   `companion.json.corrupt*.bak`，再从 `devices.json` 的 phone 投影恢复可恢复的
   令牌记录。保存使用 fsync + 原子替换并带 Windows 重试。Bridge 重启或升级不得
   因空内存状态覆盖已有手机配对令牌。
+- **2026-10-21 后续修正：** 手机队列的活跃判定把 `interrupted` 且无
+  `completedAt` 的 turn 视为活跃时，必须限制在 `LOG_ACTIVE_SECONDS`（150 秒）
+  陈旧窗口内。超过窗口的 turn 视为已死亡并释放队列，否则一次被第二个 writer
+  杀死的 turn 会让待发送消息永久卡住，直到用户删除队列项或重启 Bridge。
 
 ## 1. 范围与角色
 

@@ -879,9 +879,17 @@ class CompanionService:
                 return str(turn.get("id") or "")
             # A desktop-owned turn is reported as "interrupted" to any second
             # reader even while it is still running, so treat an unfinished
-            # turn that is still being written as active too.
+            # turn that is still being written as active too.  Without a
+            # bounded freshness window a turn killed by a second app-server
+            # writer stays "active" forever and the queue never dispatches.
             if status == "interrupted" and turn.get("completedAt") is None:
-                return str(turn.get("id") or "")
+                updated_at = _epoch(
+                    turn.get("updatedAt")
+                    or turn.get("lastActivityAt")
+                    or turn.get("createdAt")
+                )
+                if updated_at and time.time() - updated_at <= LOG_ACTIVE_SECONDS:
+                    return str(turn.get("id") or "")
         return ""
 
     def _writable_thread(self, thread_id: str) -> str:
