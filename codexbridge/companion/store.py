@@ -146,6 +146,9 @@ class CompanionStore:
         self._code_attempts = 0
         self._lock = threading.RLock()
         self._loaded_from_disk = self.path is None or not self.path.exists()
+        # File stamp of the last load/save, so an unchanged store is skipped
+        # instead of re-read and re-projected on every request.
+        self._reload_marker: tuple[int, int] | None = None
         self.load_warning = ""
 
     # ------------------------------------------------------------------ load
@@ -186,6 +189,8 @@ class CompanionStore:
             self._loaded_from_disk = True
         if migrated or recovered:
             self.save()
+        else:
+            self._remember_marker()
 
     def _recover_corrupt_store(self, warning: str) -> None:
         backup = self._quarantine_broken_file()
@@ -196,6 +201,18 @@ class CompanionStore:
             self._recover_from_registry()
             self._loaded_from_disk = True
         self.save()
+
+    def _remember_marker(self) -> None:
+        """Record the current file stamp so the next reload can skip parsing."""
+        if self.path is None:
+            self._reload_marker = None
+            return
+        try:
+            stat = self.path.stat()
+        except OSError:
+            self._reload_marker = None
+            return
+        self._reload_marker = (int(stat.st_mtime_ns), int(stat.st_size))
 
     def _quarantine_broken_file(self) -> Path | None:
         if self.path is None or not self.path.exists():
@@ -272,13 +289,33 @@ class CompanionStore:
 
         A stale tray instance must not overwrite a newer phone record with the
         empty phone list it loaded at startup.
+
+        The refresh is skipped when the file stamp is unchanged. The phone API
+        answers several authenticated requests per second, and re-reading the
+        store plus re-projecting it into the device registry -- a full
+        ``devices.json`` rewrite with ``fsync`` -- on every one of them pinned
+        a whole CPU core on a single idle phone.
         """
         if self.path is None:
+            return
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            self._loaded_from_disk = True
+            self._reload_marker = None
+            return
+        except OSError as error:
+            raise CompanionStoreError(
+                "cannot reload companion store %s: %s" % (self.path, error)
+            ) from error
+        marker = (int(stat.st_mtime_ns), int(stat.st_size))
+        if marker == self._reload_marker:
             return
         try:
             raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             self._loaded_from_disk = True
+            self._reload_marker = None
             return
         except (OSError, UnicodeDecodeError) as error:
             raise CompanionStoreError(
@@ -298,6 +335,7 @@ class CompanionStore:
         # has no phone while this instance still holds a newer in-memory
         # record, retain the in-memory copy instead of letting the next save
         # erase it. Newer records on disk still win by last_seen below.
+        before_ids = set(self.phones)
         before = dict(self.phones)
         migrated = self._apply_payload(payload)
         self._recover_from_registry()
@@ -314,9 +352,15 @@ class CompanionStore:
                 if record is not None
             }
         recovered = any(phone_id not in disk_phone_ids for phone_id in before)
-        self._sync_all_to_registry()
+        learned = set(self.phones) != before_ids
         self._loaded_from_disk = True
-        if migrated or recovered:
+        self._reload_marker = marker
+        # Project into the device registry only when this reload actually
+        # learned something. The writer already synced its own claim, so an
+        # unchanged file has nothing new to publish -- and re-publishing it on
+        # every authenticated request is what pinned a CPU core.
+        if migrated or recovered or learned:
+            self._sync_all_to_registry()
             self.save()
 
     @staticmethod
@@ -391,6 +435,7 @@ class CompanionStore:
                 os.fsync(handle.fileno())
             _replace_with_retry(temporary_name, self.path)
             temporary_name = ""
+            self._remember_marker()
         except OSError as error:
             raise CompanionStoreError(
                 "cannot save companion store %s: %s" % (self.path, error)

@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from codexbridge.companion.store import (
     CompanionStoreError,
@@ -70,6 +71,97 @@ class CompanionStoreTests(unittest.TestCase):
         loaded = CompanionStore(self.path)
         loaded.load()
         self.assertEqual(loaded.phones[phone_id].capabilities(), {'status', 'tasks'})
+
+    def test_reload_publishes_a_phone_learned_from_another_instance(self) -> None:
+        """Skipping no-op reloads must still project a newly learned phone.
+
+        The registry projection is what the management page reads. A second
+        instance pairing a phone has to show up here, so the reload that first
+        learns about it must still write it through.
+        """
+        stale = CompanionStore(self.path, registry=self.registry)
+        stale.load()
+        other = CompanionStore(self.path, registry=DeviceRegistry(self.devices_path))
+        other.load()
+        claimed = other.claim(other.pairing_code()["code"], "新手机")
+        assert claimed is not None
+        self.assertIsNone(self.registry.get(claimed["phone_id"]))
+
+        # Any authenticated request from the stale instance picks the phone up.
+        self.assertIsNotNone(stale.authorize(claimed["token"]))
+
+        record = self.registry.get(claimed["phone_id"])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.kind, "phone")
+
+    def test_repeated_snapshot_does_not_rewrite_the_device_registry(self) -> None:
+        """The management page polls snapshot(); it must not rewrite on a no-op."""
+        claimed = self.store.claim(self.store.pairing_code()["code"], "Pixel")
+        assert claimed is not None
+
+        with mock.patch.object(self.registry, "save", wraps=self.registry.save) as registry_save:
+            for _ in range(10):
+                self.store.snapshot()
+
+        self.assertEqual(registry_save.call_count, 0)
+
+    def test_repeated_authorize_does_not_rewrite_the_device_registry(self) -> None:
+        """An idle phone polling must not republish devices.json every request.
+
+        authorize() used to reload the store on every call, and that reload
+        re-projected every phone into the device registry -- a full
+        devices.json rewrite with fsync. A phone answering ten requests a
+        second therefore wrote the registry twenty times a second and pinned
+        a whole CPU core.
+        """
+        claimed = self.store.claim(self.store.pairing_code()["code"], "Pixel")
+        assert claimed is not None
+        token = claimed["token"]
+
+        with mock.patch.object(
+            self.registry, "save", wraps=self.registry.save
+        ) as registry_save:
+            for _ in range(25):
+                self.assertIsNotNone(self.store.authorize(token))
+                self.store.touch(claimed["phone_id"])
+
+        self.assertEqual(registry_save.call_count, 0)
+
+    def test_repeated_authorize_does_not_reread_the_companion_file(self) -> None:
+        """An unchanged store is served from memory, not reparsed from disk."""
+        claimed = self.store.claim(self.store.pairing_code()["code"], "Pixel")
+        assert claimed is not None
+        token = claimed["token"]
+
+        reads = 0
+        original = Path.read_text
+
+        def counting_read_text(self_path, *args, **kwargs):
+            nonlocal reads
+            if self_path == self.path:
+                reads += 1
+            return original(self_path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", counting_read_text):
+            for _ in range(25):
+                self.assertIsNotNone(self.store.authorize(token))
+
+        self.assertEqual(reads, 0)
+
+    def test_authorize_still_sees_a_phone_paired_by_another_instance(self) -> None:
+        """Skipping unchanged reloads must not hide a concurrent writer."""
+        stale = CompanionStore(self.path)
+        stale.load()
+        fresh = CompanionStore(self.path)
+        fresh.load()
+        claimed = fresh.claim(fresh.pairing_code()["code"], "新手机")
+        assert claimed is not None
+
+        authorized = stale.authorize(claimed["token"])
+
+        self.assertIsNotNone(authorized)
+        self.assertEqual(authorized.phone_id, claimed["phone_id"])
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
