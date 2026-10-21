@@ -1280,7 +1280,7 @@ PC -> 设备: {"type":"read_state","message_id":"task:t1","read_by":["a1"],"read
 | POST | `/api/companion/pair` | 无需鉴权，使用配对码换取令牌 |
 | GET | `/api/companion/status` | 额度、当前任务与待处理审批 |
 | GET | `/api/companion/threads` | 线程列表，支持 `limit`、`search`、`cursor` |
-| POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model` |
+| POST | `/api/companion/threads` | 新建线程，可带 `cwd`、`model`；桌面接管暂未完成时返回 `desktop_handoff: "pending"` |
 | GET | `/api/companion/threads/<id>` | 线程详情与归一化消息 |
 | POST | `/api/companion/threads/<id>/read` | 标记该线程当前完成状态为已读，返回最新 `status` |
 | POST | `/api/companion/threads/<id>/messages` | 发送消息，可带 `model`、`effort`；`mode=steer` 表示追加到进行中的任务；响应中的 `continued_as`（非空时）指向实际承接历史的线程 id |
@@ -1329,8 +1329,13 @@ Windows 没有可用的桌面共享 App Server socket，Bridge 因此对桌面�
 或 `desktop_handoff_pending`，不会静默退回独立 App Server 执行，避免同一 thread
 被两个 writer 同时写入。
 
-手机新建任务先用 `threadSource=user` 创建，并用中性占位名 `新任务` 提交 rollout，
-立即释放 writer，再让桌面打开 `codex://threads/<id>`，确认桌面成为 owner 后才返回成功。
+手机新建任务先用 `threadSource=user` 创建，并在共享 app-server 路径立即用中性占位名
+`新任务` 执行 `thread/name/set` 提交 rollout，随后释放 writer、让桌面打开
+`codex://threads/<id>` 并尝试确认桌面 owner。若桌面在 10 秒内没有完成 owner discovery，
+或 deep link 无法打开，HTTP 仍返回已经创建成功的线程并附带
+`desktop_handoff: "pending"`；首轮 turn 继续走共享 app-server，rollout 生成后桌面即可发现。
+只有 `thread/start` 或返回线程 ID 本身失败时才返回 503。pending 状态不会保留
+`_desktop_required`，避免后续 turn 永远等待不存在的桌面 owner。
 首条用户消息成功后，Bridge 会生成简洁标题，通过 `thread/name/set` 持久化，
 发布 `thread_name` 与 `threads_changed`，并使桌面的 `['tasks']`、
 `['list-pinned-threads']`、`['archived-threads','local']` 查询失效。这样桌面端会

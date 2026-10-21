@@ -2605,7 +2605,21 @@ class CompanionService:
                 # The desktop cannot hydrate a task while another writer owns it.
                 creator.close()
         else:
-            result = self._ensure_client().request("thread/start", params)
+            creator = self._ensure_client()
+            result = creator.request("thread/start", params)
+            thread = result.get("thread") if isinstance(result, dict) else None
+            thread_id = str((thread or {}).get("id") or "")
+            if thread_id:
+                # The shared app-server creates an empty row with no rollout
+                # file. Naming it commits the session file so Codex Desktop can
+                # hydrate and open the thread before the first turn exists.
+                try:
+                    creator.request(
+                        'thread/name/set',
+                        {'threadId': thread_id, 'name': _BRIDGE_PENDING_TITLE},
+                    )
+                except AppServerError as error:
+                    self._note(f'new_thread_name_not_persisted: {error}')
         thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             raise AppServerError("App Server 未返回新任务")
@@ -2620,6 +2634,7 @@ class CompanionService:
             with self._resumed_lock:
                 self._locked_threads.discard(thread_id)
             self._thread_note(thread_id)
+        handoff_pending = False
         if self._desktop is not None or self._client_factory is None:
             self._desktop_required.add(thread_id)
             owner = None
@@ -2627,23 +2642,32 @@ class CompanionService:
                 self._desktop.open_thread(thread_id)
             except (OSError, ValueError, RuntimeError) as error:
                 self._note(f'Desktop task registration unavailable: {error}')
-                raise AppServerError('desktop_handoff_unavailable') from error
-            # Opening a persisted task makes the desktop hydrate and own it.
-            # Do not claim success or accept a first reply before ownership is
-            # actually visible, otherwise the new empty task is not usable.
-            for _ in range(40):
-                try:
-                    owner = self._desktop_owner(thread_id)
-                except (RuntimeError, OSError):
-                    owner = None
-                if owner:
-                    break
-                if self._stop.wait(0.25):
-                    break
-            if not owner:
-                raise DesktopIpcError('desktop_handoff_pending')
+                handoff_pending = True
+            if not handoff_pending:
+                # Opening a persisted task makes the desktop hydrate and own it.
+                # Wait briefly for ownership, but never turn a successfully
+                # created thread into an HTTP failure just because the desktop
+                # is slow or offline. The first app-server turn will generate
+                # the rollout and make it discoverable later.
+                for _ in range(40):
+                    try:
+                        owner = self._desktop_owner(thread_id)
+                    except (RuntimeError, OSError):
+                        owner = None
+                    if owner:
+                        break
+                    if self._stop.wait(0.25):
+                        break
+                if not owner:
+                    self._note('desktop_handoff_pending')
+                    handoff_pending = True
+            if handoff_pending:
+                self._desktop_required.discard(thread_id)
         self.publish({'type': 'threads_changed', 'thread_id': thread_id})
-        return {"thread": self._summary(thread)}
+        response = {"thread": self._summary(thread)}
+        if handoff_pending:
+            response["desktop_handoff"] = "pending"
+        return response
 
     def mark_message_read(
         self,

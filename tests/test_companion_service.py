@@ -511,27 +511,73 @@ class CompanionServiceTests(unittest.TestCase):
         self.service.start_thread()
         desktop.open_thread.assert_called_once_with('t1')
 
-    def test_new_thread_requires_desktop_ownership_before_success(self):
+    def test_new_thread_pending_handoff_returns_the_created_thread(self):
         from unittest.mock import Mock
-        from codexbridge.codex.desktop_ipc import DesktopIpcError
         desktop = Mock()
         desktop.find_thread_owner.return_value = None
         self.service._desktop = desktop
-        creator = FakeClient()
-        creator.responses['thread/start'] = {'thread': thread_row()}
-        creator.responses['thread/name/set'] = {}
-        self.service._creation_client_factory = lambda: creator
-        with self.assertRaises(DesktopIpcError):
-            self.service.start_thread()
-        self.assertIn('t1', self.service._desktop_required)
+        self.client.responses['thread/start'] = {'thread': thread_row()}
+        self.client.responses['thread/name/set'] = {}
+
+        result = self.service.start_thread()
+
+        self.assertEqual(result['thread']['thread_id'], 't1')
+        self.assertEqual(result['desktop_handoff'], 'pending')
+        self.assertNotIn('t1', self.service._desktop_required)
+        self.assertIn(
+            ('thread/name/set', {'threadId': 't1', 'name': '新任务'}),
+            self.client.requests,
+        )
+
+    def test_shared_client_names_new_thread_before_handoff(self):
+        from unittest.mock import Mock
+        desktop = Mock()
+        desktop.find_thread_owner.return_value = 'owner'
+        self.service._desktop = desktop
+        self.client.responses['thread/start'] = {'thread': thread_row()}
+        self.client.responses['thread/name/set'] = {}
+
+        self.service.start_thread()
+
         self.assertEqual(
-            creator.requests,
+            self.client.requests[:2],
             [
                 ('thread/start', {'threadSource': 'user'}),
                 ('thread/name/set', {'threadId': 't1', 'name': '新任务'}),
             ],
         )
-        self.assertEqual(self.client.requests, [])
+
+    def test_desktop_open_failure_keeps_the_created_thread_usable(self):
+        from unittest.mock import Mock
+        desktop = Mock()
+        desktop.open_thread.side_effect = OSError('desktop unavailable')
+        self.service._desktop = desktop
+        self.client.responses['thread/start'] = {'thread': thread_row()}
+        self.client.responses['thread/name/set'] = {}
+
+        result = self.service.start_thread()
+
+        self.assertEqual(result['thread']['thread_id'], 't1')
+        self.assertEqual(result['desktop_handoff'], 'pending')
+        self.assertNotIn('t1', self.service._desktop_required)
+
+    def test_pending_handoff_thread_accepts_its_first_app_server_turn(self):
+        from unittest.mock import Mock
+        desktop = Mock()
+        desktop.find_thread_owner.return_value = None
+        self.service._desktop = desktop
+        self.client.responses['thread/start'] = {'thread': thread_row()}
+        self.client.responses['thread/name/set'] = {}
+        self.client.responses['turn/start'] = {
+            'turn': {'id': 'turn-pending', 'status': 'inProgress'}
+        }
+
+        created = self.service.start_thread()
+        sent = self.service.start_turn('t1', '第一条消息')
+
+        self.assertEqual(created['desktop_handoff'], 'pending')
+        self.assertEqual(sent['turn_id'], 'turn-pending')
+        self.assertTrue(any(method == 'turn/start' for method, _ in self.client.requests))
 
     def test_new_thread_does_not_use_the_old_placeholder_name(self):
         from unittest.mock import Mock
