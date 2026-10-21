@@ -26,6 +26,7 @@ from codexbridge.devices.manager import DeviceManager
 from codexbridge.desktop_read import sync_desktop_read_state
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.devices.session import CbdpDeviceSession
+from codexbridge.devices.home_counters import HomeCounterSender
 from codexbridge.hub import BridgeHub
 from codexbridge.messages_store import MessageStore
 from codexbridge.cbdp.events import EventSpine
@@ -571,6 +572,9 @@ def main(argv: list[str] | None = None) -> int:
         codex_state.record_snapshot()
         for record in records:
             hub.publish(record)
+        # A completion/failure/queue change must reach a home screen without
+        # waiting for the periodic UDP beat.
+        home_counters.notify()
 
     def open_logs() -> None:
         os.startfile(data_dir)
@@ -623,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
             emit(f"CodexBridge companion API 启动失败：{error}", flush=True)
     stop = threading.Event()
     codex_stop = threading.Event()
+    home_counters = HomeCounterSender(hub.counts)
+    home_counters.start()
     codex_thread = threading.Thread(
         target=run_codex_collector,
         kwargs={
@@ -658,6 +664,7 @@ def main(argv: list[str] | None = None) -> int:
         # wait for the next broadcast round.
         print(f"CodexBridge: {result.device_id} announced itself at {result.host}")
         manager.sync([result])
+        home_counters.register(result.device_id, result.host)
 
     presence = PresenceListener(on_presence, logger=print)
     presence.start()
@@ -697,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
         # shutdown mid-request leaves devices with a half-delivered catalog.
         hub.wait_idle(timeout=2.0)
         presence.stop()
+        home_counters.stop()
         manager.stop()
         speech.close()
         companion_discovery.stop()

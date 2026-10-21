@@ -138,6 +138,12 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   `completedAt` 的 turn 视为活跃时，必须限制在 `LOG_ACTIVE_SECONDS`（150 秒）
   陈旧窗口内。超过窗口的 turn 视为已死亡并释放队列，否则一次被第二个 writer
   杀死的 turn 会让待发送消息永久卡住，直到用户删除队列项或重启 Bridge。
+- **2026-10-21 后续修正：** 新增 UDP 首页计数旁路
+  `HOME_COUNTERS(0x1E)`。Bridge 在 UDP 8764 收到设备 presence 后，每 1~2 秒向该
+  设备单播一次 `running_count(0x00BC)` / `completed_unread_count(0x00BD)` /
+  `failed_unread_count(0x00BE)`，计数变化时立即补发；只单播，不广播。这是新增
+  旁路，`system.codex_state(0x0704)`、summary 订阅和 TCP 任务流程保持不变，设备
+  首页因此可以不开 CBDP TCP 会话。
 
 ## 1. 范围与角色
 

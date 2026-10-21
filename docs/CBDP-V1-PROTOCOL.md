@@ -543,8 +543,9 @@ idem = first_16_bytes(SHA-256(
 | `0x1B` | `FRAGMENT` | 双向 | 传输层通用分片 |
 | `0x1C` | `DISCOVERY` | 双向 | UDP 发现请求 |
 | `0x1D` | `DISCOVERY_REPLY` | 双向 | UDP 发现响应 |
+| `0x1E` | `HOME_COUNTERS` | Bridge 到设备 | UDP 单播的首页聚合计数 |
 
-`0x1E` 和 `0x1F` 保留。所有未分配消息类型都不得被当成已知消息解析。
+`0x1F` 保留。所有未分配消息类型都不得被当成已知消息解析。
 
 ### 7.2 消息公共字段
 
@@ -4559,6 +4560,27 @@ Codex 与 Bridge 曾因双 writer 竞争产生一个被杀死、但没有 `compl
   turn 必须视为已死亡，释放该线程的队列，继续派发待发送项。
 - 队列不得因为单条失败项或陈旧 turn 永久暂停；新增消息、删除失败项、真实 turn
   完成或陈旧窗口到期都应解除对应线程的阻塞。
+
+### 19.15 首页计数的 UDP 旁路（2026-10-21 后续修正）
+
+AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流与 CBDP 控制连接会
+耗尽 ESP32-C3 的 DMA 内存（每条连接各自预留 `TCP_SND_BUF + TCP_WND`）。首页只需要
+三个聚合数字，因此 Bridge 增加一条轻量 UDP 旁路：
+
+- 新增消息类型 `HOME_COUNTERS(0x1E)`。Bridge 在 UDP 8764 上收到设备 presence 后，
+  向该设备单播该帧；只单播，不广播。
+- `topic_id` 填 `system.thread_summaries(0x50000003)` 作为标记，`qos = state`、
+  flag 带 `EVENT`。header TLV 为 `running_count(0x00BC)`、
+  `completed_unread_count(0x00BD)`、`failed_unread_count(0x00BE)`，全部使用既有
+  tag，不新增字段。整个报文必须小于一个 MTU。
+- 节奏为 1~2 秒一次；计数发生变化时立即补发一次。目标只来自主动 presence 的设备，
+  设备离开后不再接收。
+- 这是**新增旁路**：`system.codex_state(0x0704)`、summary 订阅、握手和命令流程
+  全部保持不变。设备可以据此让首页完全不开 CBDP TCP 会话，进入 Codex 页时再照常
+  握手订阅。
+- 双路径到达时由设备侧按"取较大值 + 落地窗口"去重；Bridge 不改变 TCP 计数的语义。
+- 验收要求：首页无 TCP 会话时三个数字仍能 1~2 秒内更新；进入 Codex 后任务流程
+  无回归；单包不触发 ESP32-C3 的 DMA 申请失败。
 
 | 草稿 | `draft` | `draft.update/delete` | `draft.updated`, `draft.deleted`, `draft.expired` | `0x0168..0x016C` | full | `[本轮实现]` |
 | 批处理 | `batch` | `batch.execute` | `command.*`, 子操作对应事件 | `0x016D..0x016F` | full | `[本轮不实现]` |
