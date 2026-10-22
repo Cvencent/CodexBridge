@@ -47,6 +47,20 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - **2026-10-21 后续修正：** 手机 Companion 的 SSE/WebSocket 心跳会刷新
   `last_seen`。管理接口按 120 秒窗口把最近活跃的 `companion_http` 手机视为在线，
   不再只依赖设备 TCP 会话表。
+- **2026-10-22 后续修正：** 同一手机设备的 CBDP SSE 与 WebSocket 共用一条
+  `CbdpHttpSession`。单条 SSE 或 WebSocket 断开时只注销该网络流，不再连带关闭
+  共享会话；会话改由 `last_seen` 超过 120 秒 TTL 后回收，或在 Companion 服务
+  停止时统一关闭。否则手机同时保持两条传输时，任一条断开都会把另一条一并打断，
+  造成高频重连。
+- **2026-10-22 后续修正：** CBDP 长连接按设备限额限流。同一设备合计
+  最多 6 条长流（SSE 2、WebSocket 2、Companion events 2），
+  全服务最多 24 条。超限时 Bridge 直接返回 HTTP 429，
+  错误码 `too_many_streams` 或 `server_stream_limit`，并带
+  `Retry-After: 20` 与 `Connection: close`。设备收到后应停止并发新
+  流、按`Retry-After`退避后复用已有单条长连接，而不是无限
+  重连。Bridge 侧为每条长流占用一个阻塞线程，若不设上限，单
+  台异常设备即可堆积数百条连接并耗尽电脑响应能力。已断开的
+  长流会在心跳间隔内释放占用的名额。
 - **2026-10-22 后续修正：** `system.codex_state(0x0704)` 和 UDP
   `HOME_COUNTERS(0x1E)` 的 `running` 统一按线程去重统计。collector 扫描当前
   `thread/list` 单页最多 20 条线程，`task` 与 `status` 两类 live 记录都参与计算，

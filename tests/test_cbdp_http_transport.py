@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import os
+import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -279,6 +283,154 @@ class CbdpHttpTransportTests(unittest.TestCase):
         self.assertTrue(response.getheader("Content-Type").startswith("text/event-stream"))
         self.assertEqual(response.getheader("Connection"), "close")
         connection.close()
+
+    def test_sse_heartbeat_does_not_break_the_stream(self) -> None:
+        from unittest.mock import patch
+        from codexbridge.companion import api as companion_api
+
+        paired = self.pair()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(
+            "GET",
+            "/cbdp/v1/events",
+            headers={"Authorization": "Bearer " + paired["token"]},
+        )
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        with patch.object(companion_api, "SSE_HEARTBEAT_SECONDS", 0.1), patch.object(
+            companion_api, "SSE_WAIT_SLICE_SECONDS", 0.05
+        ):
+            line = response.fp.readline()
+        self.assertEqual(line, b": ping\n")
+        self.assertEqual(response.fp.readline(), b"\n")
+        session = self.broker.get(paired["phone_id"])
+        self.assertIsNotNone(session)
+        self.assertFalse(session.closed.is_set())
+        connection.close()
+
+    def test_closing_one_cbdp_stream_does_not_kill_the_shared_session(self) -> None:
+        # The phone may hold SSE and WebSocket streams at the same time. Both
+        # share one CbdpHttpSession keyed by device_id, so one stream ending
+        # must not close the session underneath the other stream.
+        from unittest.mock import patch
+        from codexbridge.companion import api as companion_api
+
+        paired = self.pair()
+        token = paired["token"]
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        ws = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        ws.sendall(
+            (
+                "GET /cbdp/v1/ws HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{self.port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                "\r\n"
+            ).encode("ascii")
+        )
+        handshake = b""
+        while b"\r\n\r\n" not in handshake:
+            handshake += ws.recv(4096)
+        self.assertIn(b"101 Switching Protocols", handshake)
+
+        sse = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        sse.request(
+            "GET",
+            "/cbdp/v1/events",
+            headers={"Authorization": "Bearer " + token},
+        )
+        response = sse.getresponse()
+        self.assertEqual(response.status, 200)
+
+        session = self.broker.get(paired["phone_id"])
+        self.assertIsNotNone(session)
+        assert session is not None
+        self.assertFalse(session.closed.is_set())
+
+        with patch.object(companion_api, "SSE_HEARTBEAT_SECONDS", 0.1), patch.object(
+            companion_api, "SSE_WAIT_SLICE_SECONDS", 0.05
+        ):
+            # Reading a heartbeat proves this SSE stream is live on the same
+            # shared session the WebSocket is using.
+            self.assertEqual(response.fp.readline(), b": ping\n")
+            self.assertEqual(response.fp.readline(), b"\n")
+
+            ws.sendall(encode_ws_frame(b"", opcode=0x8))
+            deadline = time.monotonic() + 3.0
+            while len(self.api._open_streams) > 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertLessEqual(len(self.api._open_streams), 1)
+            # Give a buggy finally block time to close the shared session.
+            time.sleep(0.2)
+            self.assertFalse(
+                session.closed.is_set(),
+                "closing the WebSocket stream must not drop the shared CBDP session",
+            )
+            # The SSE stream must still receive heartbeats after the WS close.
+            self.assertEqual(response.fp.readline(), b": ping\n")
+            self.assertEqual(response.fp.readline(), b"\n")
+
+        ws.close()
+        sse.close()
+
+    def test_per_device_cbdp_stream_limit_rejects_extra_streams(self) -> None:
+        # One phone was caught holding hundreds of concurrent SSE streams,
+        # which piles up one blocking server thread per stream. Reject the
+        # excess with an explicit, retry-able error instead of accepting it.
+        from unittest.mock import patch
+        from codexbridge.companion import api as companion_api
+
+        paired = self.pair()
+        token = paired["token"]
+        headers = {"Authorization": "Bearer " + token}
+
+        with patch.object(companion_api, "MAX_CBDP_SSE_PER_DEVICE", 1), patch.object(
+            companion_api, "MAX_CBDP_STREAMS_PER_DEVICE", 2
+        ), patch.object(companion_api, "MAX_CBDP_STREAMS_TOTAL", 2):
+            first = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            first.request("GET", "/cbdp/v1/events", headers=headers)
+            first_response = first.getresponse()
+            self.assertEqual(first_response.status, 200)
+            self.assertEqual(self.api.device_stream_count(paired["phone_id"]), 1)
+
+            second = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            second.request("GET", "/cbdp/v1/events", headers=headers)
+            second_response = second.getresponse()
+            payload = json.loads(second_response.read().decode())
+            self.assertEqual(second_response.status, 429, payload)
+            self.assertEqual(payload["error"], "too_many_streams")
+            self.assertTrue(second_response.getheader("Retry-After"))
+            second.close()
+            # The rejected stream must not consume a slot.
+            self.assertEqual(self.api.device_stream_count(paired["phone_id"]), 1)
+
+            # Closing the SSE client must release its slot promptly instead of
+            # waiting for the next heartbeat write to fail (up to 15 seconds).
+            # HTTPConnection.close() only drops the connection object: for a
+            # streamed response the socket belongs to the response, so the
+            # server never sees a FIN until the response itself is closed.
+            first_response.close()
+            first.close()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self.api.device_stream_count(
+                paired["phone_id"]
+            ) > 0:
+                time.sleep(0.05)
+            self.assertEqual(
+                self.api.device_stream_count(paired["phone_id"]),
+                0,
+                "an abandoned SSE stream must release its slot promptly",
+            )
+
+            third = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            third.request("GET", "/cbdp/v1/events", headers=headers)
+            third_response = third.getresponse()
+            self.assertEqual(third_response.status, 200)
+            third.close()
 
     def test_stopping_service_closes_cbdp_sessions(self) -> None:
         paired = self.pair()

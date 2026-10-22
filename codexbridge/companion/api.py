@@ -49,6 +49,19 @@ PAIR_WINDOW_SECONDS = 600
 PAIR_MAX_PER_WINDOW = 20
 FALLBACK_PORT_ATTEMPTS = 20
 
+# A buggy or over-eager device can open far more event streams than it needs.
+# Each stream owns a blocking server thread, so a single phone holding
+# hundreds of SSE connections is enough to starve the whole process and make
+# the desktop feel like it froze. Cap the fan-out per device and globally, and
+# answer the excess with an explicit 429 so the device can back off instead of
+# silently queueing endless work.
+MAX_CBDP_STREAMS_PER_DEVICE = 6
+MAX_CBDP_SSE_PER_DEVICE = 2
+MAX_CBDP_WS_PER_DEVICE = 2
+MAX_CBDP_EVENTS_PER_DEVICE = 2
+MAX_CBDP_STREAMS_TOTAL = 24
+STREAM_REJECT_RETRY_AFTER_SECONDS = 20
+
 
 class CompanionApi:
     """Threading HTTP server exposing Codex control to the local network."""
@@ -78,6 +91,8 @@ class CompanionApi:
         self._stream_stop = threading.Event()
         self._open_streams: set[socket.socket] = set()
         self._streams_lock = threading.Lock()
+        self._device_streams: dict[str, dict[str, int]] = {}
+        self._streams_total = 0
 
     @property
     def url(self) -> str:
@@ -181,6 +196,8 @@ class CompanionApi:
             with self._streams_lock:
                 streams = list(self._open_streams)
                 self._open_streams.clear()
+                self._device_streams.clear()
+                self._streams_total = 0
             for stream in streams:
                 try:
                     stream.shutdown(socket.SHUT_RDWR)
@@ -203,6 +220,54 @@ class CompanionApi:
     def unregister_stream(self, stream: socket.socket) -> None:
         with self._streams_lock:
             self._open_streams.discard(stream)
+
+    def open_device_stream(self, device_id: str, kind: str) -> str | None:
+        """Reserve a long-lived stream slot for one device.
+
+        Returns None on success, or an error code when the device already
+        holds as many streams as it is allowed. Every long-lived stream owns
+        one blocking server thread, so this is a hard resource guard rather
+        than a throttle: a single misbehaving device must not be able to turn
+        the whole bridge into hundreds of threads.
+        """
+        per_kind = {
+            "sse": MAX_CBDP_SSE_PER_DEVICE,
+            "ws": MAX_CBDP_WS_PER_DEVICE,
+            "events": MAX_CBDP_EVENTS_PER_DEVICE,
+        }.get(kind, 1)
+        with self._streams_lock:
+            if self._streams_total >= MAX_CBDP_STREAMS_TOTAL:
+                return "server_stream_limit"
+            counts = self._device_streams.setdefault(device_id, {})
+            if sum(counts.values()) >= MAX_CBDP_STREAMS_PER_DEVICE:
+                return "too_many_streams"
+            if counts.get(kind, 0) >= per_kind:
+                return "too_many_streams"
+            counts[kind] = counts.get(kind, 0) + 1
+            self._streams_total += 1
+            return None
+
+    def close_device_stream(self, device_id: str, kind: str) -> None:
+        with self._streams_lock:
+            counts = self._device_streams.get(device_id)
+            if not counts:
+                return
+            if counts.get(kind, 0) > 0:
+                counts[kind] -= 1
+                self._streams_total = max(0, self._streams_total - 1)
+            if not any(value > 0 for value in counts.values()):
+                self._device_streams.pop(device_id, None)
+
+    def device_stream_count(self, device_id: str, kind: str | None = None) -> int:
+        with self._streams_lock:
+            counts = self._device_streams.get(device_id) or {}
+            if kind is None:
+                return sum(counts.values())
+            return counts.get(kind, 0)
+
+    def stream_total(self) -> int:
+        with self._streams_lock:
+            return self._streams_total
 
     def log(self, message: str) -> None:
         if self._logger is not None:
@@ -253,6 +318,30 @@ class CompanionApi:
             return len(window) <= PAIR_MAX_PER_WINDOW
 
 
+def _peer_gone(connection: socket.socket) -> bool:
+    """Best-effort check for a peer that vanished without a clean close.
+
+    Every long-lived stream keeps one blocking server thread alive, so a
+    device that drops its socket silently must be noticed between heartbeats.
+    A readable socket whose peek returns no bytes means the peer sent FIN (or
+    the connection was reset); a not-yet-readable socket means the client is
+    still there, including the ordinary idle case.
+    """
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not readable:
+        return False
+    try:
+        probe = connection.recv(4096, socket.MSG_PEEK)
+    except (BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True
+    return not probe
+
+
 def local_addresses() -> list[str]:
     addresses: list[str] = []
     try:
@@ -293,12 +382,19 @@ class _CompanionHandler(BaseHTTPRequestHandler):
     def app(self) -> CompanionApi:
         return self.server.app
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         # No "Connection: close": HTTP/1.1 keep-alive lets the client reuse
         # this socket for its next request.
         self.end_headers()
@@ -307,11 +403,17 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
-    def _error(self, status: int, code: str, message: str = "") -> None:
+    def _error(
+        self,
+        status: int,
+        code: str,
+        message: str = "",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         payload: dict[str, Any] = {"ok": False, "error": code}
         if message:
             payload["message"] = message
-        self._send_json(status, payload)
+        self._send_json(status, payload, extra_headers=extra_headers)
 
     def _query(self) -> dict[str, list[str]]:
         return parse_qs(urlparse(self.path).query)
@@ -720,6 +822,19 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         session = self._cbdp_session()
         if session is None:
             return
+        reject = self.app.open_device_stream(session.device_id, "sse")
+        if reject is not None:
+            self._error(
+                429,
+                reject,
+                "同一设备的并发事件流过多，请复用现有连接",
+                {
+                    "Retry-After": str(STREAM_REJECT_RETRY_AFTER_SECONDS),
+                    "Connection": "close",
+                },
+            )
+            self.close_connection = True
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -738,11 +853,17 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                         # An SSE stream can stay open for an hour. Its periodic
                         # ping is the only regular proof that the phone is
                         # still here, so refresh presence with the same beat.
-                        if current is not None:
-                            self.app.store.touch(current.phone_id)
+                        session.touch()
+                        self.app.store.touch(session.device_id)
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
                         last_heartbeat = time.monotonic()
+                    elif _peer_gone(self.connection):
+                        # The peer walked away without a clean FIN. Release the
+                        # slot now instead of idling until the next heartbeat
+                        # write fails, so an abandoned stream cannot squat on
+                        # the per-device budget.
+                        break
                     continue
                 if raw is None:
                     break
@@ -755,8 +876,12 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
             pass
         finally:
+            # SSE and WebSocket streams for one phone share a single
+            # CbdpHttpSession. Ending one stream must not close the session
+            # underneath the other stream; the broker TTL and close_all()
+            # own session teardown.
             self.app.unregister_stream(self.connection)
-            self.app.cbdp_broker.drop(session.device_id) if self.app.cbdp_broker else None
+            self.app.close_device_stream(session.device_id, "sse")
 
     def _cbdp_websocket(self, query) -> None:
         upgrade = (self.headers.get("Upgrade") or "").lower()
@@ -766,6 +891,19 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             return
         session = self._cbdp_session()
         if session is None:
+            return
+        reject = self.app.open_device_stream(session.device_id, "ws")
+        if reject is not None:
+            self._error(
+                429,
+                reject,
+                "同一设备的并发 WebSocket 过多，请复用现有连接",
+                {
+                    "Retry-After": str(STREAM_REJECT_RETRY_AFTER_SECONDS),
+                    "Connection": "close",
+                },
+            )
+            self.close_connection = True
             return
         self.send_response(101)
         self.send_header("Upgrade", "websocket")
@@ -824,11 +962,29 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
             pass
         finally:
+            # SSE and WebSocket streams for one phone share a single
+            # CbdpHttpSession. Ending one stream must not close the session
+            # underneath the other stream; the broker TTL and close_all()
+            # own session teardown.
             self.app.unregister_stream(self.connection)
-            if self.app.cbdp_broker is not None:
-                self.app.cbdp_broker.drop(session.device_id)
+            self.app.close_device_stream(session.device_id, "ws")
 
     def _stream_events(self, query: dict[str, list[str]], device=None) -> None:
+        device_id = getattr(device, "phone_id", "") if device is not None else ""
+        if device_id:
+            reject = self.app.open_device_stream(device_id, "events")
+            if reject is not None:
+                self._error(
+                    429,
+                    reject,
+                    "同一设备的并发事件流过多，请复用现有连接",
+                    {
+                        "Retry-After": str(STREAM_REJECT_RETRY_AFTER_SECONDS),
+                        "Connection": "close",
+                    },
+                )
+                self.close_connection = True
+                return
         thread_filter = (query.get("thread_id") or [""])[0]
         after = self.headers.get('Last-Event-ID') or (query.get('after') or [''])[0]
         target = self.app.service.subscribe(after)
@@ -863,11 +1019,13 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                     payload = target.get(timeout=SSE_WAIT_SLICE_SECONDS)
                 except queue.Empty:
                     if time.monotonic() - last_heartbeat >= SSE_HEARTBEAT_SECONDS:
-                        session.touch()
-                        self.app.store.touch(session.device_id)
+                        if current is not None:
+                            self.app.store.touch(current.phone_id)
                         self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
                         last_heartbeat = time.monotonic()
+                    elif device_id and _peer_gone(self.connection):
+                        break
                     continue
                 thread_id = str(payload.get("thread_id") or "")
                 if device is not None:
@@ -890,6 +1048,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
             pass
         finally:
             self.app.unregister_stream(self.connection)
+            if device_id:
+                self.app.close_device_stream(device_id, "events")
             self.app.service.unsubscribe(target)
 
 
