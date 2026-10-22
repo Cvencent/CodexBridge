@@ -322,6 +322,83 @@ class DesktopIpcTests(unittest.TestCase):
             worker.join(2)
         self.assertFalse(worker.is_alive())
 
+    def test_broadcast_prefix_classifier_only_keeps_consumed_methods(self):
+        """The reader must not spend json.loads on broadcasts it ignores.
+
+        json.loads holds the GIL for the whole payload, so parsing traffic we
+        never consume stalls every other thread in the process.
+        """
+
+        consumed = json.dumps({
+            'type': 'broadcast',
+            'method': 'thread-stream-state-changed',
+            'params': {'id': 'thread-1'},
+        }).encode()
+        ignored = json.dumps({
+            'type': 'broadcast',
+            'method': 'thread-stream-following-changed',
+            'params': {'id': 'thread-1'},
+        }).encode()
+        response = json.dumps({
+            'type': 'response', 'requestId': 'r', 'result': {},
+        }).encode()
+
+        self.assertFalse(DesktopIpcClient._is_unwanted_broadcast(consumed))
+        self.assertTrue(DesktopIpcClient._is_unwanted_broadcast(ignored))
+        self.assertFalse(DesktopIpcClient._is_unwanted_broadcast(response))
+
+    def test_oversized_state_broadcast_asks_for_resync_without_parsing(self):
+        connection, server = socket.socketpair()
+        client = DesktopIpcClient(timeout=1)
+        client.MAX_BROADCAST_BYTES = 1024
+
+        def read_exact(stream, size):
+            data = b''
+            while len(data) < size:
+                chunk = stream.recv(size - len(data))
+                if not chunk:
+                    raise EOFError
+                data += chunk
+            return data
+
+        def read_message(stream):
+            return json.loads(read_exact(stream, struct.unpack('<I', read_exact(stream, 4))[0]))
+
+        def send(stream, message):
+            body = json.dumps(message).encode()
+            stream.sendall(struct.pack('<I', len(body)) + body)
+
+        release = threading.Event()
+
+        def router():
+            with server:
+                init = read_message(server)
+                send(server, {'type': 'response', 'requestId': init['requestId'],
+                              'resultType': 'success', 'result': {'clientId': 'bridge-id'}})
+                request = read_message(server)
+                large = json.dumps({
+                    'type': 'broadcast', 'method': 'thread-stream-state-changed',
+                    'params': {'payload': 'x' * 4000},
+                }).encode()
+                server.sendall(struct.pack('<I', len(large)) + large)
+                send(server, {'type': 'response', 'requestId': request['requestId'],
+                              'resultType': 'success', 'handledByClientId': 'desktop-owner'})
+                release.wait(5.0)
+
+        worker = threading.Thread(target=router)
+        worker.start()
+        try:
+            with patch.object(client, '_connect_endpoint', return_value=connection):
+                client.start()
+            self.assertEqual(client.find_thread_owner('thread-1'), 'desktop-owner')
+            self.assertEqual(client.events.get_nowait(), {'type': 'resync_required'})
+            self.assertTrue(client.connection_status()['desktop_ipc_connected'])
+        finally:
+            release.set()
+            client.close()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+
     def test_frame_beyond_the_skip_limit_is_still_rejected(self):
         connection, server = socket.socketpair()
         client = DesktopIpcClient(timeout=1)

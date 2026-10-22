@@ -177,7 +177,18 @@ class DesktopIpcClient:
     # Desktop state frames carry the whole turn history of a thread, so a long
     # conversation can outgrow any fixed budget. Frames up to MAX_FRAME_BYTES
     # are parsed, larger ones are drained and answered with a resync request.
-    MAX_FRAME_BYTES = 64 * 1024 * 1024
+    #
+    # Parsing is done by json.loads, the C scanner, which holds the GIL for the
+    # whole payload. A multi-megabyte frame therefore freezes every other
+    # thread in this process, and because this pipe is shared with the Codex
+    # desktop the desktop's own writes back up behind it. The budget is kept
+    # small so one frame can never stall the UI for long.
+    MAX_FRAME_BYTES = 8 * 1024 * 1024
+    # Broadcasts are the bulk of the traffic and most describe state this
+    # reader does not consume. Oversized broadcasts are replaced with a resync
+    # request instead of being parsed in full.
+    MAX_BROADCAST_BYTES = 2 * 1024 * 1024
+    BROADCAST_PREFIX_BYTES = 512
     MAX_SKIPPED_FRAME_BYTES = 512 * 1024 * 1024
     DISCARD_CHUNK_BYTES = 1024 * 1024
 
@@ -276,6 +287,19 @@ class DesktopIpcClient:
             self._exact(count, expected_stream)
             remaining -= count
 
+    @staticmethod
+    def _is_unwanted_broadcast(payload: bytes) -> bool:
+        """True when this frame is a broadcast this reader never consumes.
+
+        Peeking at the head of the frame avoids a full ``json.loads`` for the
+        many broadcasts that describe state only the desktop cares about.
+        """
+
+        head = payload[:DesktopIpcClient.BROADCAST_PREFIX_BYTES]
+        if b'"broadcast"' not in head:
+            return False
+        return b'thread-stream-state-changed' not in head
+
     def _enqueue_event(self, message: dict[str, Any]) -> None:
         try:
             self.events.put_nowait(message)
@@ -304,7 +328,15 @@ class DesktopIpcClient:
                     self._discard(size, stream)
                     self._enqueue_event({'type': 'resync_required'})
                     continue
-                message = json.loads(self._exact(size, stream))
+                payload = self._exact(size, stream)
+                if self._is_unwanted_broadcast(payload):
+                    continue
+                if size > self.MAX_BROADCAST_BYTES and b'"broadcast"' in payload[:self.BROADCAST_PREFIX_BYTES]:
+                    # Too large to parse without stalling the shared GIL;
+                    # consumers reconcile from the authoritative list instead.
+                    self._enqueue_event({'type': 'resync_required'})
+                    continue
+                message = json.loads(payload)
                 if not isinstance(message, dict):
                     raise DesktopIpcError('Invalid IPC message')
                 kind = message.get('type')
