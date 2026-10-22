@@ -17,13 +17,28 @@ from tests.test_companion_service import FakeClient, thread_detail, thread_row
 
 
 class CompanionApiTests(unittest.TestCase):
-    def test_json_response_closes_the_http_connection(self):
+    def test_json_responses_keep_the_http_connection_alive(self):
+        """A polling phone must be able to reuse one socket for many requests.
+
+        Forcing ``Connection: close`` made every request open a fresh TCP
+        connection, and ThreadingHTTPServer answers each connection with a new
+        thread. A phone polling several endpoints per second therefore churned
+        dozens of threads and starved the desktop of responsiveness.
+        """
+
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
-        connection.request("GET", "/api/companion/ping")
-        response = connection.getresponse()
-        response.read()
-        self.assertEqual(response.getheader("Connection"), "close")
-        connection.close()
+        try:
+            for _ in range(3):
+                connection.request("GET", "/api/companion/ping")
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertNotEqual(
+                    (response.getheader("Connection") or "").lower(), "close"
+                )
+                self.assertIn(b"codexbridge-companion", body)
+        finally:
+            connection.close()
 
     def test_stopping_the_api_ends_an_open_sse_stream(self):
         code = self.store.pairing_code()["code"]

@@ -275,6 +275,13 @@ def local_addresses() -> list[str]:
 class _CompanionHandler(BaseHTTPRequestHandler):
     server_version = "CodexBridgeCompanion/1.0"
     protocol_version = "HTTP/1.1"
+    # Keep HTTP/1.1 connections alive so a polling phone reuses one socket
+    # instead of opening a new TCP connection for every request. The server is
+    # a ThreadingHTTPServer (one thread per connection), so forcing
+    # "Connection: close" turned each poll into a fresh thread; a phone polling
+    # several endpoints per second churned dozens of threads and starved the
+    # desktop of responsiveness. The idle timeout bounds thread lifetime.
+    timeout = 30
 
     def log_message(self, fmt: str, *args) -> None:
         try:
@@ -292,8 +299,8 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.close_connection = True
+        # No "Connection: close": HTTP/1.1 keep-alive lets the client reuse
+        # this socket for its next request.
         self.end_headers()
         try:
             self.wfile.write(body)
