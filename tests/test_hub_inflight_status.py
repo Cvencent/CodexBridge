@@ -90,6 +90,23 @@ class InFlightStatusTest(unittest.TestCase):
         snap = [m for m in self.pull() if m.get("type") == "codex_status_snapshot"]
         self.assertEqual(1, len(snap), "the device must be able to un-stick by asking")
 
+    def test_running_counts_each_thread_once_across_status_and_task_records(self):
+        statuses = ["working", "waiting_user", "queued", "starting", "working"]
+        for index, status in enumerate(statuses):
+            thread = f"t{index + 1}"
+            self.hub.publish(live_task(status=status, thread=thread))
+            self.hub.publish(record(
+                "task",
+                status,
+                f"任务{index + 1}",
+                message_id=f"task:{thread}",
+                thread=thread,
+            ))
+
+        # Five threads, ten live records (status + task for each). The count is
+        # per thread, not per record.
+        self.assertEqual(5, self.hub.counts()["running"])
+
     def test_snapshot_carries_the_renderable_fields(self):
         self.hub.publish(live_task(turn="b", action="Compiling the firmware"))
         snap = [m for m in self.pull() if m.get("type") == "codex_status_snapshot"]

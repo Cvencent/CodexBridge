@@ -21,6 +21,7 @@ from codexbridge.codex.rollout_activity import (
     status_from_activity,
 )
 from codexbridge.console import emit
+from codexbridge.messages_store import IN_FLIGHT_STATUSES
 
 DETACHED_ACTIVE_WINDOW_SECONDS = 24 * 60 * 60
 # A turn that stopped updating this long ago is over, not still running.
@@ -803,6 +804,8 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
         status = "waiting_user"
     elif turn_status in {"inprogress", "running", "active"}:
         status = "working"
+    elif turn_status in {"queued", "starting"}:
+        status = turn_status
     elif turn_status == "interrupted" and (
             (latest_turn.get("completedAt") is None and recently_updating) or detached_active):
         # A second read-only app-server sees a desktop-owned in-flight turn as
@@ -910,7 +913,9 @@ def thread_snapshot(thread: Any, now_epoch: int | None = None) -> dict[str, Any]
 class CodexAppServerSource:
     """Maintain a display-safe snapshot using only documented app-server calls."""
 
-    MAX_DISPLAY_TASKS = 6
+    # One app-server list page contains at most 20 threads. Inspect the whole
+    # page so every in-flight thread contributes to the running count.
+    MAX_DISPLAY_TASKS = 20
     SOURCE_KINDS = [
         "cli", "vscode", "exec", "appServer", "unknown",
     ]
@@ -1074,7 +1079,7 @@ class CodexAppServerSource:
             snapshot = thread_snapshot(thread)
             listed_id = str(selected.get("id") or thread.get("id") or "")
             if liveness.get(listed_id, "") == "working" and snapshot["status"] not in {
-                    "working", "waiting_user", "completed"}:
+                    *IN_FLIGHT_STATUSES, "completed"}:
                 # The desktop is still appending turn records to this rollout.
                 # A second app-server cannot see that and reports the live turn
                 # as interrupted, so the log outranks the detached reading.
@@ -1085,7 +1090,7 @@ class CodexAppServerSource:
                     snapshot["current_action"] = "正在处理任务"
             if fallback is None:
                 fallback = snapshot
-            if snapshot["status"] in {"working", "waiting_user"}:
+            if snapshot["status"] in IN_FLIGHT_STATUSES:
                 active.append(snapshot)
             elif snapshot["status"] in {"completed", "failed"}:
                 terminal.append(snapshot)

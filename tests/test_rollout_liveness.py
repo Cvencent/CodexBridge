@@ -265,6 +265,49 @@ class CollectorLivenessTests(unittest.TestCase):
 
 
 class RunningCountsTests(unittest.TestCase):
+    def test_all_listed_inflight_threads_contribute_to_running_count(self) -> None:
+        threads = [f"01a20000-0000-7000-8000-0000000000{i:02d}" for i in range(7)]
+        listed = [_listed(thread_id, 400 * (index + 1))
+                  for index, thread_id in enumerate(threads)]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for thread_id in threads:
+                _write_rollout(root, thread_id, [_event("task_started", -30)])
+            source = CollectorLivenessTests()._source(
+                listed,
+                RolloutActivity(root),
+                running_ids=tuple(threads),
+            )
+            source.refresh_thread()
+            snapshot = {
+                "generated_at_epoch": int(time.time()),
+                "account": {},
+                "task": source.task,
+                "tasks": source.tasks,
+                "result": source.result,
+            }
+            hub = BridgeHub(DeviceRegistry(Path(temp) / "devices.json"))
+            for item in records_from_snapshot(snapshot):
+                hub.publish(item)
+
+        self.assertEqual(7, len(source.tasks))
+        self.assertEqual(7, hub.counts()["running"])
+
+    def test_queued_turn_status_is_preserved(self) -> None:
+        snapshot = thread_snapshot({
+            "id": "queued-thread",
+            "name": "Queued",
+            "source": "vscode",
+            "recencyAt": int(time.time()),
+            "turns": [{
+                "id": "turn-q",
+                "status": "queued",
+                "startedAt": int(time.time()),
+                "items": [],
+            }],
+        })
+        self.assertEqual("queued", snapshot["status"])
+
     def test_a_live_task_record_counts_as_running(self) -> None:
         snapshot = {
             "generated_at_epoch": int(time.time()),

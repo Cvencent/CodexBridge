@@ -47,6 +47,12 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - **2026-10-21 后续修正：** 手机 Companion 的 SSE/WebSocket 心跳会刷新
   `last_seen`。管理接口按 120 秒窗口把最近活跃的 `companion_http` 手机视为在线，
   不再只依赖设备 TCP 会话表。
+- **2026-10-22 后续修正：** `system.codex_state(0x0704)` 和 UDP
+  `HOME_COUNTERS(0x1E)` 的 `running` 统一按线程去重统计。collector 扫描当前
+  `thread/list` 单页最多 20 条线程，`task` 与 `status` 两类 live 记录都参与计算，
+  同一 `thread_id` 只计一次；`working`、`waiting_user`、`queued`、`starting`
+  都属于运行中。这样多个并发 in-progress 会话不会因为显示候选窗口或重复记录而
+  少算/多算。
 - 首页聚合计数在 CBDP 上改用独立事件 `system.codex_state(0x0704)`，在
   `system.thread_summaries(0x50000003)` 的 `summary` scope、`state` QoS 下发，
   携带 `running_count(0x00BC)`、`completed_unread_count(0x00BD)`、

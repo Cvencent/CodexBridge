@@ -10,6 +10,8 @@ from typing import Any
 
 from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.messages_store import (
+    IN_FLIGHT_KINDS,
+    IN_FLIGHT_STATUSES,
     KIND_CAPABILITY,
     MessageRecord,
     MessageStore,
@@ -373,20 +375,22 @@ class BridgeHub:
         refreshing count as running, so a stopped collector cannot leave the
         badge lit forever.
         """
-        running = 0
+        running_threads: set[str] = set()
         completed_unread = 0
         failed_unread = 0
         now = time.time()
         with self._lock:
             records = self.store.records()
         for record in records:
-            if record.kind == "task":
+            if record.kind in IN_FLIGHT_KINDS:
                 if (
-                    record.status in {"working", "waiting_user", "queued", "starting"}
+                    record.status in IN_FLIGHT_STATUSES
                     and is_in_flight(record)
                     and is_fresh(record, now)
                 ):
-                    running += 1
+                    identity = str(record.thread_id or record.message_id or "")
+                    if identity:
+                        running_threads.add(identity)
                 continue
             if record.kind != "result" or not self._record_is_unread(record):
                 continue
@@ -395,7 +399,7 @@ class BridgeHub:
             elif record.status == "completed":
                 completed_unread += 1
         return {
-            "running": running,
+            "running": len(running_threads),
             "completed_unread": completed_unread,
             "failed_unread": failed_unread,
             "done": completed_unread,
