@@ -572,6 +572,7 @@ class CompanionService:
             else Path.home() / ".codex" / "sessions"
         )
         self._log_cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
+        self._log_marker: dict[str, tuple[tuple[int, int] | None, tuple | None]] = {}
         self._log_cache_lock = threading.Lock()
         self._read_cache = ReadCache()
         self.attachments = AttachmentStore(self.data_dir)
@@ -1236,10 +1237,29 @@ class CompanionService:
         if cached is not None and now - cached[0] <= LOG_CACHE_SECONDS:
             return cached[1]
         path = self._find_rollout_log(key)
-        found = self._read_log_tail(path) if path is not None else None
+        marker = None
+        if path is not None:
+            try:
+                stat = path.stat()
+                marker = (int(stat.st_mtime_ns), int(stat.st_size))
+            except OSError:
+                marker = None
+        # A rollout that has not been appended to cannot answer differently.
+        # Re-reading its tail costs 128 KB plus a json.loads per lifecycle
+        # line, and the thread watcher asks about up to 80 rows every few
+        # seconds -- all of it while holding the GIL.
+        with self._log_cache_lock:
+            stamped = self._log_marker.get(key)
+        if marker is not None and stamped is not None and stamped[0] == marker:
+            found = stamped[1]
+        else:
+            found = self._read_log_tail(path) if path is not None else None
+            with self._log_cache_lock:
+                self._log_marker[key] = (marker, found)
         with self._log_cache_lock:
             if len(self._log_cache) > 512:
                 self._log_cache.clear()
+                self._log_marker.clear()
             self._log_cache[key] = (now, found)
         return found
 
