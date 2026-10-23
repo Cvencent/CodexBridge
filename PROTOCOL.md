@@ -1447,6 +1447,11 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
   若线程不在桌面 `unreadByIdentity` 且桌面状态文件晚于最新终态结果，就推进共享
   已读水位并清除手机/ESP 的完成与失败角标。没有桌面记录且没有 activity 的纯手机
   线程仍不会被误清除。
+- **2026-10-23 安全修正：** UDP `HOME_COUNTERS(0x1E)` 的目标注册此前只检查
+  presence，未检查 `registration_state`，导致未批准设备也能读到主机 Codex
+  聚合计数。现在只有 `registration_state == approved` 且持有配对令牌的设备会被
+  注册为计数目标；批准后立即开始、拒绝或撤销后立即停止。pending / rejected /
+  revoked 设备不再收到任何 UDP 计数帧。
 
 因此设备端不需要为了“怕看到旧数据”而缩短轮询间隔：状态变化会在下一次校准
 （运行时 2 秒、空闲时 15 秒）内被推送，未变化时缓存读取是常数时间。

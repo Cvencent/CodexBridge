@@ -173,7 +173,7 @@ CodexBridge 只负责 Codex 桥接。Dotii 的 Bambu、显示、配网和烧录�
 ## 快速开始
 
 1. 从 [GitHub Releases](https://github.com/Cvencent/CodexBridge/releases/latest)
-   下载 `CodexBridge-Setup-2.1.35-win64.exe`。
+   下载 `CodexBridge-Setup-2.1.36-win64.exe`。
 2. 安装并启动 CodexBridge，托盘图标会常驻运行。
 3. 打开本地管理页：
 
@@ -228,7 +228,7 @@ pip install -e ".[tray]"
 构建 Windows 安装包和 portable ZIP：
 
 ```powershell
-./packaging/build_windows.ps1 -Version 2.1.35
+./packaging/build_windows.ps1 -Version 2.1.36
 ```
 
 使用内置离线语音识别时，将 Vosk 模型放到：
@@ -281,11 +281,11 @@ pip install -e ".[tray]"
 
 ## 版本
 
-当前版本：**2.1.35**
+当前版本：**2.1.36**
 
 发布产物：
 
-- `CodexBridge-Setup-2.1.35-win64.exe`
-- `CodexBridge-2.1.35-win64-portable.zip`
+- `CodexBridge-Setup-2.1.36-win64.exe`
+- `CodexBridge-2.1.36-win64-portable.zip`
 
 最新下载：[GitHub Releases](https://github.com/Cvencent/CodexBridge/releases/latest)

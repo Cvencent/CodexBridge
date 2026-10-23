@@ -1,6 +1,10 @@
 import unittest
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 from codexbridge import __main__ as bridge_main
+from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.cbdp.constants import (
     FLAG_EVENT,
     QOS_STATE,
@@ -118,6 +122,65 @@ class HomeCounterSenderTests(unittest.TestCase):
         self.sender.register("dev-1", "192.168.0.39")
         self.sender.push()
         self.sender.unregister("dev-1")
+
+        self.assertEqual(self.sender.push(), 0)
+
+
+class HomeCounterRegistrationGateTests(unittest.TestCase):
+    """The UDP counter channel must follow the pairing decision."""
+
+    def setUp(self) -> None:
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.registry = DeviceRegistry(Path(self.tmp.name) / "devices.json")
+        self.sent = []
+        self.sender = HomeCounterSender(
+            lambda: {"running": 2, "completed_unread": 0, "failed_unread": 0},
+            interval_seconds=2.0,
+            sendto=lambda frame, endpoint: self.sent.append((frame, endpoint)),
+        )
+
+    def test_pending_device_is_not_registered(self) -> None:
+        self.registry.upsert("dev-1", model="dotii", token=None)
+        record = self.registry.get("dev-1")
+        record.registration_state = "pending"
+        record.host = "192.168.0.39"
+
+        registered = bridge_main._sync_home_counter_target(
+            self.sender, self.registry, "dev-1", "192.168.0.39"
+        )
+
+        self.assertFalse(registered)
+        self.assertEqual(self.sender.push(), 0)
+
+    def test_approved_device_with_token_is_registered(self) -> None:
+        self.registry.upsert("dev-1", model="dotii", token="pairing-token")
+        record = self.registry.get("dev-1")
+        record.registration_state = "approved"
+        record.host = "192.168.0.39"
+
+        registered = bridge_main._sync_home_counter_target(
+            self.sender, self.registry, "dev-1", "192.168.0.39"
+        )
+
+        self.assertTrue(registered)
+        self.assertEqual(self.sender.push(), 1)
+
+    def test_revoking_drops_the_counter_target(self) -> None:
+        self.registry.upsert("dev-1", model="dotii", token="pairing-token")
+        record = self.registry.get("dev-1")
+        record.registration_state = "approved"
+        record.host = "192.168.0.39"
+        bridge_main._sync_home_counter_target(
+            self.sender, self.registry, "dev-1", "192.168.0.39"
+        )
+        self.assertEqual(self.sender.push(), 1)
+
+        record.registration_state = "revoked"
+        record.token = None
+        bridge_main._sync_home_counter_target(
+            self.sender, self.registry, "dev-1", "192.168.0.39"
+        )
 
         self.assertEqual(self.sender.push(), 0)
 

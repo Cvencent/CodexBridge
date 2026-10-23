@@ -280,6 +280,34 @@ def _codex_working_directory() -> Path:
     return Path.home()
 
 
+def _sync_home_counter_target(
+    home_counters: HomeCounterSender,
+    registry: DeviceRegistry,
+    device_id: str,
+    host: str | None = None,
+) -> bool:
+    """Register or drop a device as a UDP home-counter target.
+
+    The counter channel is part of the device protocol, so only an approved
+    device that actually holds a pairing token may receive it. A pending,
+    rejected or revoked device that merely announces itself on UDP must never
+    see the host's Codex counters. Returns True when the device is registered.
+    """
+
+    record = registry.get(device_id)
+    endpoint = host or (getattr(record, "host", None) if record is not None else None)
+    if (
+        record is not None
+        and record.registration_state == "approved"
+        and record.token
+        and endpoint
+    ):
+        home_counters.register(device_id, endpoint)
+        return True
+    home_counters.unregister(device_id)
+    return False
+
+
 def _restart_command() -> list[str]:
     executable = str(Path(sys.executable).resolve())
     if getattr(sys, "frozen", False):
@@ -686,12 +714,22 @@ def main(argv: list[str] | None = None) -> int:
         restart_requested.set()
 
     def device_registration_action(action: str, device_id: str) -> bool:
+        def sync_home_counter_target() -> None:
+            _sync_home_counter_target(home_counters, registry, device_id)
+
         if action == "approve":
-            return manager.approve(device_id)
+            approved = manager.approve(device_id)
+            sync_home_counter_target()
+            home_counters.notify()
+            return approved
         if action == "reject":
-            return manager.reject(device_id)
+            rejected = manager.reject(device_id)
+            home_counters.unregister(device_id)
+            return rejected
         if action == "revoke":
-            return manager.revoke(device_id)
+            revoked = manager.revoke(device_id)
+            home_counters.unregister(device_id)
+            return revoked
         raise ValueError("registration_action_invalid")
 
     admin = AdminApi(
@@ -781,7 +819,12 @@ def main(argv: list[str] | None = None) -> int:
         # wait for the next broadcast round.
         print(f"CodexBridge: {result.device_id} announced itself at {result.host}")
         manager.sync([result])
-        home_counters.register(result.device_id, result.host)
+        # A pending device still gets discovered and can be approved, but the
+        # aggregate Codex counters must not leak over UDP before the user has
+        # paired it.
+        _sync_home_counter_target(
+            home_counters, registry, result.device_id, result.host
+        )
 
     presence = PresenceListener(on_presence, logger=print)
     presence.start()
