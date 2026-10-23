@@ -77,7 +77,8 @@ class ReadCacheWiringTests(unittest.TestCase):
     def test_the_watcher_always_reads_fresh_rows(self):
         # The background watcher is what notices a desktop-initiated turn. If it
         # were served from the cache it would compare its own snapshot with
-        # itself and never publish anything.
+        # itself and never publish anything. Correctness wins over sharing here;
+        # the expensive bounded item pages are cached one layer down instead.
         self.service.poll_thread_changes()
         self.client.responses["thread/list"] = {"data": [thread_row(
             "t1", turns=[{"id": "brand-new", "status": "completed",
