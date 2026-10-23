@@ -1596,8 +1596,8 @@ APP_JS = r"""
       setAlert(
         $("#general-message"),
         desired
-          ? "已开启 Codex 采集。"
-          : "已关闭 Codex 采集，并停止了 CodexBridge 启动的 Codex 后台进程；任务列表会停止更新。",
+          ? "已开启：空闲时也保持全速采集。"
+          : "已关闭：空闲时降低采集频率；有设备或手机连接时会自动恢复全速。",
         "success"
       );
     } catch (error) {

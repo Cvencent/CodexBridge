@@ -88,8 +88,8 @@ class SettingsPageTest(unittest.TestCase):
         self.assertNotIn("显示中间事件", access.group(0))
 
     def test_codex_collection_switch_lives_in_preferences(self):
-        # The switch is the user's escape hatch when Codex collection makes the
-        # machine stutter, so it belongs next to the other run settings.
+        # The switch controls the idle cadence, so it belongs next to the other
+        # run settings.
         preferences = SETTINGS_HTML.index('id="preferences-panel"')
         access = SETTINGS_HTML.index('id="access-panel"')
         switch = SETTINGS_HTML.index('id="codex-collector-enabled"')
@@ -99,9 +99,12 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("saveCodexCollector", SETTINGS_HTML)
         self.assertIn("applyCodexCollector", SETTINGS_HTML)
 
-    def test_codex_collection_warning_names_the_tradeoff(self):
-        self.assertIn("任务列表会停止更新", SETTINGS_HTML)
-        self.assertIn("不再启动独立的 Codex 后台进程", SETTINGS_HTML)
+    def test_codex_collection_copy_promises_no_lost_functionality(self):
+        # The copy must describe a cadence change, not a feature cut: clients
+        # that connect always get full-speed collection.
+        self.assertIn("空闲时降低采集频率", SETTINGS_HTML)
+        self.assertIn("立刻恢复全速采集", SETTINGS_HTML)
+        self.assertNotIn("任务列表会停止更新", SETTINGS_HTML)
 
     def test_queue_is_hidden_until_an_admin_queue_api_is_available(self):
         self.assertRegex(SETTINGS_HTML, r'id="queue-nav-item"[^>]*\bhidden\b')

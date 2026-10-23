@@ -96,30 +96,38 @@ class CodexStatePersistenceTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "codex-collection.json"
 
-    def test_defaults_to_enabled_without_a_state_file(self):
+    def test_defaults_to_idle_throttle_without_a_state_file(self):
+        # Default is the quiet machine: no background warm-up while nothing is
+        # connected. This is a cadence default, never a feature cut -- clients
+        # that connect still get full-speed collection.
         state = _CodexState(self.path)
-        self.assertTrue(state.snapshot()["enabled"])
+        self.assertFalse(state.snapshot()["enabled"])
 
-    def test_off_survives_a_restart(self):
-        # Turning collection off has to stick: coming back on at the next
-        # launch would put the stutter straight back.
+    def test_idle_throttle_survives_a_restart(self):
         _CodexState(self.path).set_enabled(False)
         self.assertFalse(_CodexState(self.path).snapshot()["enabled"])
 
-    def test_on_survives_a_restart(self):
+    def test_always_on_survives_a_restart(self):
         _CodexState(self.path).set_enabled(True)
         self.assertTrue(_CodexState(self.path).snapshot()["enabled"])
 
-    def test_a_corrupt_state_file_falls_back_to_enabled(self):
+    def test_a_corrupt_state_file_falls_back_to_the_quiet_default(self):
         self.path.write_text("{not json", encoding="utf-8")
-        self.assertTrue(_CodexState(self.path).snapshot()["enabled"])
+        self.assertFalse(_CodexState(self.path).snapshot()["enabled"])
 
-    def test_switching_off_reports_a_paused_collector(self):
+    def test_switching_to_always_on_is_reported(self):
+        state = _CodexState(self.path)
+        state.set_enabled(True)
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["collector_state"], "starting")
+        self.assertIn("全速", snapshot["collector_detail"])
+
+    def test_switching_to_idle_throttle_is_reported(self):
         state = _CodexState(self.path)
         state.set_enabled(False)
         snapshot = state.snapshot()
-        self.assertEqual(snapshot["collector_state"], "paused")
-        self.assertIn("关闭", snapshot["collector_detail"])
+        self.assertEqual(snapshot["collector_state"], "idle")
+        self.assertIn("降低", snapshot["collector_detail"])
 
 
 class CodexSourceHolderTest(unittest.TestCase):
@@ -193,18 +201,22 @@ class CodexSourceHolderTest(unittest.TestCase):
         self.assertEqual(client.started, 1)
         self.assertEqual(client.calls, [("project/list", {"limit": 100})])
 
-    def test_holder_refuses_to_start_codex_while_collection_is_off(self):
+    def test_a_device_catalog_request_still_works_with_background_off(self):
+        # The idle throttle is a cadence knob, never a feature cut: a device
+        # that explicitly opens its task list must still be served.
         class Client:
             def __init__(self):
                 self.started = 0
+                self.calls = []
 
             def start(self):
                 self.started += 1
 
             def request(self, method, params=None):
+                self.calls.append((method, params))
                 return {"source": "fallback"}
 
-        holder = _CodexSourceHolder(enabled=lambda: False)
+        holder = _CodexSourceHolder()
         client = Client()
         holder.configure(
             None,
@@ -214,11 +226,11 @@ class CodexSourceHolderTest(unittest.TestCase):
             owns_fallback=False,
         )
 
-        # The switch exists to stop exactly this: a device catalog request
-        # reviving the private app-server the user just turned off.
-        with self.assertRaises(AppServerError):
-            holder.request("project/list", {"limit": 100})
-        self.assertEqual(client.started, 0)
+        self.assertEqual(
+            holder.request("project/list", {"limit": 100}),
+            {"source": "fallback"},
+        )
+        self.assertEqual(client.calls, [("project/list", {"limit": 100})])
 
 
 class UnifiedDeviceAdminTest(unittest.TestCase):

@@ -42,6 +42,10 @@ class EventStream:
         with self._lock:
             self._subscribers.discard(target)
 
+    def subscriber_count(self):
+        with self._lock:
+            return len(self._subscribers)
+
     def publish(self, payload):
         with self._lock:
             self._sequence += 1

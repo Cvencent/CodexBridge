@@ -115,19 +115,26 @@ def _discovery_loop(
 
 
 class _CodexState:
-    """Collector state plus the user's on/off choice.
+    """Whether Codex is polled in the background while nobody is connected.
 
-    The choice is persisted because it is the escape hatch for a machine that
-    stutters while Codex collection runs: resetting to "on" after every
-    restart would put the stutter straight back.
+    This is a cadence knob, not a feature switch. Whenever a device or phone is
+    connected the collector runs at full speed regardless of this value, so no
+    client ever loses an update. With nothing connected:
+
+    * on  -> keep the original fast poll;
+    * off -> drop to a slow beacon, which is what turns the ~13% of one core
+      this machine was burning while unattended into nearly zero.
+
+    The choice persists and defaults to off, because an idle machine should not
+    be kept warm for a client that is not there.
     """
 
     def __init__(self, path: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._path = Path(path) if path is not None else None
-        self._enabled = True
-        self._state = "starting"
-        self._detail = "正在启动 Codex 采集"
+        self._enabled = False
+        self._state = "idle"
+        self._detail = "空闲时降低 Codex 采集频率"
         self._last_snapshot_epoch = 0
         if self._path is not None:
             self._enabled = self._load_enabled()
@@ -137,11 +144,11 @@ class _CodexState:
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return True
+            return False
         if not isinstance(payload, dict):
-            return True
+            return False
         value = payload.get("enabled")
-        return bool(value) if isinstance(value, bool) else True
+        return value if isinstance(value, bool) else False
 
     def _save_enabled_locked(self) -> None:
         if self._path is None:
@@ -161,9 +168,12 @@ class _CodexState:
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._enabled = bool(enabled)
-            if not self._enabled:
-                self._state = "paused"
-                self._detail = "Codex 采集已关闭"
+            self._state = "starting" if self._enabled else "idle"
+            self._detail = (
+                "空闲时也保持 Codex 全速采集"
+                if self._enabled
+                else "空闲时降低 Codex 采集频率"
+            )
             self._save_enabled_locked()
 
     def report(self, state: str, detail: str) -> None:
@@ -186,9 +196,8 @@ class _CodexState:
 
 
 class _CodexSourceHolder:
-    def __init__(self, enabled=None) -> None:
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._enabled = enabled
         self._source = None
         self._fallback = None
         self._fallback_command = None
@@ -225,11 +234,9 @@ class _CodexSourceHolder:
             fallback.close()
 
     def request(self, method: str, params: dict) -> object:
-        if self._enabled is not None and not self._enabled():
-            # Switching collection off must not be undone by the first device
-            # catalog request: spawning an app-server here is exactly what the
-            # switch exists to stop.
-            raise AppServerError("Codex 采集已关闭")
+        # Deliberately NOT gated on the background-collection switch: a device
+        # that explicitly opens the task list must still get an answer. The
+        # switch only stops the poll loop, never on-demand reads.
         with self._lock:
             source = self._source
             fallback = self._fallback or self._fallback_client
@@ -353,6 +360,13 @@ def _apply_companion_action(
 # build. The admin API binds with SO_REUSEADDR, which on Windows lets a second
 # process bind the same port silently, so a lock alone is not enough.
 _INSTANCE_LOCK: object | None = None
+# Normal Codex collection cadence, used whenever somebody is connected (or the
+# user turned on always-on background collection).
+COLLECT_SECONDS = 5.0
+# Cadence while nothing is connected and background collection is off. This is
+# a slow beacon, not a stop: the store still refreshes, so a device that shows
+# up mid-cycle finds recent data and never an empty list.
+IDLE_COLLECT_SECONDS = 60.0
 _INSTANCE_LOCK_NAME = "Local\\CodexBridgeSingleton"
 
 
@@ -458,9 +472,7 @@ def main(argv: list[str] | None = None) -> int:
     # device catalog gate on it: switching collection off has to stop every
     # path that could restart the private app-server.
     codex_state = _CodexState(data_dir / "codex-collection.json")
-    source_holder = _CodexSourceHolder(
-        enabled=lambda: codex_state.snapshot()["enabled"],
-    )
+    source_holder = _CodexSourceHolder()
     codex_cwd = _codex_working_directory()
     codex_command = os.environ.get("CODEXBRIDGE_CODEX_COMMAND")
     # Prefer the desktop's own app-server over spawning a second one: a private
@@ -554,8 +566,26 @@ def main(argv: list[str] | None = None) -> int:
         read_state=read_state,
         show_intermediate_events=lambda: companion_store.show_intermediate_events,
         codex_enabled=lambda: codex_state.snapshot()["enabled"],
+        demand=None,  # filled in below, once the hub exists
     )
     hub.commands = companion_service.commands
+
+    def watcher_demand() -> bool:
+        """True when somebody is relying on live Codex updates.
+
+        Two things count: a device with an open TCP session (it renders task
+        state continuously), or a phone holding the companion event stream
+        open. Both resume the full-speed poll the moment they appear, so the
+        optimisation is invisible to any client that is actually connected.
+        """
+        try:
+            if hub.online_device_ids():
+                return True
+        except (OSError, RuntimeError, ValueError):
+            return True
+        return companion_service.has_event_subscribers()
+
+    companion_service._demand = watcher_demand
     # Approval changes must also reach CBDP panels, not just the legacy JSON
     # event stream. Give the service the same spine and refs the device path
     # uses so it can append approval.* events.
@@ -622,15 +652,10 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(value, bool):
             raise ValueError("enabled_invalid")
         codex_state.set_enabled(value)
-        if not value:
-            # Free the app-server this process spawned: it keeps its own
-            # background watcher alive and would otherwise keep reading the
-            # multi-GB thread store even with collection switched off. Dropping
-            # the cached source first means the collector cannot hand a closed
-            # client to the next snapshot.
-            source_holder.set(None)
-            companion_service.detach_codex_client()
-            shared_app_server.close()
+        # Nothing is shut down here. The switch only changes how often the
+        # collector polls when no client is connected; the app-server stays
+        # alive (an idle one measured 0.00% of one core) so a device or phone
+        # that shows up still gets an immediate, complete task list.
         return {"codex": codex_state.snapshot()}
 
     def companion_action(payload: dict) -> dict:
@@ -711,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
         kwargs={
             "runtime_folder": data_dir,
             "cwd": codex_cwd,
-            "interval": 5.0,
+            "interval": COLLECT_SECONDS,
             "stop": codex_stop,
             "publish": publish_codex,
             "codex_command": codex_command,
@@ -723,8 +748,23 @@ def main(argv: list[str] | None = None) -> int:
                 owns_client=False,
             ),
             "report": codex_state.report,
-            "enabled": lambda: codex_state.snapshot()["enabled"],
+            # The collector itself stays enabled: it is what fills the store
+            # every device reads. Only its cadence is controlled below, so
+            # slowing down never means a device sees an empty task list.
+            "enabled": None,
             "on_source": source_holder.set,
+            # Fast beat whenever somebody is connected OR the user explicitly
+            # asked for always-on background collection. With the switch off
+            # (the default) and nothing connected, drop to a slow beacon: the
+            # data keeps flowing, just far less often. The first device or
+            # phone to appear restores the original 5 s cadence immediately and
+            # forces a refresh, so live behaviour is unchanged for any client
+            # that is actually there.
+            "interval_for": lambda: (
+                COLLECT_SECONDS if (watcher_demand() or codex_state.snapshot()["enabled"])
+                else IDLE_COLLECT_SECONDS
+            ),
+            "demand": watcher_demand,
         },
         daemon=True,
     )

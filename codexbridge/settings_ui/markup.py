@@ -203,7 +203,7 @@ MARKUP = r"""
         <div class="surface-header"><div><h2 id="preferences-startup-title">启动与运行</h2><p>控制开机自启动和本页状态刷新。</p></div></div>
         <div class="surface-body">
           <div class="check-row" style="justify-content:space-between"><span><strong>开机自启动</strong><span class="field-hint">登录 Windows 后自动运行 CodexBridge。</span></span><input id="startup-enabled" class="switch" type="checkbox" role="switch" aria-label="开机自启动"></div>
-          <div class="check-row" style="justify-content:space-between"><span><strong>Codex 采集</strong><span class="field-hint">关闭后 CodexBridge 不再读取 Codex 任务数据，也不再启动独立的 Codex 后台进程；手机与设备的重连、心跳、语音等功能不受影响，任务列表会停止更新。鼠标或系统明显卡顿时可先关闭此项。</span></span><input id="codex-collector-enabled" class="switch" type="checkbox" role="switch" aria-label="Codex 采集"></div>
+          <div class="check-row" style="justify-content:space-between"><span><strong>Codex 采集</strong><span class="field-hint">控制“没有设备或手机连接时”是否仍保持全速采集。关闭时：空闲期间自动降低采集频率以减轻系统负担；只要有设备或手机连上，立刻恢复全速采集与实时推送，所有功能照常。开启则空闲时也保持全速。</span></span><input id="codex-collector-enabled" class="switch" type="checkbox" role="switch" aria-label="Codex 采集"></div>
           <div class="form-actions"><button id="refresh-general" class="button" type="button" data-action="refresh-all"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>刷新全部状态</button></div>
           <div id="general-message" class="inline-alert" role="status" aria-live="polite">正在读取常规设置...</div>
         </div>

@@ -219,12 +219,44 @@ def run_codex_collector(
     enabled: Callable[[], bool] | None = None,
     source_factory: Callable[[], Any] | None = None,
     on_source: Callable[[Any | None], None] | None = None,
+    interval_for: Callable[[], float] | None = None,
+    demand: Callable[[], bool] | None = None,
 ) -> None:
+    """Poll the Codex snapshot until ``stop`` is set.
+
+    ``interval_for`` returns the cadence for the next cycle. It is used to slow
+    the loop down while nobody is watching (no device online, no phone stream
+    open): an unattended bridge still collects, just far less often, so data is
+    never lost -- only the beat changes. ``demand`` is consulted during that
+    slow sleep so the first client to appear triggers an immediate refresh
+    instead of waiting out the whole idle interval.
+    """
+
+    def current_interval() -> float:
+        if interval_for is not None:
+            try:
+                value = float(interval_for())
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        return float(interval)
+
+    def demand_present() -> bool:
+        if demand is None:
+            return False
+        try:
+            return bool(demand())
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     backoff = 2.0
     while not stop.is_set():
         if enabled is not None and not enabled():
+            # The caller asked for a hard stop (shutdown/restart), not a
+            # throttle: wait without collecting until it is switched back on.
             if report is not None:
-                report("disabled", "Codex 模块已关闭")
+                report("disabled", "Codex 采集已暂停")
             while not stop.is_set() and not (restart is not None and restart.is_set()):
                 stop.wait(0.25)
             if restart is not None:
@@ -255,7 +287,12 @@ def run_codex_collector(
                     publish(records)
                 if report is not None:
                     report("online", "数据采集正常")
-                deadline = time.monotonic() + max(1.0, interval)
+                cadence = max(1.0, current_interval())
+                # "Slow" is only meaningful relative to the normal cadence: when
+                # the two are equal we are in the original always-on mode and
+                # must not break out of the sleep early.
+                slow_mode = cadence > max(1.0, float(interval))
+                deadline = time.monotonic() + cadence
                 while (
                     not stop.is_set()
                     and not (restart is not None and restart.is_set())
@@ -265,6 +302,11 @@ def run_codex_collector(
                     if remaining <= 0:
                         break
                     stop.wait(min(0.25, remaining))
+                    if slow_mode and demand_present():
+                        # A device or phone just showed up. Refresh now so its
+                        # first request is fresh instead of up to one slow
+                        # interval old.
+                        break
         except (AppServerError, OSError, ValueError) as error:
             if report is not None:
                 report("error", str(error))

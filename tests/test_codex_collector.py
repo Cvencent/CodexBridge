@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -227,6 +228,90 @@ class CodexCollectorTest(unittest.TestCase):
             )
 
         self.assertEqual(active, [source, None])
+
+
+class CollectorThrottleTest(unittest.TestCase):
+    """The idle throttle must slow the beat without ever stopping collection."""
+
+    def test_slow_interval_still_publishes(self):
+        # With the throttle on the collector keeps collecting: the store stays
+        # fresh, so a device appearing mid-cycle never reads an empty list.
+        stop = threading.Event()
+        source = FakeSource(SNAPSHOT)
+        published = []
+
+        def publish(records):
+            published.extend(records)
+            stop.set()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_codex_collector(
+                runtime_folder=Path(temp_dir),
+                cwd=Path(temp_dir),
+                interval=5.0,
+                stop=stop,
+                publish=publish,
+                source_factory=lambda: source,
+                interval_for=lambda: 60.0,
+                demand=lambda: False,
+            )
+
+        self.assertTrue(published, "a throttled collector must still publish")
+
+    def test_a_client_appearing_short_circuits_the_slow_sleep(self):
+        # The first client to connect must not wait out the whole idle
+        # interval: the slow sleep watches for demand and breaks early.
+        stop = threading.Event()
+        source = FakeSource(SNAPSHOT)
+        demand = {"on": False}
+        cycles = []
+        first = threading.Event()
+
+        def publish(records):
+            del records
+            cycles.append(time.monotonic())
+            if not first.is_set():
+                first.set()
+            elif len(cycles) >= 2:
+                stop.set()
+
+        def interval_for():
+            return 5.0 if demand["on"] else 60.0
+
+        def demand_probe():
+            return demand["on"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            thread = threading.Thread(
+                target=run_codex_collector,
+                kwargs=dict(
+                    runtime_folder=Path(temp_dir),
+                    cwd=Path(temp_dir),
+                    interval=5.0,
+                    stop=stop,
+                    publish=publish,
+                    source_factory=lambda: source,
+                    interval_for=interval_for,
+                    demand=demand_probe,
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(first.wait(5.0), "expected an initial collection")
+            # A device appears while the loop is in its slow sleep.
+            demand["on"] = True
+            self.assertTrue(
+                stop.wait(6.0),
+                "a connected client must resume the fast beat promptly",
+            )
+            thread.join(timeout=5.0)
+
+        self.assertGreaterEqual(len(cycles), 2)
+        gap = cycles[1] - cycles[0]
+        self.assertLess(
+            gap, 30.0,
+            "the second collection must not wait for the full idle interval",
+        )
 
 
 if __name__ == "__main__":

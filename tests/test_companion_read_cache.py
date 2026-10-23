@@ -137,54 +137,60 @@ class ReadCacheWiringTests(unittest.TestCase):
     def test_before_the_first_poll_the_watcher_keeps_its_fast_beat(self):
         self.assertEqual(self.service._poll_seconds(), POLL_ACTIVE_SECONDS)
 
-    # -- codex collection switch ------------------------------------------
-    def test_disabling_collection_stops_the_background_poll(self):
-        # With the switch off nothing may touch the app-server: the poll is
-        # what kept a private Codex process reading the thread store every few
-        # seconds even when no device was connected.
+    # -- demand-driven polling (the optimisation) --------------------------
+    def test_the_poll_runs_when_a_client_is_connected(self):
+        # Any connected client restores the full-speed poll, exactly as before.
+        self.service._demand = lambda: True
         self.service._codex_enabled = lambda: False
-        self.assertEqual(self.count(self.service.poll_thread_changes), 0)
+        self.assertTrue(self.service._poll_enabled())
 
-    def test_disabling_collection_drops_the_comparison_baseline(self):
-        self.service.poll_thread_changes()
-        self.assertIsNotNone(self.service._observed_threads)
+    def test_the_poll_is_skipped_only_when_nobody_is_watching(self):
+        # Quiet machine: no client AND the user did not ask for always-on.
+        self.service._demand = lambda: False
         self.service._codex_enabled = lambda: False
-        self.service._observed_threads = None
-        self.assertIsNone(self.service._observed_threads)
+        self.assertFalse(self.service._poll_enabled())
 
-    def test_enabling_collection_polls_again(self):
-        flag = {"on": False}
-        self.service._codex_enabled = lambda: flag["on"]
-        self.assertEqual(self.count(self.service.poll_thread_changes), 0)
-        flag["on"] = True
-        self.assertGreater(self.count(self.service.poll_thread_changes), 0)
-
-    def test_a_read_cannot_resurrect_a_switched_off_app_server(self):
-        # The switch must hold even for an explicit phone request: otherwise
-        # the first list poll would spawn the private Codex process again.
-        from codexbridge.codex.app_server import AppServerError
-
-        self.service._client = None
-        self.service._codex_enabled = lambda: False
-        with self.assertRaises(AppServerError):
-            self.service.list_threads(limit=20)
-        self.assertIsNone(self.service._client)
-        self.assertFalse(self.client.started)
-
-    def test_re_enabling_lets_the_next_read_rebuild_the_client(self):
-        self.service._codex_enabled = lambda: False
-        self.service._client = None
-        with self.assertRaises(Exception):
-            self.service.list_threads(limit=20)
+    def test_always_on_keeps_polling_with_no_client(self):
+        self.service._demand = lambda: False
         self.service._codex_enabled = lambda: True
+        self.assertTrue(self.service._poll_enabled())
+
+    def test_a_client_arriving_resumes_the_poll(self):
+        # This is the property that makes the optimisation safe: the poll is
+        # never permanently off, it resumes the moment somebody connects.
+        watching = {"on": False}
+        self.service._demand = lambda: watching["on"]
+        self.service._codex_enabled = lambda: False
+        self.assertFalse(self.service._poll_enabled())
+        watching["on"] = True
+        self.assertTrue(self.service._poll_enabled())
+
+    def test_an_explicit_read_still_works_with_background_off(self):
+        # The switch is a cadence knob, never a feature cut: a device or phone
+        # that asks for its task list must still be served.
+        self.service._codex_enabled = lambda: False
+        self.service._demand = lambda: False
         self.assertGreater(self.count(
             lambda: self.service.list_threads(limit=20, refresh=True)), 0)
-        self.assertIsNotNone(self.service._client)
 
-    def test_a_broken_switch_never_silently_stops_collection(self):
+    def test_an_open_event_stream_counts_as_a_client(self):
+        target = self.service.subscribe()
+        self.assertTrue(self.service.has_event_subscribers())
+        self.service.unsubscribe(target)
+        self.assertFalse(self.service.has_event_subscribers())
+
+    def test_a_broken_demand_probe_never_stops_the_poll(self):
+        # Skipping the poll is an optimisation, so an unknown must answer
+        # "somebody is watching" rather than silently going quiet.
+        def boom():
+            raise RuntimeError("probe failed")
+
+        self.service._demand = boom
+        self.assertTrue(self.service._poll_enabled())
+
+    def test_a_broken_switch_probe_does_not_break_the_poll(self):
         def boom():
             raise RuntimeError("probe failed")
 
         self.service._codex_enabled = boom
         self.assertTrue(self.service._codex_collection_enabled())
-        self.assertGreater(self.count(self.service.poll_thread_changes), 0)
