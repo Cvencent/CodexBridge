@@ -145,6 +145,10 @@ class MessageStore:
         self.path = Path(path) if path is not None else None
         self._lock = threading.RLock()
         self._messages: OrderedDict[str, MessageRecord] = OrderedDict()
+        # Hash of the last payload written to disk. save() used to rewrite the
+        # whole results file on every collector cycle even when nothing had
+        # changed, which showed up as ~8 MB/min of needless writes.
+        self._saved_digest: bytes | None = None
         self.load()
 
     def load(self) -> None:
@@ -214,16 +218,20 @@ class MessageStore:
                 and record.status in {"completed", "failed"}
             ]
             payload = {"version": 1, "messages": rows}
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        with self._lock:
+            if digest == self._saved_digest:
+                return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            temporary.write_text(text, encoding="utf-8")
             temporary.replace(self.path)
         except OSError:
             return
+        with self._lock:
+            self._saved_digest = digest
 
     def add(self, record: MessageRecord) -> MessageRecord:
         with self._lock:

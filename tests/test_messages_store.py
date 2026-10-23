@@ -7,6 +7,32 @@ from codexbridge.messages_store import MessageRecord, MessageStore
 
 
 class MessageStoreTest(unittest.TestCase):
+    def test_an_unchanged_store_is_not_rewritten(self):
+        # save() runs on every collector cycle. Rewriting the whole results
+        # file when nothing changed cost ~8 MB/min of pointless writes.
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "messages.json"
+            store = MessageStore(path=path)
+            store.add(MessageRecord("result:t1:1", "t1", "result",
+                                    "completed", "完成", "正文", 1.0))
+            store.save()
+            first = path.stat().st_mtime_ns
+            store.save()
+            self.assertEqual(path.stat().st_mtime_ns, first)
+
+    def test_a_real_change_is_written(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "messages.json"
+            store = MessageStore(path=path)
+            store.add(MessageRecord("result:t1:1", "t1", "result",
+                                    "completed", "完成", "正文", 1.0))
+            store.save()
+            store.add(MessageRecord("result:t2:1", "t2", "result",
+                                    "completed", "完成2", "正文2", 2.0))
+            store.save()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["messages"]), 2)
+
     def test_path_is_not_accepted_as_the_positional_maximum(self):
         with self.assertRaises(TypeError):
             MessageStore(Path("messages.json"))
