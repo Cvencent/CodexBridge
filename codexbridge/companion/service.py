@@ -769,11 +769,17 @@ class CompanionService:
         # full speed whenever a device or phone is connected. An early return
         # based on the switch would silently cut off a client that is actually
         # watching, so the check stays out of the worker.
+        # The watcher keeps forcing a fresh page: it is the component whose
+        # whole job is noticing a change, so serving it from the shared TTL
+        # cache would trade correctness for speed. The read-amplification fix
+        # lives one layer down instead: bounded item pages are now cached, so
+        # the collector and a phone request that land close together share the
+        # expensive part without hiding a state change from this loop.
         current = {
             row["thread_id"]: row
             for row in self.list_threads(limit=80, refresh=True)["threads"]
         }
-        if not self._isolated:
+        if not self._isolated and self.PERIODIC_DESKTOP_DISCOVERY:
             for thread_id in sorted(current, key=lambda key: self._desktop_discovery_due.get(key, 0)):
                 if self._stop.is_set():
                     break
@@ -1587,6 +1593,14 @@ class CompanionService:
     # Streaming events repeat for every token of one turn, so they carry
     # no new information about a thread body: refreshing the cache on each
     # one would put us back to one read per row per poll.
+    # The periodic watcher does NOT need the desktop IPC pipe. Thread state is
+    # already reconciled from the app-server listing plus the rollout log, and
+    # every write path (start/steer/interrupt/settings) discovers the desktop
+    # owner on demand. Keeping a permanent reader on the pipe Codex Desktop
+    # writes to was the remaining way this process could stall the desktop UI,
+    # so it is off by default and only enabled explicitly (tests, diagnostics).
+    PERIODIC_DESKTOP_DISCOVERY = False
+
     STREAMING_EVENT_TYPES = frozenset({
         'agent_delta',
         'command_output',

@@ -276,11 +276,24 @@ class CompanionServiceTests(unittest.TestCase):
     def test_owner_discovery_uses_oldest_due_thread(self):
         from unittest.mock import patch
         self.service._isolated = False
+        self.service.PERIODIC_DESKTOP_DISCOVERY = True
         self.service._desktop_discovery_due = {'t1': 10, 't2': 1}
         with patch.object(self.service, 'list_threads', return_value={'threads': [
                 {'thread_id': 't1'}, {'thread_id': 't2'}]}), patch.object(self.service, '_desktop_owner') as discover:
             self.service.poll_thread_changes()
         discover.assert_called_once_with('t2')
+
+    def test_the_watcher_does_not_hold_the_desktop_pipe_by_default(self):
+        # The pipe Codex Desktop writes to must not have a permanent reader
+        # here: a slow drain can back up the desktop's own writes. Thread state
+        # comes from the app-server listing plus the rollout log, and write
+        # paths still discover the owner on demand.
+        from unittest.mock import patch
+        self.service._isolated = False
+        with patch.object(self.service, 'list_threads', return_value={'threads': [
+                {'thread_id': 't1'}]}), patch.object(self.service, '_desktop_owner') as discover:
+            self.service.poll_thread_changes()
+        discover.assert_not_called()
 
     def test_isolated_service_skips_desktop_owner_discovery(self):
         self.service._isolated = True
