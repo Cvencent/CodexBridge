@@ -219,7 +219,15 @@ class MessageStore:
             ]
             payload = {"version": 1, "messages": rows}
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        # The collector refreshes timing/counter fields on every poll. Hashing
+        # the full payload made each cycle look like a change, so the file was
+        # rewritten even when every rendered value was identical. Compare the
+        # stable projection instead; the bytes written still carry everything.
+        stable = json.dumps(
+            _without_volatile(payload), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(stable.encode("utf-8")).digest()
         with self._lock:
             if digest == self._saved_digest:
                 return

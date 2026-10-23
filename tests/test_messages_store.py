@@ -20,6 +20,23 @@ class MessageStoreTest(unittest.TestCase):
             store.save()
             self.assertEqual(path.stat().st_mtime_ns, first)
 
+    def test_a_volatile_timestamp_alone_does_not_rewrite_the_file(self):
+        # The collector refreshes generated_at_epoch on every poll; that alone
+        # must not look like a change.
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "messages.json"
+            store = MessageStore(path=path)
+            store.add(MessageRecord("result:t1:1", "t1", "result",
+                                    "completed", "完成", "正文", 1.0,
+                                    data={"generated_at_epoch": 100}))
+            store.save()
+            first = path.stat().st_mtime_ns
+            store.add(MessageRecord("result:t1:1", "t1", "result",
+                                    "completed", "完成", "正文", 1.0,
+                                    data={"generated_at_epoch": 200}))
+            store.save()
+            self.assertEqual(path.stat().st_mtime_ns, first)
+
     def test_a_real_change_is_written(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "messages.json"
