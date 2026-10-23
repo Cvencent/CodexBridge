@@ -285,6 +285,44 @@ class CollectorLivenessTests(unittest.TestCase):
 
         self.assertNotEqual(source.task["status"], "working")
 
+    def test_an_active_thread_is_not_reread_while_its_log_is_unchanged(self) -> None:
+        # The expensive case: a thread that still looked "active" used to be
+        # re-read on every 5 s beat, and each read pulls the whole stored
+        # history (measured at ~134 MB on a long thread). An unchanged rollout
+        # log proves the body cannot have grown, so the read is skipped.
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_rollout(root, LIVE, [_event("task_started", -30), _note(-3)])
+            source = self._source(
+                [_listed(LIVE, 400)],
+                RolloutActivity(root),
+                running_ids=(LIVE,),
+                calls=calls,
+            )
+            source.refresh_thread()
+            source.refresh_thread()
+
+        self.assertEqual(calls.count("thread/read"), 1)
+
+    def test_an_active_thread_is_reread_when_its_log_grows(self) -> None:
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _write_rollout(root, LIVE, [_event("task_started", -30)])
+            source = self._source(
+                [_listed(LIVE, 400)],
+                RolloutActivity(root),
+                running_ids=(LIVE,),
+                calls=calls,
+            )
+            source.refresh_thread()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(_note(-1) + "\n")
+            source.refresh_thread()
+
+        self.assertEqual(calls.count("thread/read"), 2)
+
     def test_unchanged_idle_thread_is_not_reread_on_every_poll(self) -> None:
         calls: list[str] = []
         with tempfile.TemporaryDirectory() as temp:

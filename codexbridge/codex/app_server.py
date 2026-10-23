@@ -957,6 +957,10 @@ class CodexAppServerSource:
     TURNS_PAGE_LIMIT = 100
     ITEM_PAGE_LIMIT = 200
     MAX_ITEM_PAGES = 2
+    # How often to re-read a thread whose rollout log cannot be located, so a
+    # missing file cannot pin a stale view forever. Threads with a readable log
+    # are refreshed from its change signature instead of on a timer.
+    DETAIL_RETRY_SECONDS = 10.0
     SOURCE_KINDS = [
         "cli", "vscode", "exec", "appServer", "unknown",
     ]
@@ -1182,8 +1186,18 @@ class CodexAppServerSource:
         if detail_cache is None:
             detail_cache = {}
             self._thread_detail_cache = detail_cache
+        detail_signature = getattr(self, "_thread_detail_signature", None)
+        if detail_signature is None:
+            detail_signature = {}
+            self._thread_detail_signature = detail_signature
+        detail_refreshed_at = getattr(self, "_thread_detail_refreshed_at", None)
+        if detail_refreshed_at is None:
+            detail_refreshed_at = {}
+            self._thread_detail_refreshed_at = detail_refreshed_at
         for cached_id in set(detail_cache) - display_thread_ids:
             detail_cache.pop(cached_id, None)
+            detail_signature.pop(cached_id, None)
+            detail_refreshed_at.pop(cached_id, None)
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for selected in display_threads:
@@ -1204,12 +1218,20 @@ class CodexAppServerSource:
             thread_id = str(selected.get("id") or "")
             cache_key = self._thread_detail_cache_key(selected)
             cached = detail_cache.get(thread_id)
+            # Incremental read: the stored thread body can only have grown if
+            # its rollout log changed. Re-reading a long thread costs the app
+            # server ~134 MB of history, and the old code did that on every
+            # 5 s beat for any thread that merely looked "active" -- which is
+            # what kept the disk busy for minutes after a turn had stopped.
+            signature = self.activity.signature_for_item(selected)
+            previous_signature = detail_signature.get(thread_id)
+            now = time.monotonic()
+            age = now - detail_refreshed_at.get(thread_id, 0.0)
+            changed = signature is not None and signature != previous_signature
             refresh_detail = (
                 cached is None
-                or cached[0] != cache_key
-                or self._is_active_hint(selected)
-                or thread_id in self.active_thread_ids
-                or liveness.get(thread_id) == "working"
+                or changed
+                or (signature is None and age >= self.DETAIL_RETRY_SECONDS)
             )
             if not refresh_detail:
                 detail = cached[1]
@@ -1217,6 +1239,8 @@ class CodexAppServerSource:
                 try:
                     detail = self._read_thread_detail(thread_id)
                     detail_cache[thread_id] = (cache_key, detail)
+                    detail_signature[thread_id] = signature
+                    detail_refreshed_at[thread_id] = now
                 except (AppServerError, OSError, ValueError) as error:
                     # One stored thread may contain an item type unknown to this
                     # App Server build. Keep the other readable tasks flowing.

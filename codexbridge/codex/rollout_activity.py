@@ -37,6 +37,9 @@ LOG_ACTIVE_SECONDS = 150.0
 # Rollout tails are read for every listed thread on every collector pass; the
 # cache keeps that off the hot path without making the answer stale.
 LOG_CACHE_SECONDS = 8.0
+# How long a resolved rollout path stays valid before the day folders are
+# scanned again.
+PATH_CACHE_SECONDS = 300.0
 # How many days of rollout folders to search when a listing carries no path.
 ROLLOUT_SCAN_DAYS = 3
 
@@ -247,6 +250,10 @@ class RolloutActivity:
             else Path.home() / ".codex" / "sessions"
         )
         self._cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
+        # Resolving a thread to its rollout file means globbing three day
+        # folders. Remember the answer so the change-signature check costs one
+        # stat() instead of a directory scan on every collector beat.
+        self._paths: dict[str, tuple[float, Path | None]] = {}
         self._lock = threading.Lock()
 
     @property
@@ -257,6 +264,19 @@ class RolloutActivity:
         key = str(thread_id or "")
         if not key:
             return None
+        now = time.monotonic()
+        with self._lock:
+            cached = self._paths.get(key)
+            if cached is not None and now - cached[0] <= PATH_CACHE_SECONDS:
+                return cached[1]
+        found = self._find_path_uncached(key)
+        with self._lock:
+            if len(self._paths) > 512:
+                self._paths.clear()
+            self._paths[key] = (now, found)
+        return found
+
+    def _find_path_uncached(self, key: str) -> Path | None:
         for offset in range(ROLLOUT_SCAN_DAYS):
             day = datetime.now() - timedelta(days=offset)
             folder = self._sessions_root / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}"
@@ -296,6 +316,38 @@ class RolloutActivity:
 
     def is_working(self, item: dict[str, Any] | None, now: float | None = None) -> bool:
         return status_from_activity(self.activity(item), now) == "working"
+
+    def signature(self, thread_id: str) -> tuple[int, int] | None:
+        """Cheap change token for one thread's rollout log.
+
+        Returns ``(mtime_ns, size)`` from a single ``stat`` call, or None when
+        the log cannot be found. Callers use this to decide whether a costly
+        app-server read is worth doing at all: an unchanged log means the stored
+        thread body cannot have grown, so re-reading it would only put the
+        multi-hundred-megabyte history back through the disk.
+        """
+        return self.signature_for_path(self.find_path(str(thread_id or "")))
+
+    @staticmethod
+    def signature_for_path(path: Any) -> tuple[int, int] | None:
+        if path is None:
+            return None
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return int(stat.st_mtime_ns), int(stat.st_size)
+
+    def signature_for_item(self, item: dict[str, Any] | None) -> tuple[int, int] | None:
+        """Change token for a ``thread/list`` row, preferring its own path."""
+        if not isinstance(item, dict):
+            return None
+        value = item.get("path")
+        if isinstance(value, (str, Path)) and str(value):
+            found = self.signature_for_path(value)
+            if found is not None:
+                return found
+        return self.signature(str(item.get("id") or ""))
 
     def _activity(
         self, key: str, explicit_path: str | None
