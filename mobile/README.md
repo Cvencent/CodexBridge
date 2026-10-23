@@ -65,4 +65,5 @@ release/                     构建好的 APK
 手机端仅使用 CodexBridge 伴侣接口（`/api/companion/*`）：`ping`、`pair`、`status`、`threads`、
 `threads/<id>`、`threads/<id>/messages`、`threads/<id>/interrupt`、`approvals/<id>`、`models`、
 `projects`、`events`（SSE），以及 `commands` 上的 `queue.*` 队列命令。协议细节见
-CodexBridge 仓库的 `PROTOCOL.md` 第 11A 节。
+CodexBridge 仓库的 [本机管理与伴侣接口](../docs/companion-and-admin-api.md)；
+设备接入统一以 [CBDP v1 线协议](../docs/CBDP-V1-PROTOCOL.md) 为准。

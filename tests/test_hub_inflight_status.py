@@ -7,8 +7,8 @@ the radio must not wake every few seconds), and the global read marker then
 suppresses the same record at replay time.  The device sat on "waiting for the
 computer" with no message left to redraw.
 
-The generic answer is pull-based, matching section 9.7 of PROTOCOL.md: the
-device asks, the host answers with the *current* live state, and in-flight
+The generic answer is pull-based: the device asks, the host answers with
+the *current* live state (`system.codex_state`), and in-flight
 records are never treated as consumed notifications.
 """
 import unittest

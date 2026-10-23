@@ -1,6 +1,6 @@
 # CodexBridge
 
-> **文档导航：** **项目说明** · [通用协议](PROTOCOL.md) · [CBDP v1 协议](docs/CBDP-V1-PROTOCOL.md)
+> **文档导航：** **项目说明** · [CBDP v1 协议](docs/CBDP-V1-PROTOCOL.md) · [本机管理与伴侣接口](docs/companion-and-admin-api.md)
 
 [![Release](https://img.shields.io/github/v/release/Cvencent/CodexBridge?display_name=tag&label=Release)](https://github.com/Cvencent/CodexBridge/releases/latest)
 [![Windows Release](https://github.com/Cvencent/CodexBridge/actions/workflows/release-windows.yml/badge.svg)](https://github.com/Cvencent/CodexBridge/actions/workflows/release-windows.yml)
@@ -30,7 +30,7 @@ CodexBridge 不是设备固件，也不是手机 App，而是 PC 侧的唯一桥
 | 设备或客户端 | 形态 | 接入方式 | 对应仓库 |
 |---|---|---|---|
 | **AI Passport / FoloToy AI Passport** | ESP32-C3 掌上设备 | CBDP v1、UDP 首页计数 | [Cvencent/one2passport](https://github.com/Cvencent/one2passport) |
-| **Dotii 桌面交互屏** | ESP32 桌面设备 | CBDP v1 / 通用设备协议 | [Cvencent/Dotii-Display](https://github.com/Cvencent/Dotii-Display) |
+| **Dotii 桌面交互屏** | ESP32 桌面设备 | CBDP v1 | [Cvencent/Dotii-Display](https://github.com/Cvencent/Dotii-Display) |
 | **CodexBridge Android** | Android 手机 | Companion HTTP、SSE、WebSocket | [Cvencent/CodexBridgeMobile](https://github.com/Cvencent/CodexBridgeMobile) |
 | **通用 ESP32 / ESP32-S3 设备** | 自定义硬件 | UDP 发现 + TCP CBDP v1 | [CBDP v1 协议](docs/CBDP-V1-PROTOCOL.md) |
 | **Codex Desktop / Codex CLI** | PC 上游执行端 | App Server、Desktop IPC | [openai/codex](https://github.com/openai/codex) |
@@ -83,14 +83,16 @@ CodexBridge 不是设备固件，也不是手机 App，而是 PC 侧的唯一桥
 
 ## 协议
 
-CodexBridge 同时维护两套设备接入面：
+CodexBridge 只有一套设备接入协议：
 
-1. **CBDP v1 二进制协议**：新设备、ESP32/ESP32-S3、面板和手机 CBDP 客户端。
-2. **旧 JSON 行协议兼容网关**：已有 Dotii 和旧固件继续接入。
+- **[CBDP v1 二进制协议](docs/CBDP-V1-PROTOCOL.md)** —— 所有设备唯一需要实现的协议，
+  线格式为 `major = 1`、`minor = 0`。新设备、ESP32/ESP32-S3、面板和手机 CBDP
+  客户端一律按它实现，不要在仓库里另找设备协议文档。
+- **旧 JSON 行协议**只作为已有 Dotii 和旧固件的兼容网关保留，映射规则写在
+  CBDP v1 线协议第 24 节，不再是设备接入的起点。
 
-CBDP v1 是当前主线协议，线格式为 `major = 1`、`minor = 0`，完整定义见
-[CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md)。仓库根目录的
-[通用设备协议](PROTOCOL.md) 记录当前实现、兼容规则、JSON 网关和管理接口。
+手机伴侣 API、本机管理 API 和待发送队列属于另一条非设备协议接入面，见
+[本机管理与伴侣接口](docs/companion-and-admin-api.md)。
 
 ### 默认端口
 
@@ -272,8 +274,8 @@ pip install -e ".[tray]"
 
 ## 文档
 
-- [通用设备协议](PROTOCOL.md)
 - [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md)
+- [本机管理与伴侣接口](docs/companion-and-admin-api.md)
 - [手机附件接入说明](docs/CodexBridge-mobile-attachment-api.md)
 - [PC 侧卡顿根因与修复：超大线程 JSON（2026-10-23）](docs/pc-json-gil-freeze-2026-10-23.md)
 - [设备端建议说明：手机 App 连接管理（2026-10-22）](docs/device-defect-long-lived-connections-2026-10-22.md)

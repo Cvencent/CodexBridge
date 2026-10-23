@@ -1,7 +1,7 @@
 # CodexBridge 仓库协作约束
 
 本文件是仓库级规范，适用于所有 Codex 会话和自动化 Agent。修改代码前先阅读
-`README.md` 与 `PROTOCOL.md`；无法确认行为时以当前代码和测试为准。
+`README.md` 与 `docs/CBDP-V1-PROTOCOL.md`；无法确认行为时以当前代码和测试为准。
 
 ## 1. 项目定位
 
@@ -19,8 +19,9 @@ AI Passport 以及后续任何实现通用协议的局域网设备。
 
 ## 2. 协议规范同步
 
-任何 Codex 会话在修改 CodexBridge 时，只要改动影响设备协议或通用协议，
-都必须在同一个变更中更新根目录的 `PROTOCOL.md`。
+任何 Codex 会话在修改 CodexBridge 时，只要改动影响设备协议，都必须在同一个
+变更中更新 `docs/CBDP-V1-PROTOCOL.md`。**设备接入只有 CBDP v1 一套协议文档**，
+不要新增或恢复第二份设备协议文档。
 
 需要同步更新协议文档的改动包括：
 
@@ -30,12 +31,14 @@ AI Passport 以及后续任何实现通用协议的局域网设备。
 - PC 到设备的消息类型、字段、`kind` 映射、分片规则或截断规则。
 - 设备到 PC 的事件类型、必需字段、能力要求或协议应答。
 - 已读同步、状态重放、错误码、安全边界或兼容性规则。
-- `PROTOCOL.md` 中记录的本机管理接口，以及 Dotii 管理中心快照接口边界。
+- `docs/companion-and-admin-api.md` 中记录的本机管理接口、手机伴侣接口，
+  以及 Dotii 管理中心快照接口边界。
 
 修改协议行为时，还应同步更新相关测试和协议示例。无法确定某次改动是否属于
-协议变更时，默认认为需要更新 `PROTOCOL.md`，不要留下过期文档。
+设备协议变更时，默认认为需要更新 `docs/CBDP-V1-PROTOCOL.md`；属于本机管理或
+手机伴侣接口时更新 `docs/companion-and-admin-api.md`，不要留下过期文档。
 
-`README.md` 与 `PROTOCOL.md` 顶部的文档切换栏必须保持一致。
+`README.md` 与 `docs/CBDP-V1-PROTOCOL.md` 顶部的文档切换栏必须保持一致。
 
 ## 3. 工作流与提交
 

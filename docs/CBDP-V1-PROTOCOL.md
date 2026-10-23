@@ -1,6 +1,6 @@
 # CodexBridge Device Protocol v1 (CBDP v1) 线协议规范
 
-> **文档导航：** [项目说明](../README.md) · [通用协议](../PROTOCOL.md) · **CBDP v1 协议**
+> **文档导航：** [项目说明](../README.md) · **CBDP v1 协议** · [本机管理与伴侣接口](companion-and-admin-api.md)
 
 - 状态：Frozen v1.0，供 Bridge、手机端、ESP32、ESP32-S3 和桌面端并行实现
 - 协议名：CodexBridge Device Protocol v1
