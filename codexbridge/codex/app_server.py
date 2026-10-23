@@ -957,6 +957,9 @@ class CodexAppServerSource:
     TURNS_PAGE_LIMIT = 100
     ITEM_PAGE_LIMIT = 200
     MAX_ITEM_PAGES = 2
+    # Keep in sync with companion.service.WATCH_PAGE_LIMIT so both callers hit
+    # the same cached listing.
+    LIST_PAGE_LIMIT = 40
     # How often to re-read a thread whose rollout log cannot be located, so a
     # missing file cannot pin a stale view forever. Threads with a readable log
     # are refreshed from its change signature instead of on a timer.
@@ -1150,8 +1153,13 @@ class CodexAppServerSource:
         return {"thread": thread}
 
     def refresh_thread(self) -> None:
+        # Same shape as the companion watcher's page (see WATCH_PAGE_LIMIT), so
+        # the two share one cached app-server response instead of each paying
+        # for its own listing every 10 s. Measured cost is not higher than 20
+        # rows: the expense comes from which threads land in the page, not the
+        # count itself.
         result = self.client.request("thread/list", {
-            "limit": 20,
+            "limit": self.LIST_PAGE_LIMIT,
             "sortKey": "recency_at",
             "sortDirection": "desc",
             "sourceKinds": self.SOURCE_KINDS,

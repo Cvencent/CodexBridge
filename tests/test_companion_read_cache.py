@@ -118,6 +118,13 @@ class ReadCacheWiringTests(unittest.TestCase):
         self.assertGreater(self.count(
             lambda: self.service.list_threads(limit=80)), 0)
 
+    def test_the_collector_and_watcher_share_one_listing_shape(self):
+        # Both must request the identical page, otherwise the client cache
+        # treats them as different keys and each pays for its own listing.
+        from codexbridge.codex.app_server import CodexAppServerSource
+        from codexbridge.companion.service import WATCH_PAGE_LIMIT
+        self.assertEqual(CodexAppServerSource.LIST_PAGE_LIMIT, WATCH_PAGE_LIMIT)
+
     # -- power ------------------------------------------------------------
     def test_an_idle_codex_polls_slowly(self):
         self.service.poll_thread_changes()
