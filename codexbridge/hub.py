@@ -20,6 +20,13 @@ from codexbridge.messages_store import (
     is_in_flight,
 )
 from codexbridge.cbdp.constants import (
+    EVENT_ACCOUNT_CHANGED,
+    EVENT_RATE_LIMITS_CHANGED,
+    EVENT_TOKEN_USAGE_CHANGED,
+    TAG_PLAN_TYPE,
+    TAG_RATE_LIMITS,
+    TAG_SEVEN_DAY_TOKENS,
+    QOS_TELEMETRY,
     QOS_CRITICAL,
     QOS_STATE,
     TAG_APPLIED_POLICY,
@@ -60,6 +67,11 @@ from codexbridge.cbdp.constants import (
     TAG_TURN_REF,
 )
 
+from codexbridge.cbdp.account import (
+    account_plan_payload,
+    account_rate_limits_payload,
+    account_token_usage_payload,
+)
 from codexbridge.cbdp.capabilities import capability_bitmap
 from codexbridge.cbdp.events import event_scope
 from codexbridge.cbdp.projection import (
@@ -246,6 +258,9 @@ class BridgeHub:
         self._cbdp_terminal_turns: set[tuple[str, str]] = set()
         self._cbdp_terminal_order: deque[tuple[str, str]] = deque()
         self._cbdp_thread_state: dict[str, tuple[str, int]] = {}
+        # Last account snapshot actually published, so the 5 s collector beat
+        # does not append an identical rate-limits or token-usage event.
+        self._last_account_state: tuple[Any, ...] | None = None
 
     def _cbdp_ref(self, kind: str, external_id: str) -> int:
         if self.references is None or not external_id:
@@ -583,6 +598,60 @@ class BridgeHub:
         except Exception:
             return
 
+    def publish_account(self, quota: dict[str, Any]) -> bool:
+        """Publish one account quota snapshot onto the CBDP summary topic.
+
+        The Codex app server is polled on every collector beat, but the quota
+        numbers only move when Codex actually consumes tokens. Appending an
+        identical event every 5 s would spend radio traffic and device wake-ups
+        for no state change, so a snapshot is published only when one of the
+        three visible values has moved.
+        """
+
+        if not isinstance(quota, dict):
+            return False
+        plan_payload = account_plan_payload(quota)
+        rate_payload = account_rate_limits_payload(quota)
+        usage_payload = account_token_usage_payload(quota)
+        if not plan_payload and not rate_payload and not usage_payload:
+            return False
+        marker = (
+            bytes(plan_payload.get(TAG_PLAN_TYPE, b"")),
+            bytes(rate_payload.get(TAG_RATE_LIMITS, b"")),
+            bytes(usage_payload.get(TAG_SEVEN_DAY_TOKENS, b"")),
+            str(quota.get("seven_day_as_of") or ""),
+        )
+        if marker == self._last_account_state:
+            return False
+        published = False
+        if plan_payload:
+            event = self._append_event(
+                SYSTEM_THREAD_SUMMARIES_TOPIC,
+                EVENT_ACCOUNT_CHANGED,
+                QOS_STATE,
+                plan_payload,
+            )
+            published = published or event is not None
+        if rate_payload:
+            event = self._append_event(
+                SYSTEM_THREAD_SUMMARIES_TOPIC,
+                EVENT_RATE_LIMITS_CHANGED,
+                QOS_STATE,
+                rate_payload,
+            )
+            published = published or event is not None
+        if usage_payload:
+            event = self._append_event(
+                SYSTEM_THREAD_SUMMARIES_TOPIC,
+                EVENT_TOKEN_USAGE_CHANGED,
+                QOS_TELEMETRY,
+                usage_payload,
+            )
+            published = published or event is not None
+        if published:
+            self._last_account_state = marker
+        return published
+
     def publish(self, record: MessageRecord) -> None:
         with self._lock:
             previous = self.store.get(record.message_id)
@@ -603,6 +672,13 @@ class BridgeHub:
                 )
             if record.kind == "result" and record.status in TURN_TERMINAL_EVENTS:
                 self._append_turn_terminal_event(record)
+            if record.kind == "codex_status" and isinstance(record.data, dict):
+                # The collector already computed the quota snapshot; mirror it
+                # onto the CBDP account events so a v1 device does not need a
+                # separate read command or a second upstream poll.
+                account = record.data.get("quota")
+                if isinstance(account, dict):
+                    self.publish_account(account)
             capability = KIND_CAPABILITY.get(record.kind)
             if capability is None:
                 return

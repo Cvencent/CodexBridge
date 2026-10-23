@@ -126,6 +126,9 @@ from codexbridge.cbdp.constants import (
     TYPE_AUDIO_CHUNK,
     TYPE_AUDIO_END,
     TYPE_APPROVAL_RESOLVE,
+    EVENT_ACCOUNT_CHANGED,
+    EVENT_RATE_LIMITS_CHANGED,
+    EVENT_TOKEN_USAGE_CHANGED,
     TYPE_AUTH,
     TYPE_AUTH_OK,
     TYPE_CLOSE,
@@ -205,6 +208,9 @@ METHOD_IDS = {
     0x0064: "attachment.upload.chunk",
     0x0065: "attachment.upload.end",
     0x0066: "attachment.upload.cancel",
+    0x0090: "account.read",
+    0x0091: "account.rate_limits.read",
+    0x0092: "account.token_usage.read",
     0x00C1: "content.read",
 }
 
@@ -244,6 +250,9 @@ METHOD_CAPABILITIES = {
     0x0064: "attachment",
     0x0065: "attachment",
     0x0066: "attachment",
+    0x0090: "account",
+    0x0091: "account",
+    0x0092: "account",
     0x00C1: "text",
 }
 DISPATCH_METHODS = {
@@ -654,6 +663,14 @@ class CbdpGateway:
             int(scope),
         )
 
+    # Account quota events are gated on the ``account`` capability rather than
+    # on the subscription alone. A device that never asked for quota must not
+    # silently accumulate rate-limit state just because it subscribed to the
+    # summary topic; this mirrors the command-path capability check.
+    _ACCOUNT_EVENTS = frozenset(
+        {EVENT_ACCOUNT_CHANGED, EVENT_RATE_LIMITS_CHANGED, EVENT_TOKEN_USAGE_CHANGED}
+    )
+
     def deliver_event(self, event):
         """Send one EventSpine event to every matching live subscription.
 
@@ -661,6 +678,15 @@ class CbdpGateway:
         pending queue. The gateway only decides whether the event is relevant
         to a scope and serialises it.
         """
+
+        if (
+            int(event.event_type) in self._ACCOUNT_EVENTS
+            and "account" not in self._capabilities()
+        ):
+            # Quota data is private to a device the user granted `account`.
+            # Drop it before it is queued for replay, not just before the
+            # send, so a later capability grant cannot leak buffered history.
+            return None
 
         scope = event_scope(int(event.event_type))
         self.subscriptions.deliver(
@@ -1007,6 +1033,11 @@ class CbdpGateway:
                     )
                 )
             for event in result.replay:
+                if (
+                    int(event.event_type) in self._ACCOUNT_EVENTS
+                    and "account" not in self._capabilities()
+                ):
+                    continue
                 self._emit(self._delta_frame(event))
             # Aggregated Home counters are state, not history. A device that
             # subscribes after attach can otherwise miss the single live
@@ -1020,33 +1051,39 @@ class CbdpGateway:
                 int(topic_id) == SYSTEM_THREAD_SUMMARIES_TOPIC
                 and int(scope) == 0
             ):
-                latest = self.event_spine.latest_event(
-                    lambda item: (
-                        int(item.topic_id) == int(topic_id)
-                        and int(item.event_type) == EVENT_CODEX_STATE
+                replayed = {
+                    int(event.global_seq) for event in result.replay
+                }
+                latest_kinds = [EVENT_CODEX_STATE]
+                if self._account_capability_enabled():
+                    latest_kinds.extend(
+                        (
+                            EVENT_ACCOUNT_CHANGED,
+                            EVENT_RATE_LIMITS_CHANGED,
+                            EVENT_TOKEN_USAGE_CHANGED,
+                        )
                     )
-                )
-                if latest is not None:
-                    replayed = {
-                        int(event.global_seq) for event in result.replay
-                    }
-                    if int(latest.global_seq) not in replayed:
-                        if int(latest.global_seq) <= int(result.cursor):
-                            # A fresh subscriber is given the newest window,
-                            # whose cursor can already be past an older state
-                            # event. Append the current payload so the DELTA
-                            # stays strictly newer than the reported cursor.
-                            try:
-                                latest = self.event_spine.append(
-                                    int(latest.topic_id),
-                                    int(latest.event_type),
-                                    int(latest.qos),
-                                    latest.payload,
-                                )
-                            except Exception:
-                                latest = None
-                        if latest is not None:
-                            self._emit(self._delta_frame(latest))
+                for latest_type in latest_kinds:
+                    latest = self.event_spine.latest_event(
+                        lambda item, kind=latest_type: (
+                            int(item.topic_id) == int(topic_id)
+                            and int(item.event_type) == int(kind)
+                        )
+                    )
+                    if latest is None or int(latest.global_seq) in replayed:
+                        continue
+                    if int(latest.global_seq) <= int(result.cursor):
+                        try:
+                            latest = self.event_spine.append(
+                                int(latest.topic_id),
+                                int(latest.event_type),
+                                int(latest.qos),
+                                latest.payload,
+                            )
+                        except Exception:
+                            latest = None
+                    if latest is not None:
+                        self._emit(self._delta_frame(latest))
             self._result(request_id, 0, {
                 TAG_TOPIC_ID: u32(topic_id),
                 TAG_SCOPE: u8(scope),
@@ -1140,6 +1177,43 @@ class CbdpGateway:
                 result[name] = ""
         return result
 
+    # Account read commands (v1 spec 17.1, 0x0090..0x0092). They answer from
+    # the committed account events instead of polling Codex again: the same
+    # numbers already drive the pushed account.changed / rate_limits.changed /
+    # token_usage.changed events, so a pull and a push can never disagree.
+    _ACCOUNT_READ_EVENTS = {
+        "account.read": EVENT_ACCOUNT_CHANGED,
+        "account.rate_limits.read": EVENT_RATE_LIMITS_CHANGED,
+        "account.token_usage.read": EVENT_TOKEN_USAGE_CHANGED,
+    }
+
+    def _account_capability_enabled(self) -> bool:
+        """Best-effort account check for paths that may run pre-handshake.
+
+        The attach-time replay runs before a session necessarily exposes its
+        capability bitmaps; an incomplete session must simply not receive
+        account snapshots rather than raising.
+        """
+
+        try:
+            return "account" in self._capabilities()
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _account_read_result(self, request_id, method_id, method):
+        event_type = self._ACCOUNT_READ_EVENTS.get(str(method))
+        if event_type is None:
+            return self._error(request_id, "UNSUPPORTED_FEATURE")
+        event = self.event_spine.latest_event(
+            lambda item: int(item.event_type) == int(event_type)
+        )
+        if event is None:
+            # No measured snapshot yet is not an error: the account has not
+            # been polled, or the upstream has no quota data. Return an empty
+            # success so the device renders "--" instead of an error dialog.
+            return self._result(request_id, method_id, {})
+        return self._result(request_id, method_id, dict(event.payload))
+
     def _handle_command(self, frame):
         try:
             request_id = decode_u32(require_tlv(frame.header, TAG_REQUEST_ID))
@@ -1153,6 +1227,12 @@ class CbdpGateway:
         required_capability = METHOD_CAPABILITIES.get(method_id)
         if required_capability and required_capability not in self._capabilities():
             return self._error(request_id, "CAPABILITY_NOT_ENABLED")
+        if method in {
+            "account.read",
+            "account.rate_limits.read",
+            "account.token_usage.read",
+        }:
+            return self._account_read_result(request_id, method_id, method)
         commands = self._commands()
         if commands is None:
             return self._error(request_id, "UPSTREAM_UNAVAILABLE")

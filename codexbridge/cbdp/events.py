@@ -39,6 +39,12 @@ _SUMMARY_EVENTS = frozenset(
         # screen. Summary topic, state QoS, so it can be replayed to a device
         # that reconnects with a cursor.
         0x0704,
+        # 0x0E01/0x0E02/0x0E03: account.changed, rate_limits.changed and
+        # token_usage.changed. Account state is global to the Bridge, so it
+        # rides the summary scope like codex_state rather than a thread topic.
+        0x0E01,
+        0x0E02,
+        0x0E03,
     }
 )
 _THREAD_EVENTS = frozenset(

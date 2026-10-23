@@ -1118,6 +1118,9 @@ amendment 只改变策略版本，不新增具体规则。
 | `0x018A` | `u8` | `compaction_state` | `0=requested,1=running,2=completed,3=failed`；`[本轮不实现]` |
 | `0x018B` | `utf8` | `compaction_reason` | 压缩触发原因或失败原因；`[本轮不实现]` |
 | `0x018C` | `utf8` | `compaction_summary` | 压缩结果摘要；`[本轮不实现]` |
+| `0x018D` | `u64` | `seven_day_tokens` | 最近 7 日累计 token |
+| `0x018E` | `utf8` | `seven_day_as_of` | 7 日统计截止日 |
+| `0x018F` | `u8` | `seven_day_window_days` | 统计窗口天数，恒为 7 |
 | `0x0190` | `u32` | `item_ref` | 通用 item 引用 |
 | `0x0191` | `u8` | `item_type` | `0=command,1=file_change,2=mcp_tool,3=dynamic_tool,4=web_search,5=plan,6=reasoning,7=notice,8=context_compaction`；`8` 属于 `[本轮不实现]` |
 | `0x0192` | `u8` | `item_status` | `0=pending,1=running,2=completed,3=failed,4=cancelled` |
@@ -2538,6 +2541,16 @@ draft_expires_at_ms, revision, reason
 account_ref, account_id, plan_type, rate_limits,
 token_usage, revision
 ```
+
+这三个事件的具体线约定：
+
+- `account.changed`：携带 `plan_type`。上游未报告套餐时字段缺省，不推断。
+- `rate_limits.changed`：`rate_limits` 是数组，每项包含 `rate_limit_window`（`five_hour` / `weekly`）、`remaining_percent` 与可选 `reset_at_ms`。只上报上游实际报告的窗口，缺失的窗口完全缺省，设备显示 `--`。
+- `token_usage.changed`：`seven_day_tokens` 为最近 7 天累计 token；`seven_day_window_days` 恒为 7；`seven_day_as_of` 为统计截止日。
+- `remaining_percent` 是剩余百分比（0..100），**不是** `usedPercent`；Bridge 在下发前完成换算，设备不得再次取反。
+- 上游 `resetsAt` 为 epoch 秒，线上 `reset_at_ms` 为 epoch 毫秒；单位换算只在 Bridge 做一次。
+- 三个事件都在 `system.thread_summaries` 的 summary scope 上发布，且仅发给生效能力包含 `account` 的设备。
+- 同一份快照只发布一次；数值未变时不重复追加事件。
 
 `context.usage.changed`：
 
@@ -4594,7 +4607,7 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 | 计划 | `plan` | 通过 turn 事件和 `item_stream` | `plan.updated` | `0x01A1..0x01A3` | full | `[本轮实现]` |
 | 推理摘要 | `reasoning_summary` | 通过 turn 事件和 `item_stream` | `reasoning.summary` | `0x01A0`, `0x01AC..0x01AD` | full | `[本轮实现]` |
 | MCP 状态与交互 | `mcp` | `mcp.respond` (basic action/content) | `mcp.status.changed`, `mcp.request`, `mcp.oauth.completed`; `requested_permissions` is `[本轮不实现]` | `0x0141..0x0143`, `0x0198..0x0199` | full | `[本轮实现]` |
-| 账户与额度 | `account` | `account.read`, `account.rate_limits.read`, `account.token_usage.read` | `account.changed`, `rate_limits.changed`, `token_usage.changed` | `0x0180..0x0186`, `0x01AE..0x01B4` | panel/full | `[本轮实现]` |
+| 账户与额度 | `account` | `account.read`, `account.rate_limits.read`, `account.token_usage.read` | `account.changed`, `rate_limits.changed`, `token_usage.changed` | `0x0180..0x0186`, `0x018D..0x018F`, `0x01AE..0x01B4` | panel/full | `[本轮实现]` |
 | 上下文使用 | `context_usage` | `context.read` | `context.usage.changed` | `0x0187..0x0189`, `0x01AE..0x01B4` | panel/full | `[本轮实现]` |
 | 上下文压缩 | `context_compact` | `context.compact` | `context.compaction.*` | `0x018A..0x018C` | full | `[本轮不实现]` |
 | 搜索 | `thread_search` | `thread.search` | `search.result` | `0x01BC..0x01BE` | full | `[本轮实现]` |
