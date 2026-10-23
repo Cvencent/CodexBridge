@@ -205,6 +205,43 @@ class CbdpDeviceSession:
             except OSError:
                 pass
 
+    def _mark_online(self) -> float:
+        """Apply negotiated limits and report the session online once.
+
+        Returns the deadline for the first heartbeat. Kept in one place so a
+        peer that finishes its handshake with data and one that connects
+        silently take exactly the same path.
+        """
+        session = self.gateway.session
+        assert session is not None
+        self._max_frame_bytes = int(session.max_frame_bytes or 65536)
+        self._reassembler.max_frame_bytes = self._max_frame_bytes
+        self._heartbeat_seconds = float(
+            session.heartbeat_seconds or self.heartbeat_seconds
+        )
+        info = {
+            "device_id": session.device_id or self.device_id,
+            "model": session.model,
+            "name": session.name,
+            "firmware": session.firmware,
+            "profile": session.profile,
+            "max_text_chars": session.max_text_chars,
+            "capabilities": sorted(self.gateway._capabilities()),
+        }
+        capabilities = (
+            self.on_device_info(info)
+            if self.on_device_info is not None
+            else None
+        )
+        if capabilities is not None:
+            session.enabled = capability_bitmap(capabilities)
+            session.effective = (
+                session.supported & session.enabled & session.transport_allowed
+            )
+        if self.on_online is not None:
+            self.on_online()
+        return time.monotonic() + self._heartbeat_seconds
+
     def run_once(self) -> None:
         if self.gateway is None:
             raise RuntimeError("CBDP gateway not configured")
@@ -234,6 +271,16 @@ class CbdpDeviceSession:
                     deadline = auth_deadline or hello_deadline
                     if now > deadline:
                         return
+                # The gateway can finish its handshake from data already
+                # buffered (or from its own state machine), so promote the
+                # session to "online" here rather than only after a later
+                # recv(). Without this a peer that connects and then goes
+                # completely silent never entered the heartbeat branch below,
+                # which is how a powered-off device kept its socket (and its
+                # "online" signal) alive indefinitely.
+                if not online and self.gateway.session is not None and self.gateway.session.ready:
+                    online = True
+                    next_ping = self._mark_online()
                 try:
                     readable, _, _ = select.select([sock], [], [], 0.25)
                 except (OSError, TypeError):
@@ -243,8 +290,16 @@ class CbdpDeviceSession:
                 if not readable:
                     if online and next_ping is not None and now >= next_ping:
                         if missed_pongs >= 3:
+                            # The peer stopped answering pings entirely. A TCP
+                            # socket can stay ESTABLISHED long after the device
+                            # powered off, so without this the session (and the
+                            # "somebody is online" signal built on it) would
+                            # survive indefinitely.
                             return
-                        self._send_ping()
+                        try:
+                            self._send_ping()
+                        except OSError:
+                            return
                         missed_pongs += 1
                         next_ping = now + self._heartbeat_seconds
                     continue
@@ -290,33 +345,7 @@ class CbdpDeviceSession:
                 session = self.gateway.session
                 if session is not None and session.ready and not online:
                     online = True
-                    self._max_frame_bytes = int(session.max_frame_bytes or 65536)
-                    self._reassembler.max_frame_bytes = self._max_frame_bytes
-                    self._heartbeat_seconds = float(
-                        session.heartbeat_seconds or self.heartbeat_seconds
-                    )
-                    next_ping = time.monotonic() + self._heartbeat_seconds
-                    info = {
-                        "device_id": session.device_id or self.device_id,
-                        "model": session.model,
-                        "name": session.name,
-                        "firmware": session.firmware,
-                        "profile": session.profile,
-                        "max_text_chars": session.max_text_chars,
-                        "capabilities": sorted(self.gateway._capabilities()),
-                    }
-                    capabilities = (
-                        self.on_device_info(info)
-                        if self.on_device_info is not None
-                        else None
-                    )
-                    if capabilities is not None:
-                        session.enabled = capability_bitmap(capabilities)
-                        session.effective = (
-                            session.supported & session.enabled & session.transport_allowed
-                        )
-                    if self.on_online is not None:
-                        self.on_online()
+                    next_ping = self._mark_online()
             return
         finally:
             if sock is not None:

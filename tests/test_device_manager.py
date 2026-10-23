@@ -251,6 +251,39 @@ class DeviceManagerTest(unittest.TestCase):
         FakeSession.created.kwargs["on_heartbeat"]()
         self.assertGreater(self.registry.get("d1").last_seen, first_seen)
 
+    def test_a_failed_redial_does_not_mark_a_powered_off_device_seen(self):
+        # Reproduces the "all devices off, machine still busy" bug: a dial
+        # attempt used to stamp last_seen, so a powered-off paired device kept
+        # looking freshly seen and kept the Codex collector convinced somebody
+        # was online. A failed dial must leave liveness untouched.
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="dotii",
+            device_id="d1",
+            name="Desk",
+            port=8765,
+            capabilities=["status", "text", "results", "read_ack"],
+        )
+        self.manager.sync([result])
+        self.assertTrue(FakeSession.online.wait(ONLINE_TIMEOUT_SECONDS))
+        self.manager.stop()
+        FakeSession.online.clear()
+
+        record = self.registry.get("d1")
+        stale = time.time() - 600.0
+        record.last_seen = stale
+        self.registry.save()
+
+        FakeSession.fail_before_online = True
+        manager = DeviceManager(self.registry, self.hub, session_factory=FakeSession)
+        self.addCleanup(manager.stop)
+        manager.redial_paired()
+        time.sleep(0.3)
+
+        # Give a broken dial thread a moment to fail, then verify the stamp did
+        # not move: only a real session or announcement may refresh it.
+        self.assertAlmostEqual(self.registry.get("d1").last_seen, stale, places=3)
+
     def test_discovery_name_survives_missing_device_info_name(self):
         result = DiscoveryResult(
             host="127.0.0.1",

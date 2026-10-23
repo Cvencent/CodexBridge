@@ -285,7 +285,11 @@ class DeviceManager:
             # from it is expected while it is connected, and rewriting the
             # registry file every round buys nothing.
             return
-        record.last_seen = time.time()
+        # ``last_seen`` is liveness evidence, not "we tried". Recording the
+        # dial attempt here made a powered-off device look freshly seen every
+        # few seconds, which both polluted the device list and kept telling the
+        # Codex collector that somebody was online. Only an actual session
+        # (via _online/_heartbeat) or a real discovery announcement may move it.
         if record.registration_state != "approved":
             self.registry.save()
             return
