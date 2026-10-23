@@ -265,6 +265,60 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(payload["codex"], status)
         self.assertTrue(payload["ok"])
 
+    def test_codex_collection_can_be_switched_off(self):
+        calls = []
+
+        def action(payload):
+            calls.append(payload)
+            return {"codex": {"enabled": bool(payload.get("enabled"))}}
+
+        body = json.dumps({"enabled": False}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/codex-status",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            codex_action=action,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["codex"]["enabled"])
+        self.assertEqual(calls, [{"enabled": False}])
+
+    def test_codex_collection_toggle_rejects_bad_payload(self):
+        def action(_payload):
+            raise ValueError("enabled_required")
+
+        body = json.dumps({}).encode()
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/codex-status",
+            {},
+            body,
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+            codex_action=action,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "enabled_required")
+
+    def test_codex_collection_toggle_requires_an_action(self):
+        status, payload = handle_request(
+            "POST",
+            "/api/admin/codex-status",
+            {},
+            b"{}",
+            "127.0.0.1",
+            self.hub,
+            self.registry,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"], "codex_unavailable")
+
     def test_general_settings_default_to_disabled(self):
         status, payload = handle_request(
             "GET",

@@ -87,6 +87,22 @@ class SettingsPageTest(unittest.TestCase):
         self.assertIn("显示中间事件", preferences.group(0))
         self.assertNotIn("显示中间事件", access.group(0))
 
+    def test_codex_collection_switch_lives_in_preferences(self):
+        # The switch is the user's escape hatch when Codex collection makes the
+        # machine stutter, so it belongs next to the other run settings.
+        preferences = SETTINGS_HTML.index('id="preferences-panel"')
+        access = SETTINGS_HTML.index('id="access-panel"')
+        switch = SETTINGS_HTML.index('id="codex-collector-enabled"')
+        self.assertGreater(switch, preferences)
+        self.assertGreater(switch, access)
+        self.assertIn("Codex 采集", SETTINGS_HTML)
+        self.assertIn("saveCodexCollector", SETTINGS_HTML)
+        self.assertIn("applyCodexCollector", SETTINGS_HTML)
+
+    def test_codex_collection_warning_names_the_tradeoff(self):
+        self.assertIn("任务列表会停止更新", SETTINGS_HTML)
+        self.assertIn("不再启动独立的 Codex 后台进程", SETTINGS_HTML)
+
     def test_queue_is_hidden_until_an_admin_queue_api_is_available(self):
         self.assertRegex(SETTINGS_HTML, r'id="queue-nav-item"[^>]*\bhidden\b')
         self.assertIn("/api/admin/queues", SETTINGS_HTML)

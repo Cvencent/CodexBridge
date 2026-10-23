@@ -494,6 +494,7 @@ class CompanionService:
         show_intermediate_events: bool | Callable[[], bool] = False,
         close_client_on_stop: bool = True,
         isolated: bool = False,
+        codex_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.cwd = Path(cwd)
@@ -602,11 +603,26 @@ class CompanionService:
         self._untitled_threads: set[str] = set()
         self._read_state = read_state or ReadStateStore(self.data_dir / "read-state.json")
         self._show_intermediate_events = show_intermediate_events
+        # When Codex collection is switched off the background reconciler must
+        # stop too: this poll is what keeps a second app-server reading the
+        # (multi-GB) thread store every few seconds, and it ran even when every
+        # device was unplugged. None keeps the historical always-on behaviour
+        # for embedders and tests that build the service directly.
+        self._codex_enabled = codex_enabled
         self._hidden_intermediate_items: dict[str, str] = {}
 
     def _include_intermediate_events(self) -> bool:
         setting = self._show_intermediate_events
         return bool(setting() if callable(setting) else setting)
+
+    def _codex_collection_enabled(self) -> bool:
+        if self._codex_enabled is None:
+            return True
+        try:
+            return bool(self._codex_enabled())
+        except (OSError, RuntimeError, ValueError):
+            # A broken probe must never silently disable collection.
+            return True
 
     def _codex_inputs(
         self,
@@ -661,7 +677,10 @@ class CompanionService:
     def start(self) -> None:
         self._stop.clear()
         self.queues.start()
-        self._ensure_client()
+        # A companion start (phone access toggled, boot) must not spawn Codex
+        # either: the switch is a Codex setting, not a phone setting.
+        if self._codex_collection_enabled():
+            self._ensure_client()
         if self._poll_thread is None or not self._poll_thread.is_alive():
             self._poll_thread = threading.Thread(
                 target=self._watch_threads, name="companion-thread-watch", daemon=True,
@@ -670,6 +689,11 @@ class CompanionService:
 
     def _watch_threads(self) -> None:
         while not self._stop.wait(self._poll_seconds()):
+            if not self._codex_collection_enabled():
+                # Drop the baseline so re-enabling starts a fresh comparison
+                # instead of replaying every change missed while switched off.
+                self._observed_threads = None
+                continue
             try:
                 self.poll_thread_changes()
             except (AppServerError, OSError, ValueError) as error:
@@ -689,6 +713,8 @@ class CompanionService:
         return POLL_IDLE_SECONDS
 
     def poll_thread_changes(self) -> None:
+        if not self._codex_collection_enabled():
+            return
         current = {
             row["thread_id"]: row
             for row in self.list_threads(limit=80, refresh=True)["threads"]
@@ -763,6 +789,16 @@ class CompanionService:
         return AppServerClient(command, self.cwd, prefer_shared=True)
 
     def _ensure_client(self) -> Any:
+        # "Off" has to mean off. Every path -- the background reconciler, a
+        # phone list poll and an explicit device action -- would otherwise
+        # resurrect the private app-server the user just stopped, and with it
+        # the multi-GB background reader.
+        #
+        # The switch is read before the client lock so a stale client reference
+        # cannot outlive the switch; the check is deliberately outside the lock
+        # because the admin path flips the state without holding this one.
+        if not self._codex_collection_enabled():
+            raise AppServerError("Codex 采集已关闭")
         with self._client_lock:
             if self._client is not None:
                 return self._client
@@ -819,6 +855,15 @@ class CompanionService:
                 client.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    def detach_codex_client(self) -> None:
+        """Drop the shared app-server after Codex collection is switched off.
+
+        The service does not own the shared client, so this only clears its
+        reference and closes the transport; the next request either fails with
+        the switch reported or builds a fresh client once the switch is on.
+        """
+        self._reset_client()
 
     def _thread_note(self, thread_id: str) -> None:
         with self._resumed_lock:

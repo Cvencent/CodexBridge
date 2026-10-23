@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -114,16 +115,56 @@ def _discovery_loop(
 
 
 class _CodexState:
-    def __init__(self) -> None:
+    """Collector state plus the user's on/off choice.
+
+    The choice is persisted because it is the escape hatch for a machine that
+    stutters while Codex collection runs: resetting to "on" after every
+    restart would put the stutter straight back.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
         self._lock = threading.Lock()
+        self._path = Path(path) if path is not None else None
         self._enabled = True
         self._state = "starting"
         self._detail = "正在启动 Codex 采集"
         self._last_snapshot_epoch = 0
+        if self._path is not None:
+            self._enabled = self._load_enabled()
+
+    def _load_enabled(self) -> bool:
+        assert self._path is not None
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return True
+        if not isinstance(payload, dict):
+            return True
+        value = payload.get("enabled")
+        return bool(value) if isinstance(value, bool) else True
+
+    def _save_enabled_locked(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps({"enabled": self._enabled}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self._path)
+        except OSError:
+            # A settings file that cannot be written must not block the switch.
+            pass
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
-            self._enabled = enabled
+            self._enabled = bool(enabled)
+            if not self._enabled:
+                self._state = "paused"
+                self._detail = "Codex 采集已关闭"
+            self._save_enabled_locked()
 
     def report(self, state: str, detail: str) -> None:
         with self._lock:
@@ -145,8 +186,9 @@ class _CodexState:
 
 
 class _CodexSourceHolder:
-    def __init__(self) -> None:
+    def __init__(self, enabled=None) -> None:
         self._lock = threading.Lock()
+        self._enabled = enabled
         self._source = None
         self._fallback = None
         self._fallback_command = None
@@ -183,6 +225,11 @@ class _CodexSourceHolder:
             fallback.close()
 
     def request(self, method: str, params: dict) -> object:
+        if self._enabled is not None and not self._enabled():
+            # Switching collection off must not be undone by the first device
+            # catalog request: spawning an app-server here is exactly what the
+            # switch exists to stop.
+            raise AppServerError("Codex 采集已关闭")
         with self._lock:
             source = self._source
             fallback = self._fallback or self._fallback_client
@@ -407,7 +454,13 @@ def main(argv: list[str] | None = None) -> int:
     _migrate_legacy(registry)
 
     speech = SpeechService(output_dir=data_dir / "recordings")
-    source_holder = _CodexSourceHolder()
+    # Created before the Codex plumbing because both the collector and the
+    # device catalog gate on it: switching collection off has to stop every
+    # path that could restart the private app-server.
+    codex_state = _CodexState(data_dir / "codex-collection.json")
+    source_holder = _CodexSourceHolder(
+        enabled=lambda: codex_state.snapshot()["enabled"],
+    )
     codex_cwd = _codex_working_directory()
     codex_command = os.environ.get("CODEXBRIDGE_CODEX_COMMAND")
     # Prefer the desktop's own app-server over spawning a second one: a private
@@ -483,7 +536,6 @@ def main(argv: list[str] | None = None) -> int:
         cbdp_session_factory=CbdpDeviceSession,
         cbdp_gateway_factory=cbdp_gateway_factory,
     )
-    codex_state = _CodexState()
 
     companion_store = CompanionStore(data_dir / "companion.json", registry=registry)
     try:
@@ -501,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         close_client_on_stop=False,
         read_state=read_state,
         show_intermediate_events=lambda: companion_store.show_intermediate_events,
+        codex_enabled=lambda: codex_state.snapshot()["enabled"],
     )
     hub.commands = companion_service.commands
     # Approval changes must also reach CBDP panels, not just the legacy JSON
@@ -562,6 +615,24 @@ def main(argv: list[str] | None = None) -> int:
             companion.stop()
             companion_service.stop()
 
+    def codex_action(payload: dict) -> dict:
+        if "enabled" not in payload:
+            raise ValueError("enabled_required")
+        value = payload.get("enabled")
+        if not isinstance(value, bool):
+            raise ValueError("enabled_invalid")
+        codex_state.set_enabled(value)
+        if not value:
+            # Free the app-server this process spawned: it keeps its own
+            # background watcher alive and would otherwise keep reading the
+            # multi-GB thread store even with collection switched off. Dropping
+            # the cached source first means the collector cannot hand a closed
+            # client to the next snapshot.
+            source_holder.set(None)
+            companion_service.detach_codex_client()
+            shared_app_server.close()
+        return {"codex": codex_state.snapshot()}
+
     def companion_action(payload: dict) -> dict:
         return _apply_companion_action(
             payload,
@@ -607,6 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         companion_status=companion_status,
         companion_action=companion_action,
         device_registration_action=device_registration_action,
+        codex_action=codex_action,
     )
     try:
         admin.start()

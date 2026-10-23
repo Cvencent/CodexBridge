@@ -581,8 +581,9 @@ APP_JS = r"""
     setText("overview-pending", String(pending.length));
     const codex = state.codex || {};
     const codexEnabled = codex.enabled !== false;
-    setText("overview-codex", codexEnabled ? "可用" : "未连接");
+    setText("overview-codex", codexEnabled ? "可用" : "已关闭");
     setText("overview-codex-detail", codex.collector_detail || codex.collector_state || "本机 Codex 采集状态");
+    applyCodexCollector(codex);
 
     const summary = {
       approved: state.devices.filter(function (model) { return model.registrationState === "approved"; }).length,
@@ -1536,6 +1537,13 @@ APP_JS = r"""
       state.general = payload.general || {};
       const toggle = $("#startup-enabled");
       if (toggle) toggle.checked = Boolean(state.general.startup_enabled);
+      try {
+        const codex = await api(API.codexStatus);
+        state.codex = codex.codex || null;
+        applyCodexCollector(state.codex);
+      } catch (error) {
+        recordError("codex", error);
+      }
       setAlert($("#general-message"), "常规设置已读取。");
       clearError("general");
     } catch (error) {
@@ -1560,6 +1568,40 @@ APP_JS = r"""
       setAlert($("#general-message"), toggle.checked ? "已开启开机自启动。" : "已关闭开机自启动。", "success");
     } catch (error) {
       toggle.checked = state.general ? Boolean(state.general.startup_enabled) : !desired;
+      setAlert($("#general-message"), "保存失败：" + userMessage(error), "error");
+    } finally {
+      toggle.disabled = false;
+    }
+  }
+
+  function applyCodexCollector(codex) {
+    const toggle = $("#codex-collector-enabled");
+    if (toggle) toggle.checked = (codex || {}).enabled !== false;
+  }
+
+  async function saveCodexCollector() {
+    const toggle = $("#codex-collector-enabled");
+    if (!toggle) return;
+    const desired = toggle.checked;
+    toggle.disabled = true;
+    setAlert($("#general-message"), "正在保存 Codex 采集设置...", "working");
+    try {
+      const payload = await api(API.codexStatus, {
+        method: "POST",
+        body: { enabled: desired }
+      });
+      state.codex = payload.codex || null;
+      applyCodexCollector(state.codex);
+      renderOverview();
+      setAlert(
+        $("#general-message"),
+        desired
+          ? "已开启 Codex 采集。"
+          : "已关闭 Codex 采集，并停止了 CodexBridge 启动的 Codex 后台进程；任务列表会停止更新。",
+        "success"
+      );
+    } catch (error) {
+      toggle.checked = state.codex ? state.codex.enabled !== false : !desired;
       setAlert($("#general-message"), "保存失败：" + userMessage(error), "error");
     } finally {
       toggle.disabled = false;
@@ -1859,6 +1901,8 @@ APP_JS = r"""
     if (intermediate) intermediate.addEventListener("change", saveIntermediateEvents);
     const startup = $("#startup-enabled");
     if (startup) startup.addEventListener("change", saveStartup);
+    const codexCollector = $("#codex-collector-enabled");
+    if (codexCollector) codexCollector.addEventListener("change", saveCodexCollector);
     const newCode = $("#companion-new-code");
     if (newCode) newCode.addEventListener("click", function () { newCompanionCode(newCode); });
     const copy = $("#copy-addresses");

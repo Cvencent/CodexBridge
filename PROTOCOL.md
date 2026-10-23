@@ -1417,6 +1417,8 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
 - `GET /api/admin/companion` 返回开关、局域网地址、当前端口、端口健康状态与已配对手机；手机列表由统一设备注册表派生。
 - `GET /api/admin/devices` 同时返回手机和硬件；公共字段包含 `kind`、`transport`、`registration_state`、`registration_method`、`online`、`last_address`、`has_token`、`queued_count`，不包含任何令牌或令牌摘要。
 - `POST /api/admin/companion` 支持 `{"enabled":true}`、`{"show_intermediate_events":true}`、`{"action":"new_code"}`、`{"action":"remove_phone","phone_id":"phone-xxxxxxxxxxxx"}`、`{"action":"set_port","kind":"companion","port":8568}` 和 `{"action":"set_port","kind":"discovery","port":8569}`。
+- `GET /api/admin/codex-status` 返回 `codex.enabled`、采集状态与最后快照时间。
+- `POST /api/admin/codex-status` 支持 `{"enabled":false}` 与 `{"enabled":true}`。关闭采集后，Bridge 停止 Codex 采集与任务校准轮询，并关闭它自己启动的独立 `codex app-server` 进程；设备连接、心跳、语音与 `PROTOCOL.md` 定义的其它能力不受影响，任务列表停止更新。再次开启后按原协议恢复。
 - 本机管理接口仍只允许回环地址访问；手机伴侣接口不开放本机管理能力。
 
 ### 17.6 读取缓存与新鲜度

@@ -136,3 +136,55 @@ class ReadCacheWiringTests(unittest.TestCase):
 
     def test_before_the_first_poll_the_watcher_keeps_its_fast_beat(self):
         self.assertEqual(self.service._poll_seconds(), POLL_ACTIVE_SECONDS)
+
+    # -- codex collection switch ------------------------------------------
+    def test_disabling_collection_stops_the_background_poll(self):
+        # With the switch off nothing may touch the app-server: the poll is
+        # what kept a private Codex process reading the thread store every few
+        # seconds even when no device was connected.
+        self.service._codex_enabled = lambda: False
+        self.assertEqual(self.count(self.service.poll_thread_changes), 0)
+
+    def test_disabling_collection_drops_the_comparison_baseline(self):
+        self.service.poll_thread_changes()
+        self.assertIsNotNone(self.service._observed_threads)
+        self.service._codex_enabled = lambda: False
+        self.service._observed_threads = None
+        self.assertIsNone(self.service._observed_threads)
+
+    def test_enabling_collection_polls_again(self):
+        flag = {"on": False}
+        self.service._codex_enabled = lambda: flag["on"]
+        self.assertEqual(self.count(self.service.poll_thread_changes), 0)
+        flag["on"] = True
+        self.assertGreater(self.count(self.service.poll_thread_changes), 0)
+
+    def test_a_read_cannot_resurrect_a_switched_off_app_server(self):
+        # The switch must hold even for an explicit phone request: otherwise
+        # the first list poll would spawn the private Codex process again.
+        from codexbridge.codex.app_server import AppServerError
+
+        self.service._client = None
+        self.service._codex_enabled = lambda: False
+        with self.assertRaises(AppServerError):
+            self.service.list_threads(limit=20)
+        self.assertIsNone(self.service._client)
+        self.assertFalse(self.client.started)
+
+    def test_re_enabling_lets_the_next_read_rebuild_the_client(self):
+        self.service._codex_enabled = lambda: False
+        self.service._client = None
+        with self.assertRaises(Exception):
+            self.service.list_threads(limit=20)
+        self.service._codex_enabled = lambda: True
+        self.assertGreater(self.count(
+            lambda: self.service.list_threads(limit=20, refresh=True)), 0)
+        self.assertIsNotNone(self.service._client)
+
+    def test_a_broken_switch_never_silently_stops_collection(self):
+        def boom():
+            raise RuntimeError("probe failed")
+
+        self.service._codex_enabled = boom
+        self.assertTrue(self.service._codex_collection_enabled())
+        self.assertGreater(self.count(self.service.poll_thread_changes), 0)

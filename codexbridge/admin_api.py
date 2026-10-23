@@ -43,6 +43,7 @@ def handle_request(
     companion_status: Callable[[], dict] | None = None,
     companion_action: Callable[[dict], dict] | None = None,
     device_registration_action: Callable[[str, str], bool] | None = None,
+    codex_action: Callable[[dict], dict] | None = None,
 ):
     if not _is_loopback(client_host):
         return 403, {"ok": False, "error": "loopback_required"}
@@ -96,6 +97,15 @@ def handle_request(
         if method == "GET" and path == "/api/admin/codex-status":
             status = codex_status() if codex_status is not None else {}
             return 200, {"ok": True, "codex": status}
+        if method == "POST" and path == "/api/admin/codex-status":
+            payload = _json_body(body)
+            if codex_action is None:
+                return 400, {"ok": False, "error": "codex_unavailable"}
+            try:
+                result = codex_action(payload)
+            except ValueError as error:
+                return 400, {"ok": False, "error": str(error) or "invalid_request"}
+            return 200, {"ok": True, **(result or {})}
         if method == "GET" and path == "/api/admin/devices":
             online_ids = (
                 hub.online_device_ids()
@@ -313,10 +323,12 @@ class AdminApi:
         companion_status: Callable[[], dict] | None = None,
         companion_action: Callable[[dict], dict] | None = None,
         device_registration_action: Callable[[str, str], bool] | None = None,
+        codex_action: Callable[[dict], dict] | None = None,
     ):
         self.companion_status = companion_status
         self.companion_action = companion_action
         self.device_registration_action = device_registration_action
+        self.codex_action = codex_action
         self.hub = hub
         self.registry = registry
         self.host = host
@@ -386,6 +398,7 @@ class AdminApi:
                             api.companion_status,
                             api.companion_action,
                             api.device_registration_action,
+                            api.codex_action,
                         )
                 if isinstance(payload, str):
                     encoded = payload.encode("utf-8")

@@ -14,6 +14,7 @@ from codexbridge.devices.registry import DeviceRegistry
 from codexbridge.hub import BridgeHub
 from codexbridge.__main__ import (
     _CodexSourceHolder,
+    _CodexState,
     _apply_companion_action,
     _launch_restarted_process,
     _restart_command,
@@ -89,6 +90,38 @@ class CodexCommandResolutionTest(unittest.TestCase):
         self.assertEqual(command, [str(explicit)])
 
 
+class CodexStatePersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "codex-collection.json"
+
+    def test_defaults_to_enabled_without_a_state_file(self):
+        state = _CodexState(self.path)
+        self.assertTrue(state.snapshot()["enabled"])
+
+    def test_off_survives_a_restart(self):
+        # Turning collection off has to stick: coming back on at the next
+        # launch would put the stutter straight back.
+        _CodexState(self.path).set_enabled(False)
+        self.assertFalse(_CodexState(self.path).snapshot()["enabled"])
+
+    def test_on_survives_a_restart(self):
+        _CodexState(self.path).set_enabled(True)
+        self.assertTrue(_CodexState(self.path).snapshot()["enabled"])
+
+    def test_a_corrupt_state_file_falls_back_to_enabled(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertTrue(_CodexState(self.path).snapshot()["enabled"])
+
+    def test_switching_off_reports_a_paused_collector(self):
+        state = _CodexState(self.path)
+        state.set_enabled(False)
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["collector_state"], "paused")
+        self.assertIn("关闭", snapshot["collector_detail"])
+
+
 class CodexSourceHolderTest(unittest.TestCase):
     def test_request_uses_the_active_source_client(self):
         class Client:
@@ -160,6 +193,32 @@ class CodexSourceHolderTest(unittest.TestCase):
         self.assertEqual(client.started, 1)
         self.assertEqual(client.calls, [("project/list", {"limit": 100})])
 
+    def test_holder_refuses_to_start_codex_while_collection_is_off(self):
+        class Client:
+            def __init__(self):
+                self.started = 0
+
+            def start(self):
+                self.started += 1
+
+            def request(self, method, params=None):
+                return {"source": "fallback"}
+
+        holder = _CodexSourceHolder(enabled=lambda: False)
+        client = Client()
+        holder.configure(
+            None,
+            Path("D:/work"),
+            Path("D:/data"),
+            fallback_client=client,
+            owns_fallback=False,
+        )
+
+        # The switch exists to stop exactly this: a device catalog request
+        # reviving the private app-server the user just turned off.
+        with self.assertRaises(AppServerError):
+            holder.request("project/list", {"limit": 100})
+        self.assertEqual(client.started, 0)
 
 
 class UnifiedDeviceAdminTest(unittest.TestCase):
