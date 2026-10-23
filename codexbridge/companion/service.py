@@ -146,6 +146,10 @@ LOG_SCAN_LIMIT = 24
 # watcher's forced refresh threw the shared entry away before any device could
 # reuse it. One wide page, sliced per caller, costs one fetch.
 LIST_PAGE_LIMIT = 80
+# The background reconciler's own page size. Deliberately smaller than the
+# phone-facing page: rows further down the list drag long thread histories into
+# the response and multiply the disk cost of a change-detection poll.
+WATCH_PAGE_LIMIT = 40
 # How long a turn-read verdict may stand for a row the rollout log cannot
 # classify. The log stays the authority while it has anything to say, so this
 # only bounds the case where it is silent or unreadable.
@@ -775,9 +779,14 @@ class CompanionService:
         # lives one layer down instead: bounded item pages are now cached, so
         # the collector and a phone request that land close together share the
         # expensive part without hiding a state change from this loop.
+        # 40 rows, not 80: measured on this machine, a page of 40 costs ~5.5 MB
+        # of history while a page of 80 costs ~38 MB, because the extra rows
+        # pull a very long thread into the response. The watcher only needs to
+        # notice changes near the top of the recency list; a phone that asks for
+        # more still gets its own wider page on demand.
         current = {
             row["thread_id"]: row
-            for row in self.list_threads(limit=80, refresh=True)["threads"]
+            for row in self._list_page(limit=WATCH_PAGE_LIMIT, refresh=True)["threads"]
         }
         if not self._isolated and self.PERIODIC_DESKTOP_DISCOVERY:
             for thread_id in sorted(current, key=lambda key: self._desktop_discovery_due.get(key, 0)):

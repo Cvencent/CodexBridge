@@ -84,7 +84,13 @@ class ReadCacheWiringTests(unittest.TestCase):
             "t1", turns=[{"id": "brand-new", "status": "completed",
                           "completedAt": 1791000300}])], "nextCursor": None}
         self.count(self.service.poll_thread_changes)
-        self.assertIn(("thread/list", {"limit": 80, "sortKey": "recency_at",
+        # The reconciler uses its own narrower page: measured cost jumps ~7x
+        # between 40 and 80 rows because the extra rows drag a long thread into
+        # the response.
+        from codexbridge.companion.service import WATCH_PAGE_LIMIT
+        self.assertLess(WATCH_PAGE_LIMIT, 80)
+        self.assertIn(("thread/list", {"limit": WATCH_PAGE_LIMIT,
+                                       "sortKey": "recency_at",
                                        "sortDirection": "desc",
                                        "sourceKinds": ["cli", "vscode", "exec",
                                                        "appServer", "unknown"],
