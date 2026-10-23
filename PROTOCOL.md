@@ -52,7 +52,8 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
   AI Passport 在首页/菜单态会主动拒绝 CBDP TCP 以腾出网络电台所需的 DMA 内存，
   这类设备仍可通过 UDP `HOME_COUNTERS(0x1E)` 保持首页计数，管理页不应误报离线。
   CBDP TCP 会话仍是控制能力的权威条件；pending、rejected、revoked 设备不因
-  UDP 通告进入在线状态。
+  UDP 通告进入在线状态。已批准且持有令牌的设备收到带 `pending` 的重复通告
+  时不得被降级或清空令牌；只有未批准设备才进入待批准流程。
 - **2026-10-22 后续修正：** 同一手机设备的 CBDP SSE 与 WebSocket 共用一条
   `CbdpHttpSession`。单条 SSE 或 WebSocket 断开时只注销该网络流，不再连带关闭
   共享会话；会话改由 `last_seen` 超过 120 秒 TTL 后回收，或在 Companion 服务

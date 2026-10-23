@@ -4581,6 +4581,8 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 - 已批准设备发出有效 UDP discovery/presence 会刷新 `last_seen`，最近 30 秒内即使
   没有 CBDP TCP 会话也按在线展示。`online` 只表示设备可达；任务控制、订阅和上行
   命令仍要求建立并完成 CBDP 会话。pending、rejected、revoked 设备不适用。
+  已批准设备即使收到携带旧 pending nonce 的重复 discovery/presence，也不得被降级
+  为待批准或清空已配对令牌。
 - 双路径到达时由设备侧按"取较大值 + 落地窗口"去重；Bridge 不改变 TCP 计数的语义。
 - 验收要求：首页无 TCP 会话时三个数字仍能 1~2 秒内更新；进入 Codex 后任务流程
   无回归；单包不触发 ESP32-C3 的 DMA 申请失败。

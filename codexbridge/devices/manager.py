@@ -270,7 +270,7 @@ class DeviceManager:
         )
         if legacy is not None and result.device_id != legacy_id:
             self.registry.remove(legacy_id)
-        if result.registration_state == "pending":
+        if result.registration_state == "pending" and not record.token:
             same_nonce = record.registration_nonce == result.registration_nonce
             if not same_nonce or record.registration_state == "revoked":
                 record.registration_nonce = result.registration_nonce

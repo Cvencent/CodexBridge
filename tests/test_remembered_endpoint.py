@@ -159,6 +159,56 @@ class PresenceLivenessTest(unittest.TestCase):
         self.assertIn("aipassport-1", hub.online_device_ids())
 
 
+class PresenceRegistrationStateTest(unittest.TestCase):
+    def test_presence_does_not_demote_an_approved_device(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+        hub = BridgeHub(registry)
+
+        class HomeOnlySession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_once(self):
+                raise ConnectionRefusedError(10061, "home-only transport")
+
+            def stop(self):
+                pass
+
+        manager = DeviceManager(registry, hub, session_factory=HomeOnlySession)
+        self.addCleanup(manager.stop)
+        token = registry.upsert(
+            "aipassport-1",
+            model="FoloOS-AI-Passport",
+            token="paired-token",
+            host="192.168.0.39",
+            port=8765,
+            protocol="cbdp",
+        ).token
+        self.assertTrue(token)
+
+        manager.sync(
+            [
+                DiscoveryResult(
+                    host="192.168.0.40",
+                    device="FoloOS-AI-Passport",
+                    device_id="aipassport-1",
+                    name=None,
+                    port=8765,
+                    capabilities=["status"],
+                    registration_state="pending",
+                    registration_nonce="stale-nonce-1234567890",
+                    protocol="cbdp",
+                )
+            ]
+        )
+
+        record = registry.get("aipassport-1")
+        self.assertEqual("approved", record.registration_state)
+        self.assertEqual("paired-token", record.token)
+
+
 class RedialTest(unittest.TestCase):
     def setUp(self):
         RecordingSession.created = []
