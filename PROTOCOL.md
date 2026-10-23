@@ -1440,6 +1440,13 @@ Bridge 重启、游标过期或慢消费者队列溢出时发送 `resync_require
   `thread/items/list` 头尾页，不再一次性拉取整条线程。这是 PC 侧读取方式与
   缓存策略的变化，**CBDP 线协议字段、消息类型、端口与握手均未变更**，设备端
   无需同步升级。分页项读取同样纳入上面的短缓存规则。
+- **2026-10-23 后续修正：** 新版 Codex 桌面可能只保存
+  `thread-client-id-v1:local%3A<thread_id>`、
+  `thread-reference-capability:<thread_id>`，不再写旧的
+  `thread-user-activity-times-v1`。Bridge 现在把这些键视为“桌面已收录该线程”；
+  若线程不在桌面 `unreadByIdentity` 且桌面状态文件晚于最新终态结果，就推进共享
+  已读水位并清除手机/ESP 的完成与失败角标。没有桌面记录且没有 activity 的纯手机
+  线程仍不会被误清除。
 
 因此设备端不需要为了“怕看到旧数据”而缩短轮询间隔：状态变化会在下一次校准
 （运行时 2 秒、空闲时 15 秒）内被推送，未变化时缓存读取是常数时间。

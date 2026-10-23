@@ -64,6 +64,21 @@ class DesktopReadSyncTest(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
+    def write_desktop_without_activity(self, known_thread="", filename="desktop.json"):
+        path = self.root / filename
+        atom = {"thread-user-activity-times-v1": {}}
+        if known_thread:
+            atom[f"thread-client-id-v1:local%3A{known_thread}"] = "client-thread"
+        payload = {
+            "electron-persisted-atom-state": atom,
+            "electron-thread-read-state-v1": {
+                "version": 1,
+                "unreadByIdentity": {"identity": {"local:profile": []}},
+            },
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
     def publish_result(self, thread="t1", stamp=100):
         self.hub.publish(
             MessageRecord(
@@ -137,6 +152,26 @@ class DesktopReadSyncTest(unittest.TestCase):
         self.assertEqual(1, sync_desktop_read_state(self.store, path, store=self.hub.store))
         self.assertTrue(self.store.is_message_read("result:t1:100"))
         self.assertEqual(0, self.hub.counts()["completed_unread"])
+
+    def test_desktop_known_thread_without_activity_follows_blue_dot_state(self):
+        self.publish_result(stamp=100)
+        path = self.write_desktop_without_activity(known_thread="t1")
+
+        changed = sync_desktop_read_state(self.store, path, store=self.hub.store)
+
+        self.assertEqual(1, changed)
+        self.assertTrue(self.store.is_message_read("result:t1:100"))
+        self.assertEqual(0, self.hub.counts()["completed_unread"])
+
+    def test_phone_only_thread_without_desktop_tracking_stays_unread(self):
+        self.publish_result(stamp=100)
+        path = self.write_desktop_without_activity()
+
+        changed = sync_desktop_read_state(self.store, path, store=self.hub.store)
+
+        self.assertEqual(0, changed)
+        self.assertFalse(self.store.is_message_read("result:t1:100"))
+        self.assertEqual(1, self.hub.counts()["completed_unread"])
 
     def test_remote_host_activity_is_not_treated_as_a_local_read(self):
         self.publish_result(stamp=100)

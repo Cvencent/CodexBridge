@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from urllib.parse import unquote
 
 from codexbridge.messages_store import MessageStore
 from codexbridge.read_state import ReadStateStore
@@ -130,6 +131,50 @@ def _desktop_unread(state: dict) -> set[str]:
     return unread
 
 
+def _desktop_read_state_available(state: dict) -> bool:
+    read = state.get("electron-thread-read-state-v1")
+    if not isinstance(read, dict):
+        return False
+    return isinstance(read.get("unreadByIdentity"), dict) or isinstance(
+        read.get("legacyMigration"), dict
+    )
+
+
+def _desktop_known_threads(state: dict) -> set[str]:
+    """Thread ids the desktop has explicitly written into its local UI state.
+
+    Newer desktop builds often create a thread and remove it from
+    ``unreadByIdentity`` without writing a legacy
+    ``thread-user-activity-times-v1`` entry. These keys still prove the desktop
+    knows the thread, so they let the shared read marker follow the visible
+    blue-dot state instead of getting stuck forever.
+    """
+
+    atom = state.get("electron-persisted-atom-state")
+    if not isinstance(atom, dict):
+        return set()
+    known: set[str] = set()
+    prefixes = (
+        "thread-reference-capability:",
+        "thread-tab-routes-v1:",
+        "thread-workspace-state-v1:",
+    )
+    for raw_key in atom:
+        key = str(raw_key or "")
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                thread_id = key[len(prefix):].strip()
+                if thread_id:
+                    known.add(thread_id)
+                break
+        marker = "thread-client-id-v1:local%3A"
+        if key.startswith(marker):
+            thread_id = unquote(key[len(marker):]).strip()
+            if thread_id:
+                known.add(thread_id)
+    return known
+
+
 def _terminal_times(store: MessageStore | None) -> dict[str, int]:
     """Newest completed/failed result timestamp for each known thread."""
 
@@ -196,12 +241,19 @@ def sync_desktop_read_state(
         else None
     )
     unread = _desktop_unread(state)
+    read_state_available = _desktop_read_state_available(state)
+    known_threads = _desktop_known_threads(state)
     desktop_updated = float(stat.st_mtime)
     changed = 0
-    for thread_id, seconds in activity.items():
-        if not seconds or thread_id in unread:
+    for thread_id, latest in terminal.items():
+        seconds = int(activity.get(thread_id, 0) or 0)
+        desktop_tracked = bool(seconds) or thread_id in known_threads
+        if not desktop_tracked or thread_id in unread:
             continue
-        latest = terminal.get(thread_id, 0)
+        if not seconds and not read_state_available:
+            # Without an explicit desktop read-state map, an absent activity
+            # entry is not enough evidence to retire a phone-only thread.
+            continue
         if latest and desktop_updated + 1.0 < latest:
             # The desktop has not written a decision for this result yet.
             continue
