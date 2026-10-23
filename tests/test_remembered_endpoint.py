@@ -114,6 +114,51 @@ class EndpointRegistryTest(unittest.TestCase):
         self.assertIsNone(reloaded.get("d1").port)
 
 
+class PresenceLivenessTest(unittest.TestCase):
+    def test_home_only_discovery_counts_as_online_without_tcp_session(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        registry = DeviceRegistry(Path(tmp.name) / "devices.json")
+        hub = BridgeHub(registry)
+
+        class HomeOnlySession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_once(self):
+                raise ConnectionRefusedError(10061, "home-only transport")
+
+            def stop(self):
+                pass
+
+        manager = DeviceManager(registry, hub, session_factory=HomeOnlySession)
+        self.addCleanup(manager.stop)
+        registry.mint_token("aipassport-1")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            manager.sync(
+                [
+                    DiscoveryResult(
+                        host="192.168.0.39",
+                        device="FoloOS-AI-Passport",
+                        device_id="aipassport-1",
+                        name=None,
+                        port=8765,
+                        capabilities=["status"],
+                        protocol="cbdp",
+                    )
+                ]
+            )
+            self.assertTrue(
+                wait_until(lambda: manager.online_count() == 0, 5.0),
+                "the refused TCP session was never cleaned up",
+            )
+
+        self.assertIsNotNone(registry.get("aipassport-1").last_seen)
+        self.assertIn("aipassport-1", hub.online_device_ids())
+
+
 class RedialTest(unittest.TestCase):
     def setUp(self):
         RecordingSession.created = []

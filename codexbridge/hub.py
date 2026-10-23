@@ -183,6 +183,7 @@ CATALOG_BACKED_EVENTS = frozenset(
 # HTTP/SSE phones refresh their registry timestamp on every stream heartbeat,
 # so a couple of missed beats should not flip them offline.
 PHONE_PRESENCE_TTL_SECONDS = 120.0
+HARDWARE_PRESENCE_TTL_SECONDS = 30.0
 
 
 class BridgeHub:
@@ -854,9 +855,10 @@ class BridgeHub:
     def online_device_ids(self) -> set[str]:
         """Return devices that should render as online right now.
 
-        Long-lived TCP sessions are authoritative. Phones talk over stateless
-        HTTP/SSE, so their freshness timestamp is the only available liveness
-        signal; an open SSE stream refreshes it on every heartbeat.
+        Long-lived TCP sessions are authoritative. Approved hardware that is
+        explicitly home-only still sends UDP presence, and phones talk over
+        stateless HTTP/SSE, so a fresh registry timestamp is their liveness
+        signal when no device session exists.
         """
 
         now = time.time()
@@ -867,11 +869,23 @@ class BridgeHub:
                 continue
             kind = str(getattr(record, "kind", "") or "")
             transport = str(getattr(record, "transport", "") or "")
-            if kind != "phone" and transport != "companion_http":
+            is_phone = kind == "phone" or transport == "companion_http"
+            is_hardware = (
+                kind == "hardware"
+                and transport == "device_tcp"
+                and getattr(record, "registration_state", "") == "approved"
+                and bool(getattr(record, "token", None))
+            )
+            if not is_phone and not is_hardware:
                 continue
+            ttl = (
+                PHONE_PRESENCE_TTL_SECONDS
+                if is_phone
+                else HARDWARE_PRESENCE_TTL_SECONDS
+            )
             seen = getattr(record, "last_seen", None)
             try:
-                if seen is not None and now - float(seen) <= PHONE_PRESENCE_TTL_SECONDS:
+                if seen is not None and now - float(seen) <= ttl:
                     online.add(record.device_id)
             except (TypeError, ValueError):
                 continue

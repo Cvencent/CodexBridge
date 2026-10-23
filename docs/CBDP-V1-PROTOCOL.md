@@ -4578,6 +4578,9 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 - 这是**新增旁路**：`system.codex_state(0x0704)`、summary 订阅、握手和命令流程
   全部保持不变。设备可以据此让首页完全不开 CBDP TCP 会话，进入 Codex 页时再照常
   握手订阅。
+- 已批准设备发出有效 UDP discovery/presence 会刷新 `last_seen`，最近 30 秒内即使
+  没有 CBDP TCP 会话也按在线展示。`online` 只表示设备可达；任务控制、订阅和上行
+  命令仍要求建立并完成 CBDP 会话。pending、rejected、revoked 设备不适用。
 - 双路径到达时由设备侧按"取较大值 + 落地窗口"去重；Bridge 不改变 TCP 计数的语义。
 - 验收要求：首页无 TCP 会话时三个数字仍能 1~2 秒内更新；进入 Codex 后任务流程
   无回归；单包不触发 ESP32-C3 的 DMA 申请失败。

@@ -77,7 +77,7 @@ class DeviceManager:
         if self._stopping.is_set():
             return
         for result in results:
-            self._sync_one(result)
+            self._sync_one(result, discovery_seen=True)
 
     def paired_count(self) -> int:
         """Paired devices that do not have a live session right now.
@@ -247,6 +247,8 @@ class DeviceManager:
         self,
         result: DiscoveryResult,
         dial_timeout_seconds: float | None = None,
+        *,
+        discovery_seen: bool = False,
     ) -> None:
         supported = result.capabilities
         legacy_id = f"legacy:{result.host}"
@@ -293,6 +295,11 @@ class DeviceManager:
         if record.registration_state != "approved":
             self.registry.save()
             return
+        if discovery_seen:
+            # A valid UDP reply proves the device is awake and reachable even
+            # when its current UI deliberately refuses the CBDP TCP session.
+            record.last_seen = time.time()
+            self._last_seen_saved_at[result.device_id] = time.monotonic()
         self.registry.save()
         if not record.token:
             return

@@ -55,6 +55,7 @@ CodexBridge 不是设备固件，也不是手机 App，而是 PC 侧的唯一桥
 - 每台设备分别保存支持能力和本机启用策略，不会因为某个新能力自动扩大权限。
 - 手机使用配对码；ESP 硬件使用一次性 registration nonce 和 `register_offer`。
 - 在线/离线状态采用边沿触发与迟滞，失败重拨不会重复发送假离线事件。
+- 已批准 ESP 设备即使停留在首页、暂不建立 CBDP TCP，也会通过 UDP presence 保持在线状态。
 - 手机 SSE/WebSocket 心跳会持续刷新在线状态。
 
 ### 消息、已读与提醒

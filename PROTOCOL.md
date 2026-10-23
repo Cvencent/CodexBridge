@@ -47,6 +47,12 @@ CBDP v1 的细节以 [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md) 为准。2026
 - **2026-10-21 后续修正：** 手机 Companion 的 SSE/WebSocket 心跳会刷新
   `last_seen`。管理接口按 120 秒窗口把最近活跃的 `companion_http` 手机视为在线，
   不再只依赖设备 TCP 会话表。
+- **2026-10-23 后续修正：** 已批准且持有配对令牌的硬件设备只要发出有效 UDP
+  discovery 应答或 presence 通告，就刷新 `last_seen`，并在最近 30 秒内视为在线。
+  AI Passport 在首页/菜单态会主动拒绝 CBDP TCP 以腾出网络电台所需的 DMA 内存，
+  这类设备仍可通过 UDP `HOME_COUNTERS(0x1E)` 保持首页计数，管理页不应误报离线。
+  CBDP TCP 会话仍是控制能力的权威条件；pending、rejected、revoked 设备不因
+  UDP 通告进入在线状态。
 - **2026-10-22 后续修正：** 同一手机设备的 CBDP SSE 与 WebSocket 共用一条
   `CbdpHttpSession`。单条 SSE 或 WebSocket 断开时只注销该网络流，不再连带关闭
   共享会话；会话改由 `last_seen` 超过 120 秒 TTL 后回收，或在 Companion 服务
