@@ -205,7 +205,16 @@ class AppServerClient:
         "thread/list",
         "thread/read",
         "thread/turns/list",
+        # Item pages were the one bounded read left outside the cache, so an
+        # active thread re-fetched its head and tail pages on every 5 s
+        # collector beat and again on every phone poll. They are cached for a
+        # short window (see READ_CACHE_TTL) because a running turn keeps
+        # appending to the tail.
+        "thread/items/list",
     })
+    # Per-method overrides for READ_CACHE_SECONDS. Item pages change while a
+    # turn is running, so they get a much shorter window than whole-thread reads.
+    READ_CACHE_TTL = {"thread/items/list": 2.0}
 
     def __init__(self, command: list[str], cwd: Path, timeout: float = 15.0,
                  prefer_shared: bool = False) -> None:
@@ -419,7 +428,9 @@ class AppServerClient:
                 if cacheable:
                     with self._read_cache_lock:
                         self._read_cache[cache_key] = (
-                            time.monotonic() + self.READ_CACHE_SECONDS,
+                            time.monotonic() + self.READ_CACHE_TTL.get(
+                                method, self.READ_CACHE_SECONDS
+                            ),
                             result,
                         )
                 elif method not in {"initialize"}:
