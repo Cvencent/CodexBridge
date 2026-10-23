@@ -18,6 +18,17 @@ from codexbridge.read_state import ReadStateStore
 
 
 class FakeClient:
+    """Minimal app-server double with the paged thread read model.
+
+    ``thread/read`` in the real app-server has no lightweight includeTurns
+    option: asking for turns serializes the whole rollout (tens of MB for a
+    long thread) and freezes the process while json.loads holds the GIL. The
+    service therefore reads metadata with ``includeTurns: false`` and pages
+    turns/items separately. Tests keep seeding the convenient full detail in
+    ``responses["thread/read"]``; this double remembers that payload and serves
+    the paged methods from it, while enforcing the metadata-only read.
+    """
+
     def __init__(self) -> None:
         self.responses: dict[str, object] = {}
         self.requests: list[tuple[str, dict]] = []
@@ -26,6 +37,8 @@ class FakeClient:
         self.server_requests: queue.Queue = queue.Queue()
         self.started = False
         self.closed = False
+        self.threads: dict[str, dict] = {}
+        self.item_offsets: dict[tuple[str, str], int] = {}
 
     def start(self) -> None:
         self.started = True
@@ -33,8 +46,120 @@ class FakeClient:
     def close(self) -> None:
         self.closed = True
 
+    @staticmethod
+    def _without_items(turn: dict) -> dict:
+        return {key: value for key, value in turn.items() if key != "items"}
+
+    @staticmethod
+    def _sort_key(turn: dict) -> tuple:
+        def stamp(key):
+            value = turn.get(key)
+            if isinstance(value, bool) or value is None:
+                return 0
+            if isinstance(value, (int, float)):
+                return int(value)
+            text = str(value)
+            if text.isdigit():
+                return int(text)
+            return 0
+        for key in ("startedAt", "createdAt", "updatedAt", "completedAt"):
+            value = stamp(key)
+            if value:
+                return (value, str(turn.get("id") or ""))
+        return (0, str(turn.get("id") or ""))
+
+    def _remember_thread(self, thread: dict, thread_id: str) -> None:
+        previous = self.threads.get(thread_id) or {}
+        merged = {**previous, **thread}
+        self.threads[thread_id] = merged
+
+    def _thread_read(self, params: dict) -> dict:
+        if params.get("includeTurns") is not False:
+            raise AssertionError("thread/read must pass includeTurns: false")
+        handler = self.responses.get("thread/read")
+        if handler is None:
+            raise AppServerError("unsupported: thread/read")
+        result = handler(params) if callable(handler) else handler
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict):
+            return result
+        requested = str(params.get("threadId") or "")
+        thread_id = str(thread.get("id") or requested)
+        if thread_id:
+            self._remember_thread(thread, thread_id)
+        # A static handler ignores the requested id, which is how several
+        # tests seed one detail payload for every thread. Let the paged reads
+        # find those turns under the id that was actually requested.
+        if requested and requested != thread_id:
+            self._remember_thread(thread, requested)
+        return {"thread": {key: value for key, value in thread.items()
+                           if key != "turns"}}
+
+    def _turns_list(self, params: dict) -> dict:
+        thread_id = str(params.get("threadId") or "")
+        thread = self.threads.get(thread_id)
+        if thread is None:
+            # Tests commonly seed only responses["thread/read"]. Learn the
+            # thread's turns from that payload before admitting we know
+            # nothing about it; the real app-server would do the same read.
+            try:
+                self._thread_read({"threadId": thread_id, "includeTurns": False})
+            except (AppServerError, AssertionError):
+                pass
+            thread = self.threads.get(thread_id)
+        if thread is None:
+            raise AppServerError(f"unsupported: thread/turns/list {thread_id}")
+        turns = [turn for turn in (thread.get("turns") or [])
+                 if isinstance(turn, dict)]
+        turns.sort(key=self._sort_key, reverse=True)
+        limit = int(params.get("limit") or 100)
+        return {
+            "data": [self._without_items(turn) for turn in turns[:limit]],
+            "nextCursor": None,
+        }
+
+    def _items_list(self, params: dict) -> dict:
+        thread_id = str(params.get("threadId") or "")
+        turn_id = str(params.get("turnId") or "")
+        thread = self.threads.get(thread_id)
+        if thread is None:
+            raise AppServerError(f"unsupported: thread/items/list {thread_id}")
+        turn = next((turn for turn in (thread.get("turns") or [])
+                     if isinstance(turn, dict) and str(turn.get("id")) == turn_id),
+                    None)
+        if turn is None:
+            raise AppServerError(f"unsupported: thread/items/list {turn_id}")
+        items = [item for item in (turn.get("items") or [])
+                 if isinstance(item, dict)]
+        desc = str(params.get("sortDirection") or "asc") == "desc"
+        if desc:
+            items = list(reversed(items))
+        limit = max(1, int(params.get("limit") or 100))
+        key = (thread_id, turn_id)
+        offset = self.item_offsets.get(key, 0)
+        if params.get("cursor"):
+            try:
+                offset = int(params["cursor"])
+            except (TypeError, ValueError):
+                offset = 0
+        page = items[offset:offset + limit]
+        offset += len(page)
+        self.item_offsets[key] = offset
+        next_cursor = offset if offset < len(items) else None
+        return {
+            "data": [{"item": item, "turnId": turn_id} for item in page],
+            "nextCursor": next_cursor,
+            "backwardsCursor": None,
+        }
+
     def request(self, method: str, params: dict | None = None):
         self.requests.append((method, params or {}))
+        if method == "thread/read":
+            return self._thread_read(params or {})
+        if method == "thread/turns/list":
+            return self._turns_list(params or {})
+        if method == "thread/items/list":
+            return self._items_list(params or {})
         handler = self.responses.get(method)
         if handler is None:
             raise AppServerError(f"unsupported: {method}")

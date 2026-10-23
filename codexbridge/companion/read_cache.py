@@ -21,6 +21,12 @@ from typing import Any, Callable
 CACHEABLE_METHODS = frozenset({
     "thread/list",
     "thread/read",
+    "thread/turns/list",
+    # Item pages are bounded and immutable once their turn finished, but a
+    # live turn appends to the tail. The short read TTL above keeps that
+    # window small while letting a status poll reuse the pages it just read
+    # instead of paying for them again on every device request.
+    "thread/items/list",
     "thread/loaded",
     "model/list",
 })

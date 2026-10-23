@@ -97,6 +97,15 @@ INTERNAL_THREAD_PREFIXES = ("The following is the Codex agent history",)
 MAX_MESSAGE_CHARS = 20000
 MAX_MESSAGE_ITEMS = 400
 MAX_TURNS_IN_DETAIL = 60
+# Paged app-server reads.  ``thread/read`` with ``includeTurns=true``
+# serializes a whole stored thread into one JSON line -- measured at
+# 84.7 MB for 70 turns -- and the resulting ``json.loads`` holds the GIL
+# long enough to freeze the whole bridge (visible as system-wide pointer
+# lag).  Read metadata, turn summaries and a bounded item tail instead.
+TURNS_PAGE_LIMIT = 100
+ITEM_PAGE_LIMIT = 200
+MAX_ITEM_PAGES = 2
+FULL_ITEM_TURNS = 1
 INTERMEDIATE_MESSAGE_KINDS = {
     "commentary",
     "reasoning",
@@ -862,19 +871,133 @@ class CompanionService:
         if error is not None:
             raise error
 
+    @staticmethod
+    def _sort_turns(turns: Any) -> list[dict[str, Any]]:
+        """Return turn rows oldest-first.
+
+        ``thread/turns/list`` answers newest-first; every caller in this module
+        expects stored order.
+        """
+        rows = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
+        rows.sort(key=lambda turn: (
+            _epoch(turn.get("startedAt") or turn.get("createdAt")
+                   or turn.get("updatedAt") or turn.get("completedAt")),
+            str(turn.get("id") or ""),
+        ))
+        return rows
+
+    def _read_turns(self, thread_id: str, limit: int = TURNS_PAGE_LIMIT,
+                    refresh: bool = False) -> list[dict[str, Any]]:
+        """Read one bounded page of turn summaries instead of the whole thread."""
+        result = self._read("thread/turns/list", {
+            "threadId": thread_id,
+            "limit": max(1, min(int(limit or TURNS_PAGE_LIMIT), TURNS_PAGE_LIMIT)),
+            "itemsView": "summary",
+        }, refresh=refresh)
+        data = result.get("data") if isinstance(result, dict) else None
+        return self._sort_turns(data)
+
+    def _read_thread_metadata(self, thread_id: str, refresh: bool = False) -> dict[str, Any] | None:
+        result = self._read(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": False},
+            refresh=refresh,
+        )
+        thread = result.get("thread") if isinstance(result, dict) else None
+        return dict(thread) if isinstance(thread, dict) else None
+
+    def _turn_item_tail(self, thread_id: str, turn_id: str,
+                        refresh: bool = False) -> list[dict[str, Any]]:
+        """Read the newest items of one turn, bounded to ``MAX_ITEM_PAGES``."""
+        if not turn_id:
+            return []
+        items: list[dict[str, Any]] = []
+        cursor: Any = None
+        for _ in range(MAX_ITEM_PAGES):
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "limit": ITEM_PAGE_LIMIT,
+                "itemsView": "full",
+                "sortDirection": "desc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            page = self._read("thread/items/list", params, refresh=refresh)
+            data = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(data, list) or not data:
+                break
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                item = entry.get("item") if isinstance(entry.get("item"), dict) else entry
+                if isinstance(item, dict) and item.get("type"):
+                    items.append(item)
+            cursor = page.get("nextCursor") if isinstance(page, dict) else None
+            if not cursor or len(data) < ITEM_PAGE_LIMIT:
+                break
+        items.reverse()
+        return items
+
+    def _turn_item_head(self, thread_id: str, turn_id: str,
+                        limit: int = 50,
+                        refresh: bool = False) -> list[dict[str, Any]]:
+        """Read the first items of a turn so the user request is never lost."""
+        if not turn_id:
+            return []
+        page = self._read("thread/items/list", {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "limit": max(1, int(limit)),
+            "itemsView": "full",
+            "sortDirection": "asc",
+        }, refresh=refresh)
+        data = page.get("data") if isinstance(page, dict) else None
+        items: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            for entry in data:
+                if not isinstance(entry, dict):
+                    continue
+                item = entry.get("item") if isinstance(entry.get("item"), dict) else entry
+                if isinstance(item, dict) and item.get("type"):
+                    items.append(item)
+        return items
+
+    def _full_turn_items(self, thread_id: str, turn_id: str,
+                         refresh: bool = False) -> list[dict[str, Any]]:
+        """Merge a turn's bounded head and tail, de-duplicated by item id."""
+        head = self._turn_item_head(thread_id, turn_id, refresh=refresh)
+        tail = self._turn_item_tail(thread_id, turn_id, refresh=refresh)
+        known = {str(item.get("id")) for item in head if item.get("id")}
+        merged = head + [item for item in tail
+                         if not item.get("id") or str(item.get("id")) not in known]
+        return merged
+
+    def _detail_turns(self, thread_id: str, refresh: bool = False) -> list[dict[str, Any]]:
+        """Return summary turns with the newest turn's items filled in."""
+        turns = self._read_turns(thread_id, refresh=refresh)
+        if not turns:
+            return turns
+        for turn in turns[-FULL_ITEM_TURNS:]:
+            turn_id = str(turn.get("id") or "")
+            if not turn_id:
+                continue
+            try:
+                full = self._full_turn_items(thread_id, turn_id,
+                                             refresh=refresh)
+            except AppServerError:
+                continue
+            if full:
+                turn["items"] = full
+        return turns
+
     def _active_turn_id(self, thread_id: str) -> str:
         """Return the id of the turn currently running on a thread, if any."""
         try:
-            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+            turns = self._read_turns(thread_id)
         except AppServerError:
             return ""
-        thread = result.get("thread") if isinstance(result, dict) else None
-        turns = (thread or {}).get("turns") if isinstance(thread, dict) else None
-        if not isinstance(turns, list):
-            return ""
         for turn in reversed(turns):
-            if not isinstance(turn, dict):
-                continue
             status = str(turn.get("status") or "").replace("_", "").lower()
             if status in {"inprogress", "running", "active"}:
                 return str(turn.get("id") or "")
@@ -888,6 +1011,7 @@ class CompanionService:
                     turn.get("updatedAt")
                     or turn.get("lastActivityAt")
                     or turn.get("createdAt")
+                    or turn.get("startedAt")
                 )
                 if updated_at and time.time() - updated_at <= LOG_ACTIVE_SECONDS:
                     return str(turn.get("id") or "")
@@ -1356,7 +1480,9 @@ class CompanionService:
                 # "list_turns is not supported yet". A fresh process reads the
                 # same rollout from disk, so retry once on a reset instead of
                 # failing the phone's read.
-                if method == "thread/read" and _is_stale_thread_read(error) and attempt == 0:
+                if (method in {"thread/read", "thread/turns/list",
+                             "thread/items/list"}
+                        and _is_stale_thread_read(error) and attempt == 0):
                     last_error = error
                     self._reset_client()
                     continue
@@ -1977,10 +2103,11 @@ class CompanionService:
     def _read_thread_summary(self, thread_id: str) -> dict[str, Any] | None:
         """Return a thread's summary with turns included, or None if unreadable."""
         try:
-            result = self._read("thread/read", {"threadId": thread_id, "includeTurns": True})
+            thread = self._read_thread_metadata(thread_id)
+            if thread is not None:
+                thread = {**thread, "turns": self._read_turns(thread_id)}
         except (AppServerError, OSError):
             return None
-        thread = result.get("thread") if isinstance(result, dict) else None
         if not isinstance(thread, dict):
             return None
         summary = self._summary(thread)
@@ -2308,16 +2435,9 @@ class CompanionService:
         if not fork_id:
             return []
         try:
-            result = self._read("thread/read", {"threadId": fork_id, "includeTurns": True})
-        except AppServerError:
+            turns = self._detail_turns(fork_id)
+        except (AppServerError, OSError):
             return []
-        thread = result.get("thread") if isinstance(result, dict) else None
-        if not isinstance(thread, dict):
-            return []
-        turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
-        turns.sort(key=lambda turn: _epoch(
-            turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
-        ))
         messages: list[dict[str, Any]] = []
         for turn in turns:
             turn_id = str(turn.get("id") or "")
@@ -2343,22 +2463,18 @@ class CompanionService:
         # When the origin thread is locked by the desktop we read the fork that
         # carries its history, but keep reporting the origin id to the phone.
         source_id = self._fork_for(thread_id) or thread_id
-        result = self._read("thread/read", {"threadId": source_id, "includeTurns": True})
-        tail_thread: dict[str, Any] | None = None
+        thread = self._read_thread_metadata(source_id)
+        if not isinstance(thread, dict):
+            raise ValueError("thread")
         tail_id = ""
         with self._resumed_lock:
             if thread_id not in self._forked_threads:
                 tail_id = self._fork_tails.get(thread_id, "")
-        thread = result.get("thread") if isinstance(result, dict) else None
-        if not isinstance(thread, dict):
-            raise ValueError("thread")
         live_status = self._log_status(thread_id)
         if live_status:
             thread = {**thread, "__codexbridge_live_status": live_status}
-        turns = [turn for turn in thread.get("turns", []) if isinstance(turn, dict)]
-        turns.sort(key=lambda turn: _epoch(
-            turn.get("startedAt") or turn.get("createdAt") or turn.get("updatedAt")
-        ))
+        turns = self._detail_turns(source_id)
+        thread = {**thread, "turns": turns}
         seen_turn_ids = {str(turn.get("id") or "") for turn in turns}
         turns = turns[-MAX_TURNS_IN_DETAIL:]
         messages: list[dict[str, Any]] = []

@@ -187,6 +187,15 @@ def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[s
 
 class AppServerClient:
     READ_CACHE_SECONDS = 10.0
+    # A full ``thread/read`` with ``includeTurns=true`` returns the entire
+    # stored thread in one JSON line; on a long desktop thread that measured
+    # 84.7 MB and json.loads() held the GIL for ~2 s, stalling every other
+    # Python thread in this process and freezing the system pointer. The
+    # collector now reads bounded pages instead, so this bound only has to
+    # catch pathological responses while still admitting a worst-case
+    # ``thread/items/list`` page of large items.
+    MAX_STDOUT_LINE_CHARS = 8_000_000
+    _STDOUT_DISCARD_CHARS = 1 << 20
     READ_CACHE_METHODS = frozenset({
         "account/read",
         "account/rateLimits/read",
@@ -195,6 +204,7 @@ class AppServerClient:
         "project/list",
         "thread/list",
         "thread/read",
+        "thread/turns/list",
     })
 
     def __init__(self, command: list[str], cwd: Path, timeout: float = 15.0,
@@ -220,6 +230,7 @@ class AppServerClient:
         # keep the previous behaviour of ignoring them.
         self.server_requests: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=200)
         self._closed = threading.Event()
+        self.oversized_stdout_lines = 0
 
     @staticmethod
     def _desktop_socket() -> Path | None:
@@ -297,7 +308,19 @@ class AppServerClient:
 
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
-        for line in self.process.stdout:
+        stdout = self.process.stdout
+        while True:
+            line = stdout.readline(self.MAX_STDOUT_LINE_CHARS + 1)
+            if not line:
+                break
+            if not line.endswith("\n") and len(line) > self.MAX_STDOUT_LINE_CHARS:
+                # Drain the remainder of the oversized line so the next
+                # readline() resumes on a real message boundary, but never
+                # hand the payload to json.loads or keep it alive.
+                self.oversized_stdout_lines += 1
+                while line and not line.endswith("\n"):
+                    line = stdout.readline(self._STDOUT_DISCARD_CHARS)
+                continue
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
@@ -916,6 +939,13 @@ class CodexAppServerSource:
     # One app-server list page contains at most 20 threads. Inspect the whole
     # page so every in-flight thread contributes to the running count.
     MAX_DISPLAY_TASKS = 20
+    # ``thread/read`` with ``includeTurns=true`` returns the whole stored thread
+    # in one JSON line (measured 84.7 MB / ~2 s of GIL-holding json.loads() on a
+    # 70-turn desktop thread). The collector instead assembles a bounded view
+    # from the paged read methods below.
+    TURNS_PAGE_LIMIT = 100
+    ITEM_PAGE_LIMIT = 200
+    MAX_ITEM_PAGES = 2
     SOURCE_KINDS = [
         "cli", "vscode", "exec", "appServer", "unknown",
     ]
@@ -990,6 +1020,120 @@ class CodexAppServerSource:
         self.account = account_snapshot(rate, usage)
         self.last_account_refresh = time.monotonic()
 
+    @staticmethod
+    def _sorted_turns(result: Any) -> list[dict[str, Any]]:
+        """Normalize a turns listing into oldest-first order.
+
+        ``thread/turns/list`` answers newest-first, while every consumer in
+        this module expects the stored order.
+        """
+        data = result.get("data") if isinstance(result, dict) else None
+        turns = [turn for turn in data if isinstance(turn, dict)] if isinstance(data, list) else []
+        turns.sort(key=lambda turn: (
+            int(_epoch(turn.get("startedAt") or turn.get("createdAt") or
+                       turn.get("updatedAt") or turn.get("completedAt"))),
+            str(turn.get("id") or ""),
+        ))
+        return turns
+
+    @staticmethod
+    def _unwrap_items(page: Any) -> list[dict[str, Any]]:
+        data = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(data, list):
+            return []
+        items: list[dict[str, Any]] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            item = entry.get("item")
+            if item is None and "type" in entry:
+                item = entry
+            if isinstance(item, dict):
+                items.append(item)
+        return items
+
+    def _turn_item_tail(self, thread_id: str, turn_id: str) -> list[dict[str, Any]]:
+        """Read the newest items of one turn without materializing the turn.
+
+        ``thread/items/list`` paginates a single turn; requesting
+        ``sortDirection=desc`` starts at the newest item, which is the part the
+        phone needs for progress and the final answer.
+        """
+        if not turn_id:
+            return []
+        items: list[dict[str, Any]] = []
+        cursor: Any = None
+        for _ in range(self.MAX_ITEM_PAGES):
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "limit": self.ITEM_PAGE_LIMIT,
+                "itemsView": "full",
+                "sortDirection": "desc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            page = self.client.request("thread/items/list", params)
+            entries = self._unwrap_items(page)
+            if not entries:
+                break
+            items.extend(entries)
+            cursor = page.get("nextCursor") if isinstance(page, dict) else None
+            if not cursor or len(entries) < self.ITEM_PAGE_LIMIT:
+                break
+        # Pages arrive newest-first, so one reverse restores chronological order.
+        items.reverse()
+        return items
+
+    def _turn_item_head(self, thread_id: str, turn_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Read the first items of a turn (user request and any plan)."""
+        if not turn_id:
+            return []
+        page = self.client.request("thread/items/list", {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "limit": limit,
+            "itemsView": "full",
+            "sortDirection": "asc",
+        })
+        return self._unwrap_items(page)
+
+    def _read_thread_detail(self, thread_id: str) -> dict[str, Any]:
+        """Assemble a display thread from bounded app-server reads.
+
+        The previous implementation used ``thread/read`` with
+        ``includeTurns=true``. That call serializes every stored item of a
+        thread into one JSON line, and on a long desktop thread the resulting
+        multi-megabyte ``json.loads`` held the GIL long enough to freeze the
+        whole bridge (observed as system-wide pointer lag). This method never
+        asks the app-server for a full thread.
+        """
+        metadata = self.client.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = metadata.get("thread") if isinstance(metadata, dict) else None
+        if not isinstance(thread, dict):
+            return metadata if isinstance(metadata, dict) else {}
+        thread = dict(thread)
+        turns = self._sorted_turns(self.client.request("thread/turns/list", {
+            "threadId": thread_id,
+            "limit": self.TURNS_PAGE_LIMIT,
+            "itemsView": "summary",
+        }))
+        thread["turns"] = turns
+        if not turns:
+            return {"thread": thread}
+        latest = turns[-1]
+        turn_id = str(latest.get("id") or "")
+        turn_items = self._turn_item_tail(thread_id, turn_id)
+        # A plan lives at the start of its turn and a long turn can push it out
+        # of the tail window, so pull the head too and merge by id.
+        head = self._turn_item_head(thread_id, turn_id)
+        known = {str(item.get("id")) for item in turn_items if item.get("id")}
+        prefix = [item for item in head
+                  if not item.get("id") or str(item.get("id")) not in known]
+        latest["items"] = prefix + turn_items
+        return {"thread": thread}
+
     def refresh_thread(self) -> None:
         result = self.client.request("thread/list", {
             "limit": 20,
@@ -1060,10 +1204,7 @@ class CodexAppServerSource:
                 detail = cached[1]
             else:
                 try:
-                    detail = self.client.request(
-                        "thread/read",
-                        {"threadId": selected["id"], "includeTurns": True},
-                    )
+                    detail = self._read_thread_detail(thread_id)
                     detail_cache[thread_id] = (cache_key, detail)
                 except (AppServerError, OSError, ValueError) as error:
                     # One stored thread may contain an item type unknown to this

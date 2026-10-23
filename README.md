@@ -274,6 +274,8 @@ pip install -e ".[tray]"
 - [通用设备协议](PROTOCOL.md)
 - [CBDP v1 线协议](docs/CBDP-V1-PROTOCOL.md)
 - [手机附件接入说明](docs/CodexBridge-mobile-attachment-api.md)
+- [PC 侧卡顿根因与修复：超大线程 JSON（2026-10-23）](docs/pc-json-gil-freeze-2026-10-23.md)
+- [设备端建议说明：手机 App 连接管理（2026-10-22）](docs/device-defect-long-lived-connections-2026-10-22.md)
 - [CBDP v1 架构重构设计](docs/superpowers/specs/2026-10-17-cbdp-v1-architecture-refactor-design.md)
 - [全部版本说明](release-notes/)
 

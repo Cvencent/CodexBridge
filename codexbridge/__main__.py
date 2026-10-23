@@ -410,9 +410,14 @@ def main(argv: list[str] | None = None) -> int:
     source_holder = _CodexSourceHolder()
     codex_cwd = _codex_working_directory()
     codex_command = os.environ.get("CODEXBRIDGE_CODEX_COMMAND")
+    # Prefer the desktop's own app-server over spawning a second one: a private
+    # stdio app-server keeps its own background watchers alive for the whole
+    # session, and the desktop proxy is also what makes live desktop turns
+    # visible to the collector.
     shared_app_server = AppServerClient(
         _resolve_codex_command(codex_command, data_dir),
         codex_cwd,
+        prefer_shared=True,
     )
     source_holder.configure(
         codex_command,

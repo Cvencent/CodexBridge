@@ -1,15 +1,22 @@
-# 设备端缺陷说明：手机 App 长连接滥用导致 PC 卡顿
+# 设备端建议说明：手机 App 连接管理（2026-10-22 现场，2026-10-23 修正归因）
 
-- 日期：2026-10-22
+- 首次记录日期：2026-10-22
+- 归因修正日期：2026-10-23
 - 受影响 PC 端：CodexBridge 2.1.33（Companion 端口 8568，CBDP v1 已启用）
-- 受影响设备：Xiaomi 24129PN74C（192.168.0.45），phone_id `phone-051b642ae212`
-- 结论：**PC 卡顿的主因在设备端**。设备在一段时间内持续新建并持有大量长连接，
-  每条连接在 PC 侧占用一个阻塞线程，线程数涨到 500 以上后整机输入延迟明显上升。
-  本文只描述需要设备侧修复的问题，PC 侧已另做资源保护（见文末）。
+- 当时观测设备：Xiaomi 24129PN74C（192.168.0.45），phone_id `phone-051b642ae212`
+- 结论：**当前 PC 卡顿的主因不在设备端，设备端无需为本次卡顿做任何修改。**
+  2026-10-23 的复测证明：把全部设备关闭、TCP ESTABLISHED 归零之后，CodexBridge
+  进程仍然卡顿，关闭 CodexBridge 后立刻恢复。真实主因是 PC 侧读取超长线程时
+  解析超大 JSON，长时间持有 GIL，冻结了整个 Python 进程。详见
+  [PC 侧根因与修复](pc-json-gil-freeze-2026-10-23.md)。
+
+本文保留 2026-10-22 的现场证据，并说明其后续状态：那一轮的确观测到设备侧连接
+堆积，PC 侧已用连接限额兜住；但它**不是**当前卡顿的根因，也不能作为要求设备端
+改代码的依据。
 
 ---
 
-## 1. 现场证据
+## 1. 2026-10-22 现场证据（保留）
 
 在 CodexBridge 进程（PID 30372）上采样：
 
@@ -29,115 +36,22 @@ Get-NetTCPConnection -OwningProcess <PID> -State Established |
   Sort-Object Count -Descending | Select-Object -First 20 Count,Name
 ```
 
-关键点：堆积的不是 CPU 计算，而是**线程与连接数量本身**。每个长连接在
-CodexBridge 里对应一个阻塞服务线程，数量达到数百后，整机调度与输入响应变差，
-表现为「开着 CodexBridge 鼠标就卡，关掉就不卡」。
+关键点：当时堆积的不是 CPU 计算，而是**线程与连接数量本身**，因此当时推测
+输入延迟来自线程调度压力。
 
----
+## 2. 该推测已被推翻（2026-10-23）
 
-## 2. 问题一：同一设备并行开启了数百条 `/cbdp/v1/events`（SSE）
+- 关闭全部设备后复测：TCP 8568 的 ESTABLISHED 连接数为 **0**，进程线程数恢复
+  正常，**但卡顿依旧**；关闭 CodexBridge 后卡顿立即消失。
+- 也就是说，2026-10-22 观测到的连接堆积是一个真实但**独立**的问题，与当前
+  卡顿没有因果关系。
+- 线程堆积本身 PC 侧已经兜住，见下一节。
 
-`py-spy` 中 376 条 `_cbdp_sse` 线程全部停在
-`codexbridge/companion/api.py` 的 `session.queue.get(timeout=1.0)`，
-对应路由 `/cbdp/v1/events`（CBDP v1 事件流）。
-
-同一台 192.168.0.45 设备在**同一时刻**并发持有数百条该 SSE 流，且长期不主动关闭。
-CBDP 服务端协议约定每台设备复用单条长连接即可获知全部事件，并行开流既不必要，
-也会在任意实现里产生线程/连接放大。
-
-### 设备侧要求
-
-1. 全局只保留 **1 条** CBDP 事件长连接（SSE 或 WebSocket 二选一）。
-2. 断线后重连必须退避，并**先释放旧连接**，禁止「不断新建、旧连接不关」。
-3. 对于 `GET /cbdp/v1/events` 与 `/cbdp/v1/ws`：同一进程/设备只允许一个
-   活动连接对象，切换 thread/过滤条件时复用同一条连接或显式关闭后再开。
-
----
-
-## 3. 问题二：手机 App 每次创建 `ApiClient` 都新建 OkHttpClient
-
-`mobile/android/app/src/main/java/com/codexbridge/mobile/data/ApiClient.kt:45`：
-
-```kotlin
-class ApiClient(baseUrl: String, private val token: String? = null) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        // ...
-        .build()
-}
-```
-
-`OkHttpClient` 是**实例字段**，因此每个 `ApiClient` 实例各自持有一个独立连接池。
-而 `ApiClient` 在代码中被反复新建：
-
-- `AppViewModel.kt:193`、`212`、`220`、`279`、`282`、`302`
-- `CompletionNotificationService.kt:170`、`175`、`177`
-
-OkHttp 官方要求全应用共享一个 `OkHttpClient` 实例；按实例创建会让连接池无法复用，
-表现为连接数随调用点增加而膨胀。
-
-### 设备侧要求
-
-1. 全应用共享**单个** `OkHttpClient`（连接池、线程池、Dispatcher 复用）。
-2. `ApiClient` 只持有 base URL/token 等数据，不持有独立 client。
-3. 轮询服务与前台 ViewModel 复用同一个 client 实例。
-
----
-
-## 4. 问题三：SSE 断线后立即重连，无退避
-
-`AppViewModel.kt:564-582`：
-
-```kotlin
-private fun observeThread(threadId: String) {
-    streamJob = viewModelScope.launch {
-        while (true) {
-            client.events(threadId).collect { event -> /* ... */ }
-            if (streamFailed || !_state.value.connected) refreshConnectionRoute()
-            delay(3000)                       // 固定 3 秒，无退避
-        }
-    }
-}
-```
-
-失败后固定 3 秒重连。当 PC 端或网络抖动时，多台设备/多个入口会同步以固定节奏
-重连，形成稳定高频的连接 churn。
-
-### 设备侧要求
-
-1. 重连使用指数退避并加抖动（例如 1s→2s→4s→8s，上限 30s，±20% 抖动）。
-2. 重连前确保上一条 SSE/WS 已 `cancel()`，不得泄漏旧连接。
-3. `onFailure` 收到 HTTP 429 时必须读取并遵循 `Retry-After`（PC 侧现为 20 秒）。
-
----
-
-## 5. 问题四：多个固定周期轮询叠加
-
-| 位置 | 周期 | 说明 |
-| --- | --- | --- |
-| `AppViewModel.kt:1181` | 2000 ms | 线程列表刷新（`THREADS_REFRESH_MS`） |
-| `AppViewModel.kt:586` | 4000 ms | 当前线程详情轮询 |
-| `CompletionNotificationService.kt:42` | 5000 ms | 完成通知轮询（`POLL_MS`） |
-| `AppViewModel.kt:580` | 3000 ms | SSE 固定重连间隔 |
-
-这些轮询在多个界面/服务里各自运行，且每个新 `ApiClient` 使用独立连接池，
-叠加后造成持续的高频请求与连接建立。
-
-### 设备侧要求
-
-1. 前台轮询收敛到单一调度器，按当前可见界面合并请求。
-2. 后台/前台切换时暂停不必要的轮询。
-3. 尽量用长连接推送替代高频轮询。
-
----
-
-## 6. 回复 PC 端 429 的约定（PC 侧已实现）
-
-从 CodexBridge 本次修复起，长连接按设备限额：
+## 3. PC 侧已做的连接保护（0bed2b6，不需要设备配合）
 
 - 单设备合计最多 **6** 条长流：SSE **2**、WebSocket **2**、Companion events **2**
 - 全服务合计最多 **24** 条
-- 超限响应：
+- 超限返回：
 
 ```
 HTTP/1.1 429 Too Many Requests
@@ -147,20 +61,23 @@ Connection: close
 {"ok": false, "error": "too_many_streams"}
 ```
 
-`server_stream_limit` 表示触达全局上限。设备收到 429 后应：
+设备侧如果收到 429，按 `Retry-After` 退避重试即可，这是通用客户端健壮性要求，
+不属于本次卡顿的修复范围。
 
-1. 不再对该端点发起新的并行连接；
-2. 等待 `Retry-After` 后重试，且重试时复用已有连接；
-3. 检查并关闭本进程里已泄漏的旧 SSE/WS。
+## 4. 设备端是否要改：不需要
 
----
+本次卡顿已定位为 PC 侧问题并在 CodexBridge 内修复。设备端（手机 App 与固件）
+**无需为本次卡顿提交任何改动**，也无需调整轮询节奏或长连接数量。
 
-## 7. 验证清单（设备侧修复后需自测）
+下面几条属于一般性的客户端最佳实践，由设备团队按自身排期决定是否优化，
+与本次 PC 卡顿无关，不构成本次修复的前置条件：
 
-- [ ] 全进程 OkHttpClient 实例数为 1。
-- [ ] 同一设备对 `/cbdp/v1/events` 的活动连接数始终为 1。
-- [ ] 断开网络 30 秒再恢复，重连次数随退避递减，不出现每秒多次重连。
-- [ ] 收到 429 后停止新建连接，并观察到重试间隔 ≥ `Retry-After`。
-- [ ] 连续运行 30 分钟后，PC 端
-      `Get-NetTCPConnection -OwningProcess <PID> -State Established` 中来自该设备
-      的连接数稳定在个位数，CodexBridge 线程数稳定（不随时间增长）。
+1. 全应用共享单个 `OkHttpClient` 实例，避免每个 `ApiClient` 各自持有连接池。
+2. 长连接断线重连使用指数退避加抖动，并在重连前释放旧连接。
+3. 前台轮询收敛到单一调度器，按当前可见界面合并请求。
+
+## 5. 本文件的历史说明
+
+- 2026-10-22 首次提交时，结论曾写为“主因在设备端”。
+- 2026-10-23 复测后确认该结论错误，本文按上述内容修正归因。
+- 历史提交 `f4bbca1` 中的原始表述保留在 git 历史里，本文为当前有效版本。

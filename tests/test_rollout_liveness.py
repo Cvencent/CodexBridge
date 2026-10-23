@@ -149,14 +149,23 @@ def _listed(thread_id: str, recency_age: float) -> dict:
     }
 
 
-def _detail(thread_id: str, running: bool) -> dict:
+def _turn(thread_id: str, running: bool) -> dict:
     if running:
         # Exactly how a detached app-server sees a live desktop turn.
-        turn = {"id": "turn-1", "status": "interrupted", "startedAt": STARTED,
+        return {"id": "turn-1", "status": "interrupted", "startedAt": STARTED,
                 "completedAt": None, "items": []}
-    else:
-        turn = {"id": "turn-0", "status": "completed", "startedAt": STARTED - 900,
-                "completedAt": STARTED - 800, "items": []}
+    return {"id": "turn-0", "status": "completed", "startedAt": STARTED - 900,
+            "completedAt": STARTED - 800, "items": []}
+
+
+def _turn_summary(thread_id: str, running: bool) -> dict:
+    """Turn metadata as ``thread/turns/list`` returns it: no items, no usage."""
+    return {key: value for key, value in _turn(thread_id, running).items()
+            if key != "items"}
+
+
+def _thread_metadata(thread_id: str, running: bool) -> dict:
+    """What ``thread/read {includeTurns: false}`` returns for one thread."""
     return {
         "thread": {
             "id": thread_id,
@@ -165,9 +174,23 @@ def _detail(thread_id: str, running: bool) -> dict:
             "source": "vscode",
             "recencyAt": STARTED,
             "updatedAt": int(time.time()),
-            "turns": [turn],
+            "turns": [],
         }
     }
+
+
+def _turn_items(thread_id: str, running: bool, turn_id: str,
+                sort_direction: str) -> dict:
+    """One page of ``thread/items/list`` entries for a single turn."""
+    items = [
+        {"id": "item-user", "type": "userMessage",
+         "content": [{"type": "text", "text": "hi"}]},
+        {"id": "item-agent", "type": "agentMessage",
+         "phase": "finalAnswer", "text": "done"},
+    ]
+    if sort_direction == "desc":
+        items = list(reversed(items))
+    return {"data": [{"item": item, "turnId": turn_id} for item in items]}
 
 
 class CollectorLivenessTests(unittest.TestCase):
@@ -188,9 +211,22 @@ class CollectorLivenessTests(unittest.TestCase):
                     calls.append(method)
                 if method == "thread/list":
                     return {"data": listed}
+                thread_id = str(params.get("threadId") or "")
+                is_running = thread_id in running
                 if method == "thread/read":
-                    thread_id = str(params["threadId"])
-                    return _detail(thread_id, thread_id in running)
+                    if params.get("includeTurns") is not False:
+                        raise AssertionError(
+                            "the collector must not read a whole thread")
+                    return _thread_metadata(thread_id, is_running)
+                if method == "thread/turns/list":
+                    if params.get("itemsView") != "summary":
+                        raise AssertionError("turn listings must stay summary-only")
+                    # Newest-first, exactly like the app-server answers.
+                    return {"data": [_turn_summary(thread_id, is_running)]}
+                if method == "thread/items/list":
+                    turn_id = str(params.get("turnId") or "")
+                    return _turn_items(thread_id, is_running, turn_id,
+                                       str(params.get("sortDirection") or "asc"))
                 raise AssertionError(method)
 
             def close(self):
