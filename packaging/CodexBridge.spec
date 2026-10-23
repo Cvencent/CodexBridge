@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_all
+
 
 ROOT = Path(SPECPATH).resolve().parent
 
@@ -9,17 +11,24 @@ datas = [
     (str(ROOT / "codexbridge" / "windows_speech_recognize.ps1"), "codexbridge"),
 ]
 
+# Offline Vosk speech is loaded through cffi at runtime, so PyInstaller's static
+# analysis cannot discover libvosk.dll or its MinGW runtime companions. Without
+# this the frozen build silently falls back to Windows System.Speech even when
+# the offline model is installed.
+vosk_datas, vosk_binaries, vosk_hiddenimports = collect_all("vosk")
+datas += vosk_datas
+
 hiddenimports = [
     "pystray",
     "pystray._win32",
     "PIL.Image",
     "PIL.ImageDraw",
-]
+] + list(vosk_hiddenimports)
 
 a = Analysis(
     [str(ROOT / "codexbridge" / "__main__.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=list(vosk_binaries),
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

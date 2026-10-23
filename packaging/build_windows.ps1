@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.1.37",
+    [string]$Version = "2.1.38",
     [switch]$SkipInstaller,
     [switch]$SkipTests
 )
@@ -29,6 +29,37 @@ if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
 $Executables = @(Get-ChildItem -LiteralPath $Dist -Filter "*.exe" -File -Recurse)
 if ($Executables.Count -ne 1 -or $Executables[0].FullName -ne $Exe) {
     throw "Expected exactly one executable in dist: $Exe"
+}
+
+# Offline Vosk speech needs these native libraries next to the module. They are
+# dlopen'd at runtime, so a missing one is invisible until a recording silently
+# falls back to System.Speech. Fail the build instead of shipping that.
+$RequiredVoskFiles = @(
+    "vosk/libvosk.dll",
+    "vosk/libstdc++-6.dll",
+    "vosk/libgcc_s_seh-1.dll",
+    "vosk/libwinpthread-1.dll"
+)
+$VoskCheck = @"
+import sys
+from PyInstaller.archive.readers import CArchiveReader
+
+required = {
+    "vosk/libvosk.dll",
+    "vosk/libstdc++-6.dll",
+    "vosk/libgcc_s_seh-1.dll",
+    "vosk/libwinpthread-1.dll",
+}
+reader = CArchiveReader(sys.argv[1])
+names = {str(name).replace("\\", "/") for name in reader.toc}
+missing = sorted(required - names)
+if missing:
+    print("MISSING:" + ",".join(missing))
+    sys.exit(1)
+"@
+$Missing = python -c $VoskCheck $Exe
+if ($LASTEXITCODE -ne 0) {
+    throw "Built executable is missing bundled offline speech file: $Missing"
 }
 
 $Portable = Join-Path $Release "CodexBridge-$Version-win64-portable.zip"
