@@ -176,12 +176,21 @@ def _resolve_codex_command(explicit: str | None, runtime_folder: Path) -> list[s
                 return [node, executable]
             return [executable]
 
-    executable = shutil.which("codex")
+    # Prefer a native executable over the PATH shim. ``which("codex")`` on
+    # Windows resolves to ``codex.CMD``, and a batch file can only run through
+    # ``cmd.exe``; that spawns a console window every time the bridge starts an
+    # app-server, which flashes a black command box over the user's screen
+    # (reported when sending a recorded task from an AI Passport). The native
+    # ``codex.exe`` is a single process and starts without any console.
+    executable = shutil.which("codex.exe")
     if executable:
         return [executable]
     for candidate in _codex_install_candidates():
         if candidate.is_file():
             return [str(candidate)]
+    executable = shutil.which("codex")
+    if executable:
+        return [executable]
     raise AppServerError("未找到 Codex CLI，请确认 Codex 已安装并位于 PATH 中")
 
 

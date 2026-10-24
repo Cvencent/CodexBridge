@@ -89,6 +89,26 @@ class CodexCommandResolutionTest(unittest.TestCase):
 
         self.assertEqual(command, [str(explicit)])
 
+    def test_prefers_native_executable_over_a_cmd_shim(self):
+        """A ``.cmd`` shim needs cmd.exe, which flashes a console window.
+
+        ``which("codex")`` resolves to ``codex.CMD`` on a normal npm install.
+        Launching a batch file spawns cmd.exe and a visible console every time
+        the bridge starts its app-server; the native ``codex.exe`` does not.
+        """
+        shim = r"C:\node\codex.CMD"
+        native = r"C:\Users\me\AppData\Local\OpenAI\Codex\bin\1\codex.exe"
+
+        def fake_which(name: str) -> str | None:
+            return {"codex": shim, "codex.exe": native}.get(name)
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "codexbridge.codex.app_server.shutil.which", side_effect=fake_which
+        ):
+            command = _resolve_codex_command(None, Path(temp_dir))
+
+        self.assertEqual(command, [native])
+
 
 class CodexStatePersistenceTest(unittest.TestCase):
     def setUp(self):
