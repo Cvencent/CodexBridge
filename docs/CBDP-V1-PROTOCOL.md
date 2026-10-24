@@ -1600,6 +1600,9 @@ Bridge -> ERROR(POLICY_DENIED, PAIRING_PENDING, reason=pairing_pending)
    不得把令牌写入普通日志、遥测或调试输出。无线配对不建立第二套鉴权算法。
 5. Bridge 只有在设备已被本地管理员批准并且注册表保存了令牌时才能返回 OFFER。
    未批准时不得先下发临时令牌，也不得把“待批准”伪装成鉴权成功。
+   在 Device Listener Binding 下，未批准设备不会被 Bridge 拨号，因此设备只会在
+   UDP presence 后停留在管理页“待批准”；`PAIRING_PENDING` 只适用于已经建立
+   CBDP 连接、但注册表尚未持有可用令牌的场景。
 6. 收到 `PAIRING_PENDING` 的设备应关闭当前会话并按指数退避重新 HELLO；管理员
    批准后，下一次 HELLO 会取得令牌。设备已经持有有效令牌时 SHOULD 省略
    `pairing_state` 并直接走标准 AUTH。
@@ -1608,6 +1611,9 @@ Bridge -> ERROR(POLICY_DENIED, PAIRING_PENDING, reason=pairing_pending)
    启用 TLS 时可获得传输层保护。
 8. `PAIRING` 不改变能力位图、订阅、命令、事件或错误码编号；未实现此消息的旧
    设备不会发送 `pairing_state`，因此保持兼容。
+
+设备端可直接照做的实现清单、代码位置、字节示例和验收用例见
+[CBDP `PAIRING(0x1F)` 设备端接入说明](CBDP-0x1F-pairing-device-handoff-2026-10-24.md)。
 
 ## 12. 会话状态机
 
