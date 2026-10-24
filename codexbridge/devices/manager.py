@@ -162,7 +162,31 @@ class DeviceManager:
         if record.registration_state not in {"pending", "rejected", "revoked"}:
             raise DeviceRegistrationError("registration_not_pending")
         if not record.registration_nonce:
-            raise DeviceRegistrationError("registration_nonce_missing")
+            # Pure CBDP devices never use the JSON register_offer exchange.
+            # Approval mints the token locally; the device receives it from
+            # the next HELLO's TYPE_PAIRING response over the normal CBDP
+            # session, then authenticates with that token.
+            if record.protocol != "cbdp":
+                raise DeviceRegistrationError("registration_nonce_missing")
+            if not record.host or not record.port:
+                raise DeviceRegistrationError("registration_endpoint_missing")
+            record.token = record.token or secrets.token_urlsafe(24)
+            record.registration_state = "approved"
+            record.registration_error = ""
+            self.registry.save()
+            self._sync_one(
+                DiscoveryResult(
+                    host=record.host,
+                    device=record.model,
+                    device_id=device_id,
+                    name=record.name,
+                    port=record.port,
+                    capabilities=sorted(record.supported),
+                    registration_state="approved",
+                    protocol="cbdp",
+                )
+            )
+            return True
         if not record.registration_address or not record.host or not record.port:
             raise DeviceRegistrationError("registration_endpoint_missing")
         if record.registration_address != record.host:

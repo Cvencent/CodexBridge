@@ -53,9 +53,7 @@ def encode_frame(frame: Frame) -> bytes:
         raise TypeError("frame must be a Frame")
     if frame.version_major != VERSION_MAJOR:
         raise CBDPError("PROTOCOL_VERSION")
-    if frame.message_type not in range(1, 0x20) or (
-        frame.message_type == 0x1F
-    ):
+    if frame.message_type not in range(1, 0x20):
         raise CBDPError("UNSUPPORTED_FEATURE")
     if frame.flags & UNSUPPORTED_FLAGS:
         raise CBDPError("UNSUPPORTED_FEATURE")

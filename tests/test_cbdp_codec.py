@@ -7,6 +7,7 @@ from codexbridge.cbdp.constants import (
     QOS_TELEMETRY,
     TAG_PAYLOAD_CRC32,
     TYPE_PING,
+    TYPE_PAIRING,
 )
 from codexbridge.cbdp.frame import (
     Frame,
@@ -32,6 +33,10 @@ class CBDPCodecTests(unittest.TestCase):
     def test_unknown_tlv_is_returned_but_does_not_break_known_tags(self):
         raw = encode_tlvs([(0x0097, u32(7)), (0x7FFF, b"future")])
         self.assertEqual(decode_tlvs(raw)[0x7FFF], b"future")
+
+    def test_pairing_message_type_is_encodable(self):
+        raw = encode_frame(Frame(message_type=TYPE_PAIRING))
+        self.assertEqual(decode_frame(raw).message_type, TYPE_PAIRING)
 
     def test_duplicate_tlv_is_rejected(self):
         raw = struct.pack(">HH", 0x0097, 4) + u32(1) + struct.pack(">HH", 0x0097, 4) + u32(2)

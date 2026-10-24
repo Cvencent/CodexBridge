@@ -8,6 +8,7 @@
 - 目标版本：CodexBridge 2.0
 - 线格式版本：`major = 1`，`minor = 0`
 - 日期：2026-10-17
+- 后续协议补充：2026-10-24（新增 `PAIRING(0x1F)` 无线配对消息）
 - 规范范围：发现、传输、会话、鉴权、能力、订阅、事件、命令、写入、音频、审批、ACK、重传、分片、错误、兼容和一致性测试
 
 本文档是正式线协议基线。客户端 Agent、ESP Agent、Bridge Agent 和桌面端 Agent
@@ -544,8 +545,9 @@ idem = first_16_bytes(SHA-256(
 | `0x1C` | `DISCOVERY` | 双向 | UDP 发现请求 |
 | `0x1D` | `DISCOVERY_REPLY` | 双向 | UDP 发现响应 |
 | `0x1E` | `HOME_COUNTERS` | Bridge 到设备 | UDP 单播的首页聚合计数 |
+| `0x1F` | `PAIRING` | Bridge 到设备 | 无线配对令牌下发；`[2026-10-24 补充]` |
 
-`0x1F` 保留。所有未分配消息类型都不得被当成已知消息解析。
+`0x20` 及以上未分配。所有未分配消息类型都不得被当成已知消息解析。
 
 ### 7.2 消息公共字段
 
@@ -923,6 +925,8 @@ message 解析。`objects` 数组的元素 tag 固定为 `0x00A0`。
 | `0x00BC` | `u16` | `running_count` | 当前运行中的任务数；`codex.state` 事件使用 |
 | `0x00BD` | `u16` | `completed_unread_count` | 全局未读的完成结果数；`codex.state` 事件使用 |
 | `0x00BE` | `u16` | `failed_unread_count` | 全局未读的失败结果数；`codex.state` 事件使用 |
+| `0x00C0` | `u8` | `pairing_state` |
+| `0x00C1` | `utf8` | `pairing_token` |
 | `0x00B8` | `u32` | `retransmit_timeout_ms` |
 | `0x00B9` | `u8` | `max_retries` |
 | `0x00BA` | `u32` | `fragment_timeout_ms` |
@@ -1421,6 +1425,7 @@ DISCOVERY_REPLY(0x1D)
 ```text
 Device -> HELLO
 Bridge -> WELCOME
+[HELLO 携带 pairing_state=request 时：Bridge -> PAIRING]
 Device -> AUTH
 Bridge -> AUTH_OK
 双方 -> PING / PONG
@@ -1469,6 +1474,7 @@ Bridge -> AUTH_OK
 | `0x001E` | `writer_lease_seconds` |
 | `0x002A` | `request_id` |
 | `0x0098` | `server_time_ms` |
+| `0x00C0` | `pairing_state`（仅无线配对请求，可选） |
 
 可选字段：`profile`、`enabled_caps`、`transport_allowed`、`policy_version`、
 `applied_policy`、`window_frames`、`window_bytes`、`retransmit_timeout_ms`、
@@ -1550,7 +1556,7 @@ Bridge 在 AUTH 通过后发送 `AUTH_OK`，flags 包含 `RESPONSE`。必填字�
 `lease_generation` 和 `owner_device_ref`。
 
 只有收到 AUTH_OK 后，会话才进入 `READY`。AUTH_OK 之前，除了 HELLO、
-WELCOME、AUTH、ERROR、PING 和 PONG，其他消息都必须拒绝。
+WELCOME、PAIRING、AUTH、ERROR、PING 和 PONG，其他消息都必须拒绝。
 
 ### 11.7 Token 与密钥
 
@@ -1559,6 +1565,49 @@ WELCOME、AUTH、ERROR、PING 和 PONG，其他消息都必须拒绝。
 - Bridge 必须支持按设备撤销和轮换令牌。
 - 令牌轮换可以要求重连；旧令牌不得继续用于 HMAC。
 - `plain_lan_debug` 只能对回环地址、测试设备或显式打开的调试策略生效。
+
+### 11.8 无线配对（2026-10-24 协议补充）
+
+> 本节是 CBDP v1 原始规范落地后的补充。旧设备不发送 `pairing_state` 时，
+> HELLO/WELCOME/AUTH 流程保持完全不变。新增此流程是为了让没有 USB、无法使用
+> `register_offer` 的设备也能在本地管理员批准后取得配对令牌。
+
+没有本地令牌的设备在连接后发送的 `HELLO` 中携带
+`pairing_state = PAIRING_STATE_REQUEST(1)`。Bridge 仍先返回 `WELCOME`，随后按
+本机审批状态二选一：
+
+```text
+Device -> HELLO(pairing_state=request)
+Bridge -> WELCOME
+
+已批准且已有令牌：
+Bridge -> PAIRING(pairing_state=offer, pairing_token=<16..64 bytes>)
+Device -> AUTH(标准 HMAC pairing_token)
+
+尚未批准或没有令牌：
+Bridge -> ERROR(POLICY_DENIED, PAIRING_PENDING, reason=pairing_pending)
+```
+
+规则：
+
+1. `pairing_state` 缺省值为 `PAIRING_STATE_NONE(0)`；HELLO 只接受 `0` 或
+   `PAIRING_STATE_REQUEST(1)`。其他值返回 `INVALID_PARAM`。
+2. `PAIRING(0x1F)` 在 v1 中只有 Bridge 到设备方向。flags MUST 包含
+   `RESPONSE`，`request_id` 必须回显触发它的 HELLO `request_id`。
+3. PAIRING header MUST 包含 `pairing_state = PAIRING_STATE_OFFER(2)` 和
+   `pairing_token`。令牌按 UTF-8 编码后长度为 16..64 字节。
+4. 设备收到 OFFER 后必须把令牌保存到安全存储或 NVS，然后使用标准 AUTH 登录；
+   不得把令牌写入普通日志、遥测或调试输出。无线配对不建立第二套鉴权算法。
+5. Bridge 只有在设备已被本地管理员批准并且注册表保存了令牌时才能返回 OFFER。
+   未批准时不得先下发临时令牌，也不得把“待批准”伪装成鉴权成功。
+6. 收到 `PAIRING_PENDING` 的设备应关闭当前会话并按指数退避重新 HELLO；管理员
+   批准后，下一次 HELLO 会取得令牌。设备已经持有有效令牌时 SHOULD 省略
+   `pairing_state` 并直接走标准 AUTH。
+7. 令牌撤销或轮换后，旧令牌的 AUTH 必须失败；设备清除旧令牌后重新发送
+   `pairing_state=request`。明文局域网上的首次令牌下发依赖本地管理员显式批准，
+   启用 TLS 时可获得传输层保护。
+8. `PAIRING` 不改变能力位图、订阅、命令、事件或错误码编号；未实现此消息的旧
+   设备不会发送 `pairing_state`，因此保持兼容。
 
 ## 12. 会话状态机
 
@@ -4641,6 +4690,21 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 首版 ESP32-S3 `panel` 最小闭环是：摘要、短文本、审批、音频、有限控制和活动
 状态同步。首版 ESP32 `micro` 最小闭环是：摘要、短文本、审批、音频和最小控制
 状态。三者共享同一事件编号和错误码，不共享同一内存预算。
+
+### 19.16 无线配对消息（2026-10-24 后续补充）
+
+原始 v1.0 把 `0x1F` 标为保留。为了让没有 USB 的纯 CBDP 设备可以完成首次接入，
+后续实现正式分配并标记以下内容：
+
+- 消息类型 `PAIRING(0x1F)`，方向为 Bridge 到设备，作为 HELLO 配对请求的响应。
+- TLV `pairing_state(0x00C0)`，取值 `0=none,1=request,2=offer`。
+- TLV `pairing_token(0x00C1)`，UTF-8 令牌，长度 16..64 字节。
+- `HELLO.pairing_state` 的可选请求语义，以及 `PAIRING_PENDING` 错误原因。
+- 纯 CBDP 设备没有旧 JSON `registration_nonce` 时，本地管理员批准会直接生成令牌；
+  设备在下一次 HELLO 中通过 `PAIRING` 取得该令牌，不再依赖 `register_offer`。
+
+旧客户端、旧 ESP 固件和旧手机端不需要实现新消息；它们省略 `pairing_state` 即可
+继续使用原有 HELLO/WELCOME/AUTH 流程。
 
 ## 29. 并行开发接口清单
 

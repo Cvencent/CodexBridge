@@ -111,6 +111,10 @@ SSE 和 TCP 设备事件按同一能力分类：`queue_*` 只发送给启用 `qu
 `approved + pairing_code`；硬件无令牌时为 `pending`，批准后为
 `approved`。
 
+纯 CBDP 硬件不需要旧 JSON 注册的 `registration_nonce`。管理员批准后，Bridge 会
+在本机生成配对令牌；设备在 HELLO 中发送 `pairing_state=request`，Bridge 随后通过
+CBDP `PAIRING(0x1F)` 下发令牌。带 nonce 的旧硬件仍走原有 `register_offer` 流程。
+
 `GET /api/admin/devices` 返回统一列表，每项字段为：
 
 ```json

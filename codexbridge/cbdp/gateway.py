@@ -146,6 +146,12 @@ from codexbridge.cbdp.constants import (
     TYPE_WELCOME,
     TYPE_DELTA,
     TYPE_RESYNC,
+    TYPE_PAIRING,
+    TAG_PAIRING_STATE,
+    TAG_PAIRING_TOKEN,
+    PAIRING_STATE_NONE,
+    PAIRING_STATE_REQUEST,
+    PAIRING_STATE_OFFER,
 )
 from codexbridge.cbdp.events import EventSpine, event_scope
 from codexbridge.cbdp.frame import Frame, encode_frame
@@ -865,6 +871,9 @@ class CbdpGateway:
             )
             request_id = decode_u32(require_tlv(frame.header, TAG_REQUEST_ID))
             client_nonce = frame.header.get(TAG_CLIENT_NONCE, b"\x00" * 16)
+            pairing_state = decode_u8(
+                frame.header.get(TAG_PAIRING_STATE, bytes([PAIRING_STATE_NONE]))
+            )
             if (
                 version_minor != 0
                 or not device_id
@@ -874,6 +883,7 @@ class CbdpGateway:
                 or profile not in {0, 1, 2}
                 or transport_security not in {0, 1}
                 or len(client_nonce) != 16
+                or pairing_state not in {PAIRING_STATE_NONE, PAIRING_STATE_REQUEST}
             ):
                 raise CBDPError("INVALID_PARAM")
         except CBDPError as error:
@@ -923,7 +933,34 @@ class CbdpGateway:
                 TAG_SERVER_TIME_MS: i64(int(time.time() * 1000)),
             },
         )
-        return self._emit(welcome)
+        self._emit(welcome)
+        if pairing_state == PAIRING_STATE_REQUEST:
+            # The device has no stored token. Deliver the Bridge-minted token
+            # only when the local admin already approved this device and the
+            # registry holds a token; otherwise tell it to keep waiting.
+            token = str(self.pairing_token(device_id) or "")
+            if 16 <= len(token.encode("utf-8")) <= 64:
+                self._emit(
+                    Frame(
+                        message_type=TYPE_PAIRING,
+                        flags=FLAG_RESPONSE,
+                        seq=self._next_seq(),
+                        ack_seq=self._incoming_seq,
+                        header={
+                            TAG_REQUEST_ID: u32(request_id),
+                            TAG_PAIRING_STATE: u8(PAIRING_STATE_OFFER),
+                            TAG_PAIRING_TOKEN: utf8(token),
+                        },
+                    )
+                )
+            else:
+                self._error(
+                    request_id,
+                    "POLICY_DENIED",
+                    "PAIRING_PENDING",
+                    {"reason": "pairing_pending"},
+                )
+        return welcome
 
     def _handle_auth(self, frame):
         session = self.session

@@ -171,6 +171,35 @@ class DeviceManagerTest(unittest.TestCase):
         self.assertEqual(record.registration_state, "approved")
         self.assertTrue(record.has_token)
 
+    def test_approve_cbdp_device_without_nonce_mints_wireless_token(self):
+        result = DiscoveryResult(
+            host="127.0.0.1",
+            device="passport",
+            device_id="cbdp-pending",
+            name="Passport",
+            port=8765,
+            capabilities=["status", "text"],
+            protocol="cbdp",
+        )
+        self.manager.sync([result])
+        record = self.registry.get("cbdp-pending")
+        self.assertEqual(record.registration_state, "pending")
+        self.assertIsNone(record.registration_nonce)
+
+        calls = []
+        self.manager._send_register_offer = lambda *args, **kwargs: self.fail(
+            "CBDP approval must not use register_offer"
+        )
+        self.manager._sync_one = lambda result, **kwargs: calls.append(result)
+
+        self.assertTrue(self.manager.approve("cbdp-pending"))
+        self.assertEqual(record.registration_state, "approved")
+        self.assertGreaterEqual(len(record.token), 16)
+        self.assertLessEqual(len(record.token), 64)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].protocol, "cbdp")
+        self.assertEqual(calls[0].registration_state, "approved")
+
     def test_approve_rejects_expired_or_rebound_nonce(self):
         self.registry.upsert(
             "pending-1",

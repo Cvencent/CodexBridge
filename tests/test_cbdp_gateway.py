@@ -41,7 +41,12 @@ from codexbridge.cbdp.constants import (
     TAG_STATUS,
     TAG_ONLINE,
     TAG_ECHO,
+    TAG_ERROR_DETAIL,
+    TAG_ERROR_MESSAGE,
     TAG_PING_ID,
+    TAG_PAIRING_STATE,
+    TAG_PAIRING_TOKEN,
+    TAG_REASON,
     TAG_SERVER_TIME_MS,
     TAG_SERVER_NONCE,
     TAG_SESSION_ID,
@@ -64,9 +69,12 @@ from codexbridge.cbdp.constants import (
     TYPE_SEND_CHUNK,
     TYPE_SEND_END,
     TYPE_ERROR,
+    TYPE_PAIRING,
     TYPE_SUBSCRIBE,
     TYPE_RESYNC,
     TYPE_WELCOME,
+    PAIRING_STATE_OFFER,
+    PAIRING_STATE_REQUEST,
 )
 from codexbridge.cbdp import gateway
 from codexbridge.cbdp.frame import Frame
@@ -75,6 +83,7 @@ from codexbridge.cbdp.refs import ReferenceRegistry
 from codexbridge.cbdp.tlv import (
     CBDPError,
     decode_array,
+    decode_u8,
     decode_u16,
     decode_utf8,
     decode_i64,
@@ -398,23 +407,26 @@ class CbdpGatewayTests(unittest.TestCase):
     def raw(self, frame):
         return frame
 
-    def hello(self, request_id=1, nonce=b"\x01" * 16):
+    def hello(self, request_id=1, nonce=b"\x01" * 16, pairing_state=None):
+        header = {
+            TAG_VERSION_MINOR: u16(0),
+            TAG_DEVICE_ID: utf8("dev-1"),
+            TAG_MODEL: utf8("esp32"),
+            TAG_FIRMWARE: utf8("1.0"),
+            TAG_PROFILE: u8(1),
+            TAG_SUPPORTED_CAPS: capability_bitmap(
+                ["status", "text", "control", "queue", "queue_manage"]
+            ).to_bytes(8, "big"),
+            TAG_TRANSPORT_SECURITY: u8(0),
+            TAG_CLIENT_NONCE: nonce,
+            TAG_REQUEST_ID: u32(request_id),
+        }
+        if pairing_state is not None:
+            header[TAG_PAIRING_STATE] = u8(pairing_state)
         return Frame(
             message_type=TYPE_HELLO,
             flags=FLAG_REQUEST,
-            header={
-                TAG_VERSION_MINOR: u16(0),
-                TAG_DEVICE_ID: utf8("dev-1"),
-                TAG_MODEL: utf8("esp32"),
-                TAG_FIRMWARE: utf8("1.0"),
-                TAG_PROFILE: u8(1),
-                TAG_SUPPORTED_CAPS: capability_bitmap(
-                    ["status", "text", "control", "queue", "queue_manage"]
-                ).to_bytes(8, "big"),
-                TAG_TRANSPORT_SECURITY: u8(0),
-                TAG_CLIENT_NONCE: nonce,
-                TAG_REQUEST_ID: u32(request_id),
-            },
+            header=header,
         )
 
     def test_hello_returns_welcome_with_intersected_capabilities(self):
@@ -428,6 +440,57 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertTrue(fields[TAG_MAX_AUDIO_BYTES])
         self.assertTrue(fields[TAG_MAX_TEXT_CHARS])
         self.assertTrue(fields[TAG_MAX_FRAME_BYTES])
+
+    def test_hello_pairing_request_offers_the_approved_token(self):
+        self.gateway.handle_frame(
+            self.hello(request_id=9, pairing_state=PAIRING_STATE_REQUEST)
+        )
+        self.assertEqual(
+            [frame.message_type for frame in self.sent],
+            [TYPE_WELCOME, TYPE_PAIRING],
+        )
+        pairing = self.sent[1]
+        self.assertTrue(pairing.flags & FLAG_RESPONSE)
+        self.assertEqual(decode_u32(pairing.header[TAG_REQUEST_ID]), 9)
+        self.assertEqual(
+            decode_u8(pairing.header[TAG_PAIRING_STATE]),
+            PAIRING_STATE_OFFER,
+        )
+        self.assertEqual(
+            decode_utf8(pairing.header[TAG_PAIRING_TOKEN]),
+            "0123456789abcdef0123456789abcdef",
+        )
+
+    def test_hello_pairing_request_reports_pending_without_approval(self):
+        self.gateway.pairing_token = lambda device_id: ""
+        self.gateway.handle_frame(
+            self.hello(request_id=10, pairing_state=PAIRING_STATE_REQUEST)
+        )
+        self.assertEqual(
+            [frame.message_type for frame in self.sent],
+            [TYPE_WELCOME, TYPE_ERROR],
+        )
+        error = self.sent[1]
+        fields = decode_tlvs(encode_tlvs(error.header.items()))
+        self.assertEqual(decode_u32(fields[TAG_REQUEST_ID]), 10)
+        self.assertEqual(decode_utf8(fields[TAG_ERROR_MESSAGE]), "PAIRING_PENDING")
+        detail = decode_tlvs(fields[TAG_ERROR_DETAIL])
+        self.assertEqual(decode_utf8(detail[TAG_REASON]), "pairing_pending")
+
+    def test_hello_without_pairing_request_keeps_existing_flow(self):
+        self.gateway.handle_frame(self.hello())
+        self.assertEqual(
+            [frame.message_type for frame in self.sent],
+            [TYPE_WELCOME],
+        )
+
+    def test_hello_rejects_unknown_pairing_state(self):
+        self.gateway.handle_frame(self.hello(pairing_state=3))
+        self.assertEqual(
+            [frame.message_type for frame in self.sent],
+            [TYPE_ERROR],
+        )
+        self.assertEqual(self.sent[0].code, 0x0006)
 
     def test_hello_name_and_model_are_limited_to_64_bytes(self):
         hello = self.hello()

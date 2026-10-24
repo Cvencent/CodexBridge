@@ -53,7 +53,7 @@ CodexBridge 不是设备固件，也不是手机 App，而是 PC 侧的唯一桥
 
 - UDP 自动发现、待批准设备、批准/拒绝/撤销、配对令牌和能力配置都在同一页面。
 - 每台设备分别保存支持能力和本机启用策略，不会因为某个新能力自动扩大权限。
-- 手机使用配对码；ESP 硬件使用一次性 registration nonce 和 `register_offer`。
+- 手机使用配对码；ESP 硬件可在本地批准后通过 CBDP `PAIRING(0x1F)` 无线取得令牌，旧固件继续兼容 registration nonce 和 `register_offer`。
 - 在线/离线状态采用边沿触发与迟滞，失败重拨不会重复发送假离线事件。
 - 已批准 ESP 设备即使停留在首页、暂不建立 CBDP TCP，也会通过 UDP presence 保持在线状态。
 - 手机 SSE/WebSocket 心跳会持续刷新在线状态。
