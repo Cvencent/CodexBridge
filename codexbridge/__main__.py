@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from codexbridge.admin_api import AdminApi
 from codexbridge.codex.app_server import (
@@ -542,6 +543,16 @@ def main(argv: list[str] | None = None) -> int:
         references=references,
     )
 
+    project_service: dict[str, Any] = {}
+
+    def project_lookup(project_id: str):
+        """Resolve a device's project reference once the service exists."""
+
+        service = project_service.get("service")
+        if service is None:
+            return None
+        return service.project_cwd(project_id)
+
     def cbdp_gateway_factory(device_id, record):
         return CbdpGateway(
             commands=lambda: hub.commands,
@@ -553,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             active_thread=hub.followed_thread,
             active_state=hub.active_state,
             set_active_state=hub.set_active_state,
+            project_cwd=lambda project_id: project_lookup(project_id),
             defer=lambda device_id, callback: hub.defer_blocking_event(
                 device_id,
                 {"type": "cbdp_deferred", "callback": callback},
@@ -596,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
         codex_enabled=lambda: codex_state.snapshot()["enabled"],
         demand=None,  # filled in below, once the hub exists
     )
+    project_service["service"] = companion_service
     hub.commands = companion_service.commands
 
     def watcher_demand() -> bool:

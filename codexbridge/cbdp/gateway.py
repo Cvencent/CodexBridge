@@ -464,6 +464,7 @@ class CbdpGateway:
         active_thread=None,
         active_state=None,
         set_active_state=None,
+        project_cwd=None,
         auth_mode=1,
         policy_version=1,
     ):
@@ -488,6 +489,12 @@ class CbdpGateway:
         # keeps the shared hub as the only source of truth in tests.
         self.active_state = active_state
         self.set_active_state = set_active_state
+        # Optional ``project_id -> cwd`` resolver. ``thread.start`` carries a
+        # compact ``project_ref``; the app-server needs a working directory, so
+        # the gateway translates the reference before dispatch. Returning
+        # ``None`` means the project is unknown; an empty string means the
+        # project exists but has no usable directory.
+        self.project_cwd = project_cwd
         self._active_revision = 0
         self.transport_allowed = transport_allowed or (
             lambda device_id: (1 << 64) - 1
@@ -1345,6 +1352,34 @@ class CbdpGateway:
         run()
         return None
 
+    def _thread_start_cwd(self, params):
+        """Translate ``thread.start``'s project selector into a directory.
+
+        Devices pick a project from ``projects.list`` and only hold its compact
+        ``project_ref``; the app-server needs a real working directory. Resolve
+        it here so the command layer keeps taking a plain ``cwd`` and no
+        ``project_id`` leaks into ``thread/start``.
+        """
+
+        project_id = str(params.pop("project_id", "") or "").strip()
+        if not project_id:
+            return
+        resolver = self.project_cwd
+        if resolver is None:
+            raise CBDPError("UNSUPPORTED_FEATURE")
+        try:
+            cwd = resolver(project_id)
+        except CBDPError:
+            raise
+        except Exception:  # noqa: BLE001 - unknown project must not 500
+            raise CBDPError("NOT_FOUND")
+        if cwd is None:
+            raise CBDPError("NOT_FOUND")
+        cwd = str(cwd).strip()
+        if not cwd:
+            raise CBDPError("INVALID_PARAM")
+        params["cwd"] = cwd
+
     def _normalize_params(self, method, params):
         params = dict(params)
         if "project_ref" in params:
@@ -1352,8 +1387,10 @@ class CbdpGateway:
             if not project_id:
                 raise CBDPError("NOT_FOUND")
             if "project_id" in params and params["project_id"] != project_id:
-                raise ValueError("project selectors disagree")
+                raise CBDPError("INVALID_PARAM")
             params["project_id"] = project_id
+        if method == "thread.start":
+            self._thread_start_cwd(params)
         if method in {"turn.start", "queue.add"} and "input_parts" in params:
             params["input_parts"] = self._decode_input_parts(params["input_parts"])
         if method.startswith("attachment."):

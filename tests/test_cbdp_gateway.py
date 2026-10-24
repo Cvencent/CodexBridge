@@ -346,6 +346,53 @@ class CbdpGatewayTests(unittest.TestCase):
             gateway._normalize_params("threads.list", {"project_ref": 999999})
         self.assertEqual(caught.exception.name, "NOT_FOUND")
 
+    def test_thread_start_resolves_project_ref_to_cwd(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            references=refs,
+            project_cwd=lambda project_id: r"D:\proj\one",
+        )
+        ref = gateway._ref("project", "proj-1")
+
+        params = gateway._normalize_params("thread.start", {"project_ref": ref})
+
+        self.assertEqual(params, {"cwd": r"D:\proj\one"})
+        with self.assertRaises(CBDPError) as caught:
+            gateway._normalize_params("thread.start", {"project_ref": 424242})
+        self.assertEqual(caught.exception.name, "NOT_FOUND")
+
+    def test_thread_start_rejects_a_project_without_a_cwd(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            references=refs,
+            project_cwd=lambda project_id: "",
+        )
+        ref = gateway._ref("project", "proj-empty")
+
+        with self.assertRaises(CBDPError) as caught:
+            gateway._normalize_params("thread.start", {"project_ref": ref})
+
+        self.assertEqual(caught.exception.name, "INVALID_PARAM")
+
+    def test_thread_start_without_project_ref_keeps_working(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+
+        gateway = CbdpGateway(commands=lambda: None)
+
+        self.assertEqual(
+            gateway._normalize_params("thread.start", {"cwd": r"D:\x"}),
+            {"cwd": r"D:\x"},
+        )
+        self.assertEqual(gateway._normalize_params("thread.start", {}), {})
+
     def test_thread_settings_update_decodes_policy_enums_to_names(self):
         from codexbridge.cbdp.gateway import CbdpGateway
 

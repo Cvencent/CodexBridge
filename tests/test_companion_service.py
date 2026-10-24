@@ -273,6 +273,22 @@ class CompanionServiceTests(unittest.TestCase):
             ["a", "b"],
         )
 
+    def test_project_cwd_resolves_id_or_name(self) -> None:
+        with mock.patch.object(
+            self.service,
+            "_project_catalog",
+            return_value={"projects": [
+                {"project_id": "p1", "name": "One",
+                 "cwd": r"D:\proj\one", "roots": [r"D:\proj\one"]},
+                {"project_id": "p2", "name": "Empty", "cwd": "", "roots": []},
+            ]},
+        ):
+            self.assertEqual(self.service.project_cwd("p1"), r"D:\proj\one")
+            self.assertEqual(self.service.project_cwd("One"), r"D:\proj\one")
+            self.assertEqual(self.service.project_cwd("p2"), "")
+            self.assertIsNone(self.service.project_cwd("missing"))
+            self.assertIsNone(self.service.project_cwd(""))
+
     def test_owner_discovery_uses_oldest_due_thread(self):
         from unittest.mock import patch
         self.service._isolated = False

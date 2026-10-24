@@ -3535,6 +3535,38 @@ class CompanionService:
         return {"models": models}
 
     def list_projects(self) -> dict[str, Any]:
+        return self._project_catalog()
+
+    def project_cwd(self, project_id: str) -> str | None:
+        """Resolve a project id (or name) to its working directory.
+
+        ``thread.start`` receives a compact project reference from the device;
+        the app-server needs a real directory. ``None`` means the project is
+        unknown, while an empty string means it exists without a usable path.
+        """
+
+        wanted = str(project_id or "").strip()
+        if not wanted:
+            return None
+        for row in self._project_catalog().get("projects") or []:
+            if not isinstance(row, dict):
+                continue
+            if wanted not in {
+                str(row.get("project_id") or ""),
+                str(row.get("name") or ""),
+            }:
+                continue
+            roots = [
+                str(root).strip()
+                for root in row.get("roots") or []
+                if str(root or "").strip()
+            ]
+            if roots:
+                return roots[0]
+            return str(row.get("cwd") or "").strip()
+        return None
+
+    def _project_catalog(self) -> dict[str, Any]:
         projects: list[dict[str, Any]] = []
         try:
             desktop = json.loads(read_text_shared(self.desktop_state_path))

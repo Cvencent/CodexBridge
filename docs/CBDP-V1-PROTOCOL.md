@@ -2755,7 +2755,7 @@ project_ref, project_id, revision
 | `status.read` | 无 | 无 | `online`, `metrics`, `applied_policy` | `[本轮实现]` |
 | `threads.list` | 无 | `cursor`, `history_depth`, `search_snippet`, `project_ref` | `objects`, `next_cursor`, `object_count` | `[本轮实现]` |
 | `thread.read` | `thread_ref` / `thread_id` | `cursor`, `history_depth` | `thread_ref`, `status`, `objects`, `next_cursor` | `[本轮实现]`；`history_depth` 映射为最多返回的消息条数，省略时使用设备 profile 的历史预算 |
-| `thread.start` | 无 | `title`, `cwd`, `model_name`, `effort`, `project_ref` | `thread_ref`, `owner_state`, `revision` | `[本轮实现]` |
+| `thread.start` | 无 | `title`, `cwd`, `model_name`, `effort`, `project_ref` | `thread_ref`, `owner_state`, `revision` | `[本轮实现]`；`project_ref` 由 Bridge 解析成项目目录 |
 | `turn.start` | `thread_ref` / `thread_id`, `body` 或 `input_parts` | `model_name`, `effort`, `part_ref`, `references`, `deadline_ms` | `thread_ref`, `turn_ref`, `status` | `[本轮实现]` |
 | `turn.steer` | `thread_ref` / `thread_id`, `body` 或 `input_parts` | `turn_ref`, `part_ref`, `references` | `thread_ref`, `turn_ref`, `status` | `[本轮实现]` |
 | `turn.interrupt` | `thread_ref` / `thread_id` | `turn_ref`, `reason`；`interrupt_mode` 为 `[本轮不实现]` | `thread_ref`, `turn_ref`, `status` | `[本轮实现]`（不含 `interrupt_mode`） |
@@ -4711,6 +4711,20 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 
 旧客户端、旧 ESP 固件和旧手机端不需要实现新消息；它们省略 `pairing_state` 即可
 继续使用原有 HELLO/WELCOME/AUTH 流程。
+
+### 19.17 `thread.start` 项目目录解析（2026-10-25 后续修正）
+
+设备从 `projects.list` 拿到的是紧凑 `project_ref`，而 Codex app-server 需要真实
+工作目录。因此 `thread.start` 携带 `project_ref` 时，Bridge MUST 在网关层把它
+解析成项目目录，再把 `cwd` 交给命令层：
+
+1. `project_ref` 通过引用表解析为项目 ID；无法解析返回 `NOT_FOUND`。
+2. 项目存在但没有可用目录时返回 `INVALID_PARAM`。
+3. 解析结果写入 `cwd`，`project_id` MUST NOT 透传给 app-server。
+4. 未携带 `project_ref` 时保持原有行为（使用请求中的 `cwd` 或 Bridge 默认目录）。
+5. 同时提供 `project_ref` 与不一致的 `project_id` 时返回 `INVALID_PARAM`。
+
+Bridge 监听绑定和桌面交接两条创建路径 MUST 使用同一个解析出的 `cwd`。
 
 ## 29. 并行开发接口清单
 
