@@ -18,6 +18,7 @@ from codexbridge.protocol.commands import CommandDispatcher
 from codexbridge.companion.queue import QueueService
 
 from codexbridge.read_state import ReadStateStore
+from codexbridge.win_shared import read_text_shared
 
 
 from codexbridge.codex.app_server import (
@@ -3536,7 +3537,7 @@ class CompanionService:
     def list_projects(self) -> dict[str, Any]:
         projects: list[dict[str, Any]] = []
         try:
-            desktop = json.loads(self.desktop_state_path.read_text(encoding="utf-8"))
+            desktop = json.loads(read_text_shared(self.desktop_state_path))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             desktop = {}
         local = desktop.get("local-projects")

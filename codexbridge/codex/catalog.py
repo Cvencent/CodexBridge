@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from codexbridge.win_shared import read_text_shared
+
 CATALOG_ITEMS_PER_PAGE = 7
 NEW_THREAD_TITLE = "新建任务"
 CATALOG_TITLE_CHARS = 22
@@ -378,7 +380,7 @@ class CodexCatalogService:
 
     def _desktop_projects(self, state: _CatalogState) -> list[dict[str, Any]]:
         try:
-            desktop = json.loads(self.desktop_state_path.read_text(encoding="utf-8"))
+            desktop = json.loads(read_text_shared(self.desktop_state_path))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return []
         local_projects = desktop.get("local-projects")

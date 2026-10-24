@@ -27,6 +27,7 @@ from urllib.parse import unquote
 
 from codexbridge.messages_store import MessageStore
 from codexbridge.read_state import ReadStateStore
+from codexbridge.win_shared import read_text_shared
 
 # One JSON parse per changed file, not one per poll tick: the desktop state is
 # large (hundreds of kilobytes) and is polled several times a second.
@@ -44,7 +45,7 @@ def desktop_state_path() -> Path:
 
 def _read_json(path: Path) -> dict:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(read_text_shared(path))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
