@@ -1362,6 +1362,92 @@ class CompanionServiceTests(unittest.TestCase):
             self.assertFalse(lock.exists())
             self.assertFalse((lock_dir / "t1.lock.removed").exists())
 
+    def test_a_lock_held_by_a_live_desktop_is_never_stolen(self) -> None:
+        """A running desktop Codex owns its thread; the bridge must not take it.
+
+        Deleting a held lock revoked the desktop's ownership: its next send
+        failed with a writer conflict while the bridge wrote the same thread
+        from a second app-server.
+        """
+        from codexbridge.companion import service as service_module
+
+        with mock.patch.dict(
+            "os.environ",
+            {"USERPROFILE": self.temp.name, "HOME": self.temp.name},
+        ):
+            lock_dir = Path(self.temp.name) / ".codex" / "thread-writer-locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = lock_dir / "t1.lock"
+            lock.write_bytes(b"locked")
+
+            with mock.patch(
+                "codexbridge.companion.service.writer_lock_path",
+                return_value=lock,
+            ), mock.patch.object(
+                service_module, "_writer_lock_is_held", return_value=True
+            ):
+                self.assertFalse(service_module._clear_writer_lock("t1"))
+
+            self.assertTrue(lock.exists())
+            self.assertFalse((lock_dir / "t1.lock.removed").exists())
+
+    def test_a_stale_lock_file_is_still_reclaimable(self) -> None:
+        from codexbridge.companion import service as service_module
+
+        with mock.patch.dict(
+            "os.environ",
+            {"USERPROFILE": self.temp.name, "HOME": self.temp.name},
+        ):
+            lock_dir = Path(self.temp.name) / ".codex" / "thread-writer-locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock = lock_dir / "t1.lock"
+            lock.write_bytes(b"stale")
+
+            with mock.patch(
+                "codexbridge.companion.service.writer_lock_path",
+                return_value=lock,
+            ), mock.patch.object(
+                service_module, "_writer_lock_is_held", return_value=False
+            ):
+                self.assertTrue(service_module._clear_writer_lock("t1"))
+
+            self.assertFalse(lock.exists())
+
+    def test_the_writer_lock_probe_treats_a_held_lock_as_held(self) -> None:
+        """End-to-end probe: an exclusively opened handle must read as held."""
+        from codexbridge.companion import service as service_module
+
+        lock_dir = Path(self.temp.name) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock = lock_dir / "t1.lock"
+        lock.write_bytes(b"")
+
+        if os.name != "nt":
+            self.skipTest("share-mode probing is Windows-only")
+
+        import ctypes as ctypes_module
+
+        kernel32 = ctypes_module.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes_module.c_void_p
+        kernel32.CreateFileW.argtypes = [
+            ctypes_module.c_wchar_p,
+            ctypes_module.c_uint32,
+            ctypes_module.c_uint32,
+            ctypes_module.c_void_p,
+            ctypes_module.c_uint32,
+            ctypes_module.c_uint32,
+            ctypes_module.c_void_p,
+        ]
+        handle = kernel32.CreateFileW(
+            str(lock), 0x80000000, 0, None, 3, 0, None
+        )
+        self.assertNotEqual(handle, ctypes_module.c_void_p(-1).value)
+        try:
+            self.assertTrue(service_module._writer_lock_is_held(lock))
+        finally:
+            kernel32.CloseHandle(ctypes_module.c_void_p(handle))
+        self.assertFalse(service_module._writer_lock_is_held(lock))
+
     def test_turn_completed_event_marks_history_append(self) -> None:
         payload = {
             "threadId": "t1",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import queue
@@ -196,20 +197,81 @@ def writer_lock_path(thread_id: str) -> Path:
     return Path.home() / ".codex" / "thread-writer-locks" / f"{thread_id}.lock"
 
 
+def _writer_lock_is_held(path: Path) -> bool:
+    """Whether a live Codex process currently holds this writer lock.
+
+    The lock file is only *implied* by its presence: a real lock is an open
+    handle that denies sharing. Probing with an exclusive open therefore
+    separates "a live app-server owns this thread" from "a stale file was left
+    behind after a crash". Deleting a held lock is what let the bridge fight
+    the desktop Codex for the same thread: the desktop's next ``turn/start``
+    then failed with a writer conflict while the bridge believed it had
+    legitimately taken the thread over.
+    """
+    try:
+        if os.name != "nt":
+            raise OSError("writer locks are only probed on Windows")
+    except OSError:
+        # Non-Windows platforms have no portable share-mode probe. Be
+        # conservative and treat the lock as held rather than risk deleting a
+        # lock that a live desktop process still owns.
+        return True
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        # ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean a live owner.
+        return error in {32, 33}
+    kernel32.CloseHandle(ctypes.c_void_p(handle))
+    return False
+
+
 def _clear_writer_lock(thread_id: str) -> bool:
-    """Remove a stale Codex thread writer lock when Windows allows it.
+    """Remove a *stale* Codex thread writer lock, never a live one.
 
     The desktop app-server can keep its lock file after a turn finishes. The
     lock is advisory and owned by an independent process, but Windows POSIX
     semantics let us delete it by rename; once removed a new app-server can
     resume and write the same stored thread. Failure is safe: callers fall back
     to the previous locked-thread behavior.
+
+    A lock that a live process still holds must never be deleted. Doing so
+    silently revoked the desktop's ownership of its own thread, so the desktop
+    Codex reported a write error on its next send while the bridge went on to
+    write the thread from a second app-server.
     """
     if not thread_id or Path(thread_id).name != thread_id:
         return False
     path = writer_lock_path(thread_id)
     try:
         if not path.is_file():
+            return False
+        if _writer_lock_is_held(path):
+            # A live owner: leave the lock exactly where it is. Callers treat
+            # this as "still locked" and route the write elsewhere instead of
+            # hijacking the desktop's thread.
             return False
         path.replace(path.with_name(path.name + ".removed"))
         path.with_name(path.name + ".removed").unlink(missing_ok=True)
