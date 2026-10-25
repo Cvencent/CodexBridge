@@ -4726,6 +4726,28 @@ AI Passport 首页在后台播放网络电台时，同时存在的电台 TCP 流
 
 Bridge 监听绑定和桌面交接两条创建路径 MUST 使用同一个解析出的 `cwd`。
 
+### 19.18 `thread.start` 继承设备最近选择的项目（2026-10-25 后续修正）
+
+现网设备把“选择项目”编码为 `threads.list(project_ref)`：项目对象返回
+`project_ref` 后，设备用同一个引用请求该项目的任务列表。部分已发布固件没有
+额外的项目参数，新建任务时会发送不带 `cwd` / `project_ref` 的
+`thread.start(0x0004)`。为了让这些设备无需升级就能在所选项目下建任务，
+Bridge MUST 在 CBDP 网关层按 `device_id` 记住最近一次用于 `threads.list`
+查询的 `project_ref`，并在该设备后续无参数 `thread.start` 时把该项目解析成
+`cwd`。
+
+优先级固定为：
+
+1. `thread.start` 显式携带的 `cwd`。
+2. 同一 `thread.start` 显式携带的 `project_ref` / `project_id`。
+3. 该设备最近一次 `threads.list(project_ref)` 记录的项目。
+4. Bridge 默认工作目录。
+
+记忆状态 MUST 按设备隔离，且只在 Bridge 进程内保留；设备重连后重新执行
+`threads.list(project_ref)` 即可恢复。项目引用无法解析或没有可用目录时沿用
+§19.17 的 `NOT_FOUND` / `INVALID_PARAM` 语义。该记忆不能让一个设备的项目
+选择影响另一个设备，也不能覆盖 `thread.start` 的显式参数。
+
 ## 29. 并行开发接口清单
 
 ### 29.1 Bridge Agent

@@ -160,6 +160,22 @@ class CodexCatalogTest(unittest.TestCase):
             desktop_state_path=self.desktop_state,
         )
 
+    def test_selected_project_cwd_survives_catalog_confirmation(self):
+        self._write_desktop_state()
+        service = self._service()
+        service.handle_device_event("device-1", {"type": "codex_catalog_request"})
+        service.handle_device_event(
+            "device-1", {"type": "codex_project_select", "id": "p0"}
+        )
+        service.handle_device_event(
+            "device-1", {"type": "codex_selection_confirm"}
+        )
+
+        self.assertEqual(
+            service.selected_project_cwd("device-1"),
+            str(Path(tempfile.gettempdir()) / "repo-a"),
+        )
+
     def test_projects_are_paged_with_short_ids(self):
         self._write_desktop_state()
         service = self._service()

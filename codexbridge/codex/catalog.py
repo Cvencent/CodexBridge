@@ -157,6 +157,10 @@ class CodexCatalogService:
         # Model chosen by a device. This is a device preference, not catalog
         # state, so it survives cancel/confirm resets and bridge re-handshakes.
         self._chosen_models: dict[str, str] = {}
+        # The project a device selected most recently. Picker state is reset
+        # when the catalog closes, but later parameterless thread creation must
+        # still use the same directory.
+        self._selected_projects: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
 
     def handle_device_event(
@@ -189,7 +193,10 @@ class CodexCatalogService:
     def _start_thread(self, device_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
         """Create a real Codex thread so the device can work without a PC."""
         state = self._states.setdefault(device_id, _CatalogState())
-        cwd = str((state.selected_project or {}).get("cwd") or self.workspace)
+        selected_project = (
+            state.selected_project or self._selected_projects.get(device_id) or {}
+        )
+        cwd = str(selected_project.get("cwd") or self.workspace)
         model = event.get("model") or self._chosen_models.get(device_id)
         params: dict[str, Any] = {"cwd": cwd}
         if isinstance(model, str) and model.strip():
@@ -241,6 +248,13 @@ class CodexCatalogService:
             state = self._states.get(device_id)
             return str(state.active_thread_id or "") if state else ""
 
+    def selected_project_cwd(self, device_id: str) -> str:
+        """Directory of the project this device selected most recently."""
+
+        with self._lock:
+            project = self._selected_projects.get(device_id) or {}
+            return str(project.get("cwd") or "").strip()
+
     def handle_voice_command(self, device_id: str, text: str) -> list[dict[str, Any]]:
         """Turn a confirmed voice instruction into a real Codex turn.
 
@@ -255,7 +269,10 @@ class CodexCatalogService:
         thread_id = state.active_thread_id
         model = self._chosen_models.get(device_id) or ""
         if not thread_id:
-            cwd = str((state.selected_project or {}).get("cwd") or self.workspace)
+            selected_project = (
+                state.selected_project or self._selected_projects.get(device_id) or {}
+            )
+            cwd = str(selected_project.get("cwd") or self.workspace)
             params: dict[str, Any] = {"cwd": cwd}
             if model:
                 params["model"] = model
@@ -499,6 +516,7 @@ class CodexCatalogService:
             state.project_page = int(project["page"])
             return self._render_project_page(state)
         state.selected_project = project
+        self._selected_projects[device_id] = dict(project)
         threads = self._project_threads(state, project)
         return self._render_thread_list(state, project, threads)
 

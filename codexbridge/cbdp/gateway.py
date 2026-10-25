@@ -521,6 +521,11 @@ class CbdpGateway:
         self._cursor_reverse: dict[str, int] = {}
         self._cursor_seq = 0
         self._ref_external: dict[tuple[str, int], str] = {}
+        # Device -> project_id it most recently used to list threads. Devices
+        # select a project by calling threads.list(project_ref) and older
+        # firmware follows with a parameterless thread.start; keeping this
+        # selection lets that flow create the task in the chosen directory.
+        self._device_projects: dict[str, str] = {}
         self._lock = threading.RLock()
 
     def bind_transport(self, send):
@@ -1291,7 +1296,7 @@ class CbdpGateway:
         if method == "active_state.set":
             return self._handle_active_state_set(request_id, device_id, params)
         try:
-            normalized = self._normalize_params(method, params)
+            normalized = self._normalize_params(method, params, device_id=device_id)
         except CBDPError as error:
             return self._error(request_id, error.name)
         except (TypeError, ValueError):
@@ -1380,7 +1385,7 @@ class CbdpGateway:
             raise CBDPError("INVALID_PARAM")
         params["cwd"] = cwd
 
-    def _normalize_params(self, method, params):
+    def _normalize_params(self, method, params, device_id=""):
         params = dict(params)
         if "project_ref" in params:
             project_id = self._external_from_ref("project", int(params.pop("project_ref")))
@@ -1389,7 +1394,15 @@ class CbdpGateway:
             if "project_id" in params and params["project_id"] != project_id:
                 raise CBDPError("INVALID_PARAM")
             params["project_id"] = project_id
+            if method == "threads.list" and device_id:
+                self._device_projects[device_id] = project_id
         if method == "thread.start":
+            if not str(params.get("cwd") or "").strip():
+                remembered = (
+                    self._device_projects.get(device_id) if device_id else ""
+                )
+                if remembered and "project_id" not in params:
+                    params["project_id"] = remembered
             self._thread_start_cwd(params)
         if method in {"turn.start", "queue.add"} and "input_parts" in params:
             params["input_parts"] = self._decode_input_parts(params["input_parts"])

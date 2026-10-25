@@ -393,6 +393,70 @@ class CbdpGatewayTests(unittest.TestCase):
         )
         self.assertEqual(gateway._normalize_params("thread.start", {}), {})
 
+    def test_threads_list_project_ref_is_remembered_for_thread_start(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            references=refs,
+            project_cwd=lambda project_id: r"D:\proj\selected",
+        )
+        ref = gateway._ref("project", "proj-selected")
+
+        listed = gateway._normalize_params(
+            "threads.list", {"project_ref": ref}, device_id="dev-1"
+        )
+
+        self.assertEqual(listed, {"project_id": "proj-selected"})
+        self.assertEqual(
+            gateway._normalize_params("thread.start", {}, device_id="dev-1"),
+            {"cwd": r"D:\proj\selected"},
+        )
+
+    def test_remembered_project_is_isolated_per_device(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            references=refs,
+            project_cwd=lambda project_id: r"D:\proj\selected",
+        )
+        ref = gateway._ref("project", "proj-selected")
+
+        gateway._normalize_params(
+            "threads.list", {"project_ref": ref}, device_id="dev-1"
+        )
+
+        self.assertEqual(
+            gateway._normalize_params("thread.start", {}, device_id="dev-2"), {}
+        )
+
+    def test_thread_start_explicit_cwd_wins_over_remembered_project(self):
+        from codexbridge.cbdp.gateway import CbdpGateway
+        from codexbridge.cbdp.refs import ReferenceRegistry
+
+        refs = ReferenceRegistry(None)
+        gateway = CbdpGateway(
+            commands=lambda: None,
+            references=refs,
+            project_cwd=lambda project_id: r"D:\proj\selected",
+        )
+        ref = gateway._ref("project", "proj-selected")
+        gateway._normalize_params(
+            "threads.list", {"project_ref": ref}, device_id="dev-1"
+        )
+
+        self.assertEqual(
+            gateway._normalize_params(
+                "thread.start", {"cwd": r"D:\explicit"}, device_id="dev-1"
+            ),
+            {"cwd": r"D:\explicit"},
+        )
+
     def test_thread_settings_update_decodes_policy_enums_to_names(self):
         from codexbridge.cbdp.gateway import CbdpGateway
 

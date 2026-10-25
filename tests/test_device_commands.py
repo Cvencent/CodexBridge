@@ -22,6 +22,10 @@ class Service:
         self.calls.append(('settings-update', thread_id, settings))
         return {'thread_id': thread_id, 'applied': True, 'settings_revision': 0}
 
+    def start_thread(self, cwd='', model='', ephemeral=False):
+        self.calls.append(('start', cwd, model, ephemeral))
+        return {'thread': {'id': 'thread-project'}, 'cwd': cwd}
+
 
 class ReadStateCommandTests(unittest.TestCase):
     def test_message_read_update_marks_shared_message_and_thread_state(self):
@@ -69,6 +73,51 @@ class ReadStateCommandTests(unittest.TestCase):
 
 
 class DeviceCommandTests(unittest.TestCase):
+    def test_thread_start_inherits_the_devices_selected_project(self):
+        service = Service()
+        commands = CommandDispatcher(
+            service,
+            selected_project_cwd=lambda device_id: (
+                r'D:\aipassport\one2passport-publish'
+                if device_id == 'esp'
+                else ''
+            ),
+        )
+
+        result = commands.execute(
+            'esp',
+            {'control'},
+            {'request_id': 'start-project', 'method': 'thread.start', 'params': {}},
+        )
+
+        self.assertTrue(result['result']['ok'] if 'ok' in result['result'] else True)
+        self.assertEqual(
+            service.calls,
+            [('start', r'D:\aipassport\one2passport-publish', '', False)],
+        )
+
+    def test_thread_start_explicit_cwd_wins_over_selected_project(self):
+        service = Service()
+        commands = CommandDispatcher(
+            service,
+            selected_project_cwd=lambda device_id: r'D:\selected-project',
+        )
+
+        commands.execute(
+            'esp',
+            {'control'},
+            {
+                'request_id': 'start-explicit',
+                'method': 'thread.start',
+                'params': {'cwd': r'D:\explicit-project'},
+            },
+        )
+
+        self.assertEqual(
+            service.calls,
+            [('start', r'D:\explicit-project', '', False)],
+        )
+
     def test_legacy_cancel_is_executed_with_existing_tasks_capability(self):
         from codexbridge.hub import BridgeHub
         from codexbridge.devices.registry import DeviceRegistry
