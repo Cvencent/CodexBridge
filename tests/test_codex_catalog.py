@@ -175,6 +175,7 @@ class CodexCatalogTest(unittest.TestCase):
             service.selected_project_cwd("device-1"),
             str(Path(tempfile.gettempdir()) / "repo-a"),
         )
+        self.assertEqual(service.selected_project_id("device-1"), "project-0")
 
     def test_projects_are_paged_with_short_ids(self):
         self._write_desktop_state()

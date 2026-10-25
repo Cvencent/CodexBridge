@@ -22,8 +22,8 @@ class Service:
         self.calls.append(('settings-update', thread_id, settings))
         return {'thread_id': thread_id, 'applied': True, 'settings_revision': 0}
 
-    def start_thread(self, cwd='', model='', ephemeral=False):
-        self.calls.append(('start', cwd, model, ephemeral))
+    def start_thread(self, cwd='', model='', ephemeral=False, project_id=''):
+        self.calls.append(('start', cwd, model, ephemeral, project_id))
         return {'thread': {'id': 'thread-project'}, 'cwd': cwd}
 
 
@@ -93,7 +93,7 @@ class DeviceCommandTests(unittest.TestCase):
         self.assertTrue(result['result']['ok'] if 'ok' in result['result'] else True)
         self.assertEqual(
             service.calls,
-            [('start', r'D:\aipassport\one2passport-publish', '', False)],
+            [('start', r'D:\aipassport\one2passport-publish', '', False, '')],
         )
 
     def test_thread_start_explicit_cwd_wins_over_selected_project(self):
@@ -115,7 +115,49 @@ class DeviceCommandTests(unittest.TestCase):
 
         self.assertEqual(
             service.calls,
-            [('start', r'D:\explicit-project', '', False)],
+            [('start', r'D:\explicit-project', '', False, '')],
+        )
+
+    def test_thread_start_inherits_the_selected_project_id(self):
+        service = Service()
+        commands = CommandDispatcher(
+            service,
+            selected_project_cwd=lambda device_id: r'F:\aiNovelWriter',
+            selected_project_id=lambda device_id: 'de957997-legacy',
+        )
+
+        commands.execute(
+            'esp',
+            {'control'},
+            {'request_id': 'start-project-id', 'method': 'thread.start', 'params': {}},
+        )
+
+        self.assertEqual(
+            service.calls,
+            [('start', r'F:\aiNovelWriter', '', False, 'de957997-legacy')],
+        )
+
+    def test_thread_start_explicit_cwd_does_not_inherit_project_id(self):
+        service = Service()
+        commands = CommandDispatcher(
+            service,
+            selected_project_cwd=lambda device_id: r'F:\selected',
+            selected_project_id=lambda device_id: 'de957997-legacy',
+        )
+
+        commands.execute(
+            'esp',
+            {'control'},
+            {
+                'request_id': 'start-explicit-project',
+                'method': 'thread.start',
+                'params': {'cwd': r'F:\explicit'},
+            },
+        )
+
+        self.assertEqual(
+            service.calls,
+            [('start', r'F:\explicit', '', False, '')],
         )
 
     def test_legacy_cancel_is_executed_with_existing_tasks_capability(self):

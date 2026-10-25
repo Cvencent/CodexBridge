@@ -255,6 +255,17 @@ class CodexCatalogService:
             project = self._selected_projects.get(device_id) or {}
             return str(project.get("cwd") or "").strip()
 
+    def selected_project_id(self, device_id: str) -> str:
+        """Desktop project selector for the device's most recent choice."""
+
+        with self._lock:
+            project = self._selected_projects.get(device_id) or {}
+            return str(
+                project.get("desktop_project_id")
+                or project.get("project_id")
+                or ""
+            ).strip()
+
     def handle_voice_command(self, device_id: str, text: str) -> list[dict[str, Any]]:
         """Turn a confirmed voice instruction into a real Codex turn.
 

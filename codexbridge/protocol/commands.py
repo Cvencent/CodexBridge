@@ -57,9 +57,16 @@ COMMANDS = {
 
 
 class CommandDispatcher:
-    def __init__(self, service, cache_size=1000, selected_project_cwd=None):
+    def __init__(
+        self,
+        service,
+        cache_size=1000,
+        selected_project_cwd=None,
+        selected_project_id=None,
+    ):
         self.service = service
         self.selected_project_cwd = selected_project_cwd
+        self.selected_project_id = selected_project_id
         self._cache = OrderedDict()
         self._cache_size = cache_size
         self._lock = threading.RLock()
@@ -174,7 +181,8 @@ class CommandDispatcher:
             return service.read_thread(**params)
         if method == 'thread.start':
             start_params = dict(params)
-            if not str(start_params.get('cwd') or '').strip():
+            had_cwd = bool(str(params.get('cwd') or '').strip())
+            if not had_cwd:
                 resolver = self.selected_project_cwd
                 if callable(resolver):
                     try:
@@ -183,6 +191,17 @@ class CommandDispatcher:
                         selected_cwd = ''
                     if selected_cwd:
                         start_params['cwd'] = selected_cwd
+                if 'project_id' not in start_params:
+                    id_resolver = self.selected_project_id
+                    if callable(id_resolver):
+                        try:
+                            selected_project_id = str(
+                                id_resolver(device_id) or ''
+                            ).strip()
+                        except Exception:
+                            selected_project_id = ''
+                        if selected_project_id:
+                            start_params['project_id'] = selected_project_id
             return service.start_thread(**start_params)
         if method == 'thread.rename':
             return service.rename_thread(params['thread_id'], params['title'])

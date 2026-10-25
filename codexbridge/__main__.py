@@ -618,6 +618,9 @@ def main(argv: list[str] | None = None) -> int:
     companion_service.commands.selected_project_cwd = (
         codex_catalog.selected_project_cwd
     )
+    companion_service.commands.selected_project_id = (
+        codex_catalog.selected_project_id
+    )
 
     def watcher_demand() -> bool:
         """True when somebody is relying on live Codex updates.
