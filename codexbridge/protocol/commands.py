@@ -15,7 +15,7 @@ COMMANDS = {
     'status.read': ('status', (), ()),
     'threads.list': ('tasks', (), ('limit', 'search', 'cursor', 'project_id')),
     'thread.read': ('tasks', ('thread_id',), ('message_limit',)),
-    'thread.start': ('control', (), ('cwd', 'model')),
+    'thread.start': ('control', (), ('cwd', 'model', 'project_id')),
     'thread.rename': ('control', ('thread_id', 'title'), ()),
     'thread.settings.read': ('tasks', ('thread_id',), ()),
     'thread.settings.update': (

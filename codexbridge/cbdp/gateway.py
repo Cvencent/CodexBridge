@@ -1366,7 +1366,7 @@ class CbdpGateway:
         ``project_id`` leaks into ``thread/start``.
         """
 
-        project_id = str(params.pop("project_id", "") or "").strip()
+        project_id = str(params.get("project_id", "") or "").strip()
         if not project_id:
             return
         resolver = self.project_cwd

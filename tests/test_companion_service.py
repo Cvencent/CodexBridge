@@ -1235,6 +1235,54 @@ class CompanionServiceTests(unittest.TestCase):
         self.assertIn('t1', self.service._untitled_threads)
         self.assertNotIn('新任务', result['thread']['title'])
 
+    def test_new_thread_persists_the_desktop_project_assignment(self) -> None:
+        legacy = 'de957997-11b7-47c4-8195-5fef7d6ee6c8'
+        canonical = '01a157b8-0723-77f3-8df6-f7512134c9eb'
+        state = Path(self.temp.name) / 'desktop-state.json'
+        state.write_text(
+            json.dumps(
+                {
+                    'local-projects': {
+                        legacy: {
+                            'name': 'aiNovelWrite',
+                            'rootPaths': [r'F:\aiNovelWriter'],
+                        }
+                    },
+                    'app-server-project-id-by-legacy-project-id-by-host': {
+                        'local': {legacy: canonical}
+                    },
+                }
+            ),
+            encoding='utf-8',
+        )
+        self.service.desktop_state_path = state
+        self.client.responses['project/list'] = {
+            'data': [
+                {
+                    'id': canonical,
+                    'name': 'aiNovelWrite',
+                    'roots': [{'path': r'F:\aiNovelWriter'}],
+                }
+            ]
+        }
+        creator = FakeClient()
+        creator.responses['thread/start'] = {'thread': thread_row(name='')}
+        creator.responses['thread/name/set'] = {}
+        self.service._creation_client_factory = lambda: creator
+
+        self.service.start_thread(
+            cwd=r'F:\aiNovelWriter',
+            project_id=legacy,
+        )
+
+        start = next(
+            params for method, params in creator.requests if method == 'thread/start'
+        )
+        self.assertEqual(
+            start.get('projectId'),
+            canonical,
+        )
+
     def test_first_user_turn_generates_and_persists_title(self) -> None:
         from unittest.mock import Mock
         desktop = Mock()

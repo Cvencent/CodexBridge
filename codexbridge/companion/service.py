@@ -2890,12 +2890,24 @@ class CompanionService:
         except (AppServerError, DesktopIpcError, OSError, ValueError) as error:
             self._note('generated_title_not_persisted')
 
-    def start_thread(self, cwd: str = "", model: str = "", ephemeral: bool = False) -> dict[str, Any]:
+    def start_thread(
+        self,
+        cwd: str = "",
+        model: str = "",
+        ephemeral: bool = False,
+        project_id: str = "",
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if cwd:
             params["cwd"] = str(cwd)
         if model:
             params["model"] = str(model)
+        canonical_project_id = self.desktop_project_id(project_id)
+        if canonical_project_id:
+            # Codex Desktop stores a thread's project membership separately
+            # from its cwd. Without this the rollout exists on disk but the
+            # desktop sidebar never shows it under the selected project.
+            params["projectId"] = canonical_project_id
         if ephemeral:
             params["ephemeral"] = True
         else:
@@ -3574,6 +3586,77 @@ class CompanionService:
                 return roots[0]
             return str(row.get("cwd") or "").strip()
         return None
+
+    def desktop_project_id(self, project_id: str) -> str:
+        """Resolve a project selector to the app-server's canonical project id.
+
+        Desktop state stores legacy project ids, but ``thread/start`` accepts
+        only ids from ``project/list``. Match the selector by legacy id, name,
+        or root directory and return the canonical id.
+        """
+
+        wanted = str(project_id or "").strip()
+        if not wanted:
+            return ""
+        try:
+            desktop = json.loads(read_text_shared(self.desktop_state_path))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            desktop = {}
+        local = desktop.get("local-projects")
+        legacy_id = ""
+        name = ""
+        roots: set[str] = set()
+        if isinstance(local, dict):
+            for raw_id, raw in local.items():
+                if not isinstance(raw, dict):
+                    continue
+                row_roots = {
+                    str(path).strip()
+                    for path in raw.get("rootPaths") or []
+                    if str(path or "").strip()
+                }
+                row_name = str(raw.get("name") or "").strip()
+                if wanted not in {str(raw_id), row_name, *row_roots}:
+                    continue
+                legacy_id = str(raw_id)
+                name = row_name
+                roots = row_roots
+                break
+        # Desktop stores legacy ids in local-projects, but app-server accepts
+        # its own canonical ids. Prefer the desktop's own migration map.
+        mappings = desktop.get("app-server-project-id-by-legacy-project-id-by-host")
+        if legacy_id and isinstance(mappings, dict):
+            for host_map in mappings.values():
+                if not isinstance(host_map, dict):
+                    continue
+                canonical = str(host_map.get(legacy_id) or "").strip()
+                if canonical:
+                    return canonical
+        try:
+            result = self._ensure_client().request("project/list", {"limit": 100})
+        except Exception:
+            return ""
+        projects = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(projects, list):
+            return ""
+        canonical = ""
+        for item in projects:
+            if not isinstance(item, dict):
+                continue
+            if wanted == str(item.get("id") or "").strip():
+                return wanted
+            item_roots = {
+                str(root.get("path") if isinstance(root, dict) else root).strip()
+                for root in item.get("roots") or []
+            }
+            item_name = str(item.get("name") or "").strip()
+            if roots and item_roots & roots:
+                return str(item.get("id") or "").strip()
+            if not canonical and (
+                (name and item_name == name) or (wanted and item_name == wanted)
+            ):
+                canonical = str(item.get("id") or "").strip()
+        return canonical
 
     def _project_catalog(self) -> dict[str, Any]:
         projects: list[dict[str, Any]] = []

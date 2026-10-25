@@ -360,7 +360,10 @@ class CbdpGatewayTests(unittest.TestCase):
 
         params = gateway._normalize_params("thread.start", {"project_ref": ref})
 
-        self.assertEqual(params, {"cwd": r"D:\proj\one"})
+        self.assertEqual(
+            params,
+            {"project_id": "proj-1", "cwd": r"D:\proj\one"},
+        )
         with self.assertRaises(CBDPError) as caught:
             gateway._normalize_params("thread.start", {"project_ref": 424242})
         self.assertEqual(caught.exception.name, "NOT_FOUND")
@@ -412,7 +415,7 @@ class CbdpGatewayTests(unittest.TestCase):
         self.assertEqual(listed, {"project_id": "proj-selected"})
         self.assertEqual(
             gateway._normalize_params("thread.start", {}, device_id="dev-1"),
-            {"cwd": r"D:\proj\selected"},
+            {"project_id": "proj-selected", "cwd": r"D:\proj\selected"},
         )
 
     def test_remembered_project_is_isolated_per_device(self):

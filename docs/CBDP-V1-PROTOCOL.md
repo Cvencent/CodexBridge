@@ -4748,6 +4748,22 @@ Bridge MUST 在 CBDP 网关层按 `device_id` 记住最近一次用于 `threads.
 §19.17 的 `NOT_FOUND` / `INVALID_PARAM` 语义。该记忆不能让一个设备的项目
 选择影响另一个设备，也不能覆盖 `thread.start` 的显式参数。
 
+### 19.19 `thread.start` 保留桌面项目归属（2026-10-25 后续修正）
+
+Codex app-server 的线程目录和桌面项目归属是两份独立信息。Bridge 解析出项目
+目录后，除了把 `project_ref` 转换成 `cwd`，还 MUST 把该项目的 canonical
+`project_id` 传递给 `thread/start` 的 `projectId` 字段。否则线程虽然落在正确
+目录、rollout 和回复也都正常，Codex 桌面的项目侧边栏仍然不会显示该线程。
+
+规则：
+
+1. 只有 Bridge 项目目录中真实存在的 canonical `project_id` 才能写入
+   `projectId`；项目名、未知 ID 和空值 MUST NOT 透传。
+2. `project_ref` 解析失败仍按 §19.17 返回 `NOT_FOUND`，不能创建默认目录任务。
+3. `cwd` 与 `projectId` MUST 来自同一次项目解析，避免线程落在 A 项目目录却
+   归属到 B 项目。
+4. 未携带项目信息的旧客户端行为不变，`projectId` 可省略。
+
 ## 29. 并行开发接口清单
 
 ### 29.1 Bridge Agent
