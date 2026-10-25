@@ -28,6 +28,27 @@ class Service:
 
 
 class ReadStateCommandTests(unittest.TestCase):
+    def test_relative_read_timestamp_advances_the_thread_to_now(self):
+        import time
+        from codexbridge.companion.service import CompanionService
+        from codexbridge.read_state import ReadStateStore
+
+        store = ReadStateStore(None)
+        service = CompanionService.__new__(CompanionService)
+        service._read_state = store
+
+        service.mark_message_read(
+            "result:thread-1:1792919304",
+            4_549_000,
+            thread_id="thread-1",
+            source="aipassport",
+        )
+
+        self.assertGreaterEqual(
+            store.thread_read_at("thread-1"),
+            int(time.time()) - 2,
+        )
+
     def test_message_read_update_marks_shared_message_and_thread_state(self):
         from codexbridge.companion.service import CompanionService
         from codexbridge.read_state import ReadStateStore

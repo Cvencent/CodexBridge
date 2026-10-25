@@ -17,7 +17,7 @@ from codexbridge.companion.attachments import AttachmentStore
 from codexbridge.protocol.commands import CommandDispatcher
 from codexbridge.companion.queue import QueueService
 
-from codexbridge.read_state import ReadStateStore
+from codexbridge.read_state import MIN_EPOCH_SECONDS, ReadStateStore
 from codexbridge.win_shared import read_text_shared
 
 
@@ -3013,9 +3013,16 @@ class CompanionService:
         source = str(source or "")
         self._read_state.mark_message(message_id, source=source)
         if thread_id and read_at_ms > 0:
+            thread_seconds = int(read_at_ms // 1000)
+            if thread_seconds < MIN_EPOCH_SECONDS:
+                # Some devices report milliseconds since boot, not Unix epoch
+                # milliseconds. The user is marking this thread read now, so a
+                # relative reading must become the current absolute watermark;
+                # storing 4549 would leave every result permanently unread.
+                thread_seconds = int(time.time())
             self._read_state.mark_thread(
                 thread_id,
-                int(read_at_ms // 1000),
+                thread_seconds,
                 source=source,
                 notify=False,
             )

@@ -525,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
         workspace=codex_cwd,
     )
     read_state = ReadStateStore(data_dir / "read-state.json")
+    read_state.repair_implausible_thread_markers()
     event_spine = EventSpine(data_dir / "cbdp-events.sqlite3", logger=print)
     projection = ProjectionStore(data_dir / "cbdp-projection.sqlite3")
     references = ReferenceRegistry(data_dir / "cbdp-refs.sqlite3")

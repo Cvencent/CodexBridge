@@ -391,7 +391,8 @@ class BridgeHub:
         refreshing count as running, so a stopped collector cannot leave the
         badge lit forever.
         """
-        running_threads: set[str] = set()
+        running_keys: set[tuple[str, str]] = set()
+        fallback_threads: set[str] = set()
         completed_unread = 0
         failed_unread = 0
         now = time.time()
@@ -404,9 +405,21 @@ class BridgeHub:
                     and is_in_flight(record)
                     and is_fresh(record, now)
                 ):
-                    identity = str(record.thread_id or record.message_id or "")
-                    if identity:
-                        running_threads.add(identity)
+                    thread_id = str(record.thread_id or "").strip()
+                    data = record.data if isinstance(record.data, dict) else {}
+                    task = data.get("task") if isinstance(data.get("task"), dict) else {}
+                    turn_id = str(task.get("turn_id") or "").strip()
+                    if thread_id and turn_id:
+                        running_keys.add((thread_id, turn_id))
+                    elif thread_id:
+                        fallback_threads.add(thread_id)
+                    for item in data.get("tasks") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        item_thread = str(item.get("thread_id") or thread_id).strip()
+                        item_turn = str(item.get("turn_id") or "").strip()
+                        if item_thread and item_turn:
+                            running_keys.add((item_thread, item_turn))
                 continue
             if record.kind != "result" or not self._record_is_unread(record):
                 continue
@@ -414,8 +427,16 @@ class BridgeHub:
                 failed_unread += 1
             elif record.status == "completed":
                 completed_unread += 1
+        # A task record without a turn id describes the same thread-level state
+        # as its status record. Only use that fallback when no explicit turn
+        # was seen for the thread; this preserves per-turn counting without
+        # double-counting the status/task pair.
+        explicit_threads = {thread_id for thread_id, _ in running_keys}
+        for thread_id in fallback_threads:
+            if thread_id not in explicit_threads:
+                running_keys.add((thread_id, ""))
         return {
-            "running": len(running_threads),
+            "running": len(running_keys),
             "completed_unread": completed_unread,
             "failed_unread": failed_unread,
             "done": completed_unread,

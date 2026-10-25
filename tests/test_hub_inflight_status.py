@@ -107,6 +107,20 @@ class InFlightStatusTest(unittest.TestCase):
         # per thread, not per record.
         self.assertEqual(5, self.hub.counts()["running"])
 
+    def test_running_counts_two_turns_in_the_same_thread_separately(self):
+        for turn in ("a", "b"):
+            self.hub.publish(record(
+                "status",
+                "working",
+                f"任务{turn}",
+                message_id=f"status:t1:{turn}",
+                thread="t1",
+                data={"task": {"thread_id": "t1", "turn_id": turn,
+                               "status": "working"}},
+            ))
+
+        self.assertEqual(2, self.hub.counts()["running"])
+
     def test_snapshot_carries_the_renderable_fields(self):
         self.hub.publish(live_task(turn="b", action="Compiling the firmware"))
         snap = [m for m in self.pull() if m.get("type") == "codex_status_snapshot"]

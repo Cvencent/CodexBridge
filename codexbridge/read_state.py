@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any
 
 MAX_MESSAGE_IDS = 2000
+# Unix seconds before 2001 are not plausible persisted read watermarks. Devices
+# that report uptime-relative milliseconds produce tiny values (for example
+# 4549 for 4549 s after boot); those must be interpreted as "read now", never
+# stored literally or every unread result stays unread forever.
+MIN_EPOCH_SECONDS = 1_000_000_000
 
 
 class ReadStateStore:
@@ -112,6 +117,29 @@ class ReadStateStore:
     def thread_read_at(self, thread_id: str) -> int:
         with self._lock:
             return int(self._threads.get(str(thread_id or ""), 0))
+
+    def repair_implausible_thread_markers(self, now: int | float | None = None) -> int:
+        """Replace uptime-relative thread watermarks with the current time.
+
+        Older Bridge versions accepted a device's millisecond uptime directly
+        as ``read_at_ms // 1000``. Those values are below any real Unix epoch
+        and therefore can never mark a completed result read. Migration is
+        monotonic: the replacement is current time and only advances a marker.
+        """
+
+        replacement = max(
+            MIN_EPOCH_SECONDS,
+            int(time.time() if now is None else now),
+        )
+        changed = 0
+        with self._lock:
+            for thread_id, value in list(self._threads.items()):
+                if 0 < int(value) < MIN_EPOCH_SECONDS:
+                    self._threads[thread_id] = replacement
+                    changed += 1
+        if changed:
+            self.save()
+        return changed
 
     def is_thread_read(self, thread_id: str, completed_at: int) -> bool:
         if not thread_id or completed_at <= 0:
