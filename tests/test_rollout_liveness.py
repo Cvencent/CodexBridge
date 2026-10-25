@@ -305,6 +305,58 @@ class CollectorLivenessTests(unittest.TestCase):
 
         self.assertEqual(calls.count("thread/read"), 1)
 
+    def test_the_same_running_turn_skips_the_whole_thread_listing(self) -> None:
+        # thread/turns/list makes the app server load the entire stored thread
+        # (measured 134 MB cold on a long one). While the rollout log still
+        # reports the same turn id, only the bounded item page is needed.
+        calls: list[str] = []
+        turn = "turn-1"  # matches the fake app-server summary
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _write_rollout(root, LIVE, [
+                _event("task_started", -30, turn_id=turn),
+                _note(-3),
+            ])
+            source = self._source(
+                [_listed(LIVE, 400)],
+                RolloutActivity(root),
+                running_ids=(LIVE,),
+                calls=calls,
+            )
+            source.refresh_thread()
+            first_turns = calls.count("thread/turns/list")
+            first_items = calls.count("thread/items/list")
+            # Same turn keeps streaming: the log grows, the turn id does not.
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(_event("agent_message", -1, turn_id=turn) + "\n")
+            source.refresh_thread()
+
+        self.assertEqual(first_turns, 1)
+        self.assertEqual(calls.count("thread/turns/list"), 1,
+                         "the same running turn must not re-list every thread")
+        self.assertGreater(calls.count("thread/items/list"), first_items,
+                           "the item page must still refresh")
+
+    def test_a_new_turn_re_reads_the_turn_list(self) -> None:
+        calls: list[str] = []
+        first = "turn-1"
+        second = "turn-2"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _write_rollout(root, LIVE, [_event("task_started", -30, turn_id=first)])
+            source = self._source(
+                [_listed(LIVE, 400)],
+                RolloutActivity(root),
+                running_ids=(LIVE,),
+                calls=calls,
+            )
+            source.refresh_thread()
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(_event("task_started", -1, turn_id=second) + "\n")
+            source.refresh_thread()
+
+        self.assertEqual(calls.count("thread/turns/list"), 2)
+
     def test_an_active_thread_is_reread_when_its_log_grows(self) -> None:
         calls: list[str] = []
         with tempfile.TemporaryDirectory() as temp:

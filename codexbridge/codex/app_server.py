@@ -1125,7 +1125,12 @@ class CodexAppServerSource:
         })
         return self._unwrap_items(page)
 
-    def _read_thread_detail(self, thread_id: str) -> dict[str, Any]:
+    def _read_thread_detail(
+        self,
+        thread_id: str,
+        cached_thread: dict[str, Any] | None = None,
+        refresh_turns: bool = True,
+    ) -> dict[str, Any]:
         """Assemble a display thread from bounded app-server reads.
 
         The previous implementation used ``thread/read`` with
@@ -1134,6 +1139,12 @@ class CodexAppServerSource:
         multi-megabyte ``json.loads`` held the GIL long enough to freeze the
         whole bridge (observed as system-wide pointer lag). This method never
         asks the app-server for a full thread.
+
+        ``refresh_turns=False`` reuses the cached turn summaries and only
+        re-reads the newest turn's items. ``thread/turns/list`` makes the app
+        server load the whole stored thread (measured 134 MB cold on a long
+        one), so it is skipped entirely while the rollout log shows the same
+        turn still running.
         """
         metadata = self.client.request(
             "thread/read", {"threadId": thread_id, "includeTurns": False})
@@ -1141,11 +1152,18 @@ class CodexAppServerSource:
         if not isinstance(thread, dict):
             return metadata if isinstance(metadata, dict) else {}
         thread = dict(thread)
-        turns = self._sorted_turns(self.client.request("thread/turns/list", {
-            "threadId": thread_id,
-            "limit": self.TURNS_PAGE_LIMIT,
-            "itemsView": "summary",
-        }))
+        cached_turns = []
+        if isinstance(cached_thread, dict):
+            cached_turns = cached_thread.get("turns") or []
+        if not refresh_turns and cached_turns:
+            # Shallow-copy each turn: only ``items`` is replaced below.
+            turns = [dict(turn) for turn in cached_turns if isinstance(turn, dict)]
+        else:
+            turns = self._sorted_turns(self.client.request("thread/turns/list", {
+                "threadId": thread_id,
+                "limit": self.TURNS_PAGE_LIMIT,
+                "itemsView": "summary",
+            }))
         thread["turns"] = turns
         if not turns:
             return {"thread": thread}
@@ -1211,10 +1229,15 @@ class CodexAppServerSource:
         if detail_refreshed_at is None:
             detail_refreshed_at = {}
             self._thread_detail_refreshed_at = detail_refreshed_at
+        detail_turn_id = getattr(self, "_thread_detail_turn_id", None)
+        if detail_turn_id is None:
+            detail_turn_id = {}
+            self._thread_detail_turn_id = detail_turn_id
         for cached_id in set(detail_cache) - display_thread_ids:
             detail_cache.pop(cached_id, None)
             detail_signature.pop(cached_id, None)
             detail_refreshed_at.pop(cached_id, None)
+            detail_turn_id.pop(cached_id, None)
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for selected in display_threads:
@@ -1242,6 +1265,8 @@ class CodexAppServerSource:
             # what kept the disk busy for minutes after a turn had stopped.
             signature = self.activity.signature_for_item(selected)
             previous_signature = detail_signature.get(thread_id)
+            known_turn = self.activity.latest_turn_id_for_item(selected)
+            cached_turn = detail_turn_id.get(thread_id, "")
             now = time.monotonic()
             age = now - detail_refreshed_at.get(thread_id, 0.0)
             changed = signature is not None and signature != previous_signature
@@ -1250,14 +1275,44 @@ class CodexAppServerSource:
                 or changed
                 or (signature is None and age >= self.DETAIL_RETRY_SECONDS)
             )
+            # Only pay for the whole-thread turn listing when the turn itself
+            # changed (or we cannot tell). While the same turn keeps streaming,
+            # the cached summaries plus a fresh item page are enough.
+            refresh_turns = (
+                cached is None
+                or not known_turn
+                or known_turn != cached_turn
+            )
             if not refresh_detail:
                 detail = cached[1]
             else:
                 try:
-                    detail = self._read_thread_detail(thread_id)
+                    cached_thread = cached[1].get("thread") if cached else None
+                    detail = self._read_thread_detail(
+                        thread_id,
+                        cached_thread=cached_thread,
+                        refresh_turns=refresh_turns,
+                    )
                     detail_cache[thread_id] = (cache_key, detail)
                     detail_signature[thread_id] = signature
                     detail_refreshed_at[thread_id] = now
+                    refreshed_thread = detail.get("thread") if isinstance(detail, dict) else None
+                    refreshed_turns = refreshed_thread.get("turns") if isinstance(refreshed_thread, dict) else None
+                    if isinstance(refreshed_turns, list) and refreshed_turns:
+                        last_turn = refreshed_turns[-1]
+                        if isinstance(last_turn, dict):
+                            detail_turn_id[thread_id] = str(last_turn.get("id") or known_turn)
+                            # The turn summaries were reused, so the cached
+                            # copy still says "inProgress". Trust the rollout
+                            # log's terminal event for the same turn instead of
+                            # leaving a finished turn spinning forever.
+                            state = liveness.get(thread_id, "")
+                            if state == "completed":
+                                last_turn["status"] = "completed"
+                            elif state == "idle":
+                                last_turn["status"] = "interrupted"
+                    elif known_turn:
+                        detail_turn_id[thread_id] = known_turn
                 except (AppServerError, OSError, ValueError) as error:
                     # One stored thread may contain an item type unknown to this
                     # App Server build. Keep the other readable tasks flowing.

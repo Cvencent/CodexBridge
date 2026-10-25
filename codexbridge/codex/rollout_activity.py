@@ -49,6 +49,7 @@ _BOOKKEEPING_EVENT_TYPES = {"thread_settings_applied"}
 _TURN_EVENT_TYPES = {"task_started", "task_complete", "turn_aborted"}
 
 _TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+_TURN_ID_RE = re.compile(r'"turn_id"\s*:\s*"([^"]{1,64})"')
 _ROLLOUT_STEM_RE = re.compile(
     r"^rollout-(?:\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-)?(.+)$"
 )
@@ -167,8 +168,8 @@ def win32_open_shared(path: str, offset: int) -> int:
     return handle
 
 
-def read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
-    """Return ``(newest, last_turn_event, event_stamp, written_at, real_activity)``.
+def read_log_tail(path: Path) -> tuple[float, str, float, float, float, str] | None:
+    """Return ``(newest, last_turn_event, event_stamp, written_at, real_activity, turn_id)``.
 
     ``real_activity`` is the newest stamp from a record that reflects actual turn
     work, so callers can tell "a turn is running" apart from "the file was
@@ -189,6 +190,8 @@ def read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
     real_activity = 0.0
     kind = ""
     kind_stamp = 0.0
+    latest_turn_id = ""
+    latest_turn_stamp = 0.0
     with_timestamps = 0
     for raw in blob.splitlines():
         line = raw.decode("utf-8", "replace")
@@ -200,6 +203,14 @@ def read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
             kind_stamp = stamp
         else:
             stamp = line_stamp(line)
+        if "turn_id" in line and stamp is not None and stamp >= latest_turn_stamp:
+            # Rollout records carry the turn id on event_msg/token_usage lines.
+            # Keeping the newest one lets callers skip the expensive
+            # thread/turns/list call while a turn is still the same one.
+            match = _TURN_ID_RE.search(line)
+            if match is not None:
+                latest_turn_id = match.group(1)
+                latest_turn_stamp = stamp
         if stamp is None:
             continue
         with_timestamps += 1
@@ -209,7 +220,7 @@ def read_log_tail(path: Path) -> tuple[float, str, float, float, float] | None:
             real_activity = stamp
     if with_timestamps == 0:
         return None
-    return newest, kind, kind_stamp, written_at, real_activity
+    return newest, kind, kind_stamp, written_at, real_activity, latest_turn_id
 
 
 def status_from_activity(
@@ -223,7 +234,7 @@ def status_from_activity(
     """
     if activity is None:
         return ""
-    newest, kind, kind_stamp, written_at, real_activity = activity
+    newest, kind, kind_stamp, written_at, real_activity = activity[:5]
     if newest <= 0:
         return ""
     reference = time.time() if now is None else float(now)
@@ -249,7 +260,14 @@ class RolloutActivity:
             if sessions_root is not None
             else Path.home() / ".codex" / "sessions"
         )
-        self._cache: dict[str, tuple[float, tuple[float, str, float, float, float] | None]] = {}
+        # key -> (read_at, file_signature, activity). The signature lets a log
+        # that grows invalidate the entry immediately instead of waiting out
+        # LOG_CACHE_SECONDS, which used to delay a new turn by up to 8 s.
+        self._cache: dict[
+            str,
+            tuple[float, tuple[int, int] | None,
+                  tuple[float, str, float, float, float, str] | None],
+        ] = {}
         # Resolving a thread to its rollout file means globbing three day
         # folders. Remember the answer so the change-signature check costs one
         # stat() instead of a directory scan on every collector beat.
@@ -317,6 +335,13 @@ class RolloutActivity:
     def is_working(self, item: dict[str, Any] | None, now: float | None = None) -> bool:
         return status_from_activity(self.activity(item), now) == "working"
 
+    def latest_turn_id_for_item(self, item: dict[str, Any] | None) -> str:
+        """Newest turn id the rollout log mentions, or "" when unknown."""
+        activity = self.activity(item)
+        if not activity or len(activity) < 6:
+            return ""
+        return str(activity[5] or "")
+
     def signature(self, thread_id: str) -> tuple[int, int] | None:
         """Cheap change token for one thread's rollout log.
 
@@ -355,17 +380,19 @@ class RolloutActivity:
         if not key:
             return None
         now = time.monotonic()
+        path = Path(explicit_path) if explicit_path is not None else self.find_path(key)
+        signature = self.signature_for_path(path)
         with self._lock:
             cached = self._cache.get(key)
-            if cached is not None and now - cached[0] <= LOG_CACHE_SECONDS:
-                return cached[1]
-        if explicit_path is not None:
-            path = Path(explicit_path)
-        else:
-            path = self.find_path(key)
+            if (
+                cached is not None
+                and now - cached[0] <= LOG_CACHE_SECONDS
+                and cached[1] == signature
+            ):
+                return cached[2]
         found = read_log_tail(path) if path is not None else None
         with self._lock:
             if len(self._cache) > 512:
                 self._cache.clear()
-            self._cache[key] = (now, found)
+            self._cache[key] = (now, signature, found)
         return found

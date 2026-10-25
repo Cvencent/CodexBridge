@@ -2453,7 +2453,7 @@ class CompanionService:
             if inferred:
                 summary["status"] = inferred
             if activity is not None:
-                _newest, _kind, kind_stamp, _written, _real = activity
+                _newest, _kind, kind_stamp, _written, _real = activity[:5]
                 if (
                     summary.get("status") in {"completed", "failed"}
                     and kind_stamp > 0
