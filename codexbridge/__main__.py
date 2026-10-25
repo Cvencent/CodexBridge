@@ -602,6 +602,11 @@ def main(argv: list[str] | None = None) -> int:
         codex_cwd,
         codex_command,
         client_factory=lambda command, cwd: shared_app_server,
+        creation_client_factory=lambda: AppServerClient(
+            _resolve_codex_command(codex_command, data_dir),
+            codex_cwd,
+            prefer_shared=False,
+        ),
         close_client_on_stop=False,
         read_state=read_state,
         show_intermediate_events=lambda: companion_store.show_intermediate_events,

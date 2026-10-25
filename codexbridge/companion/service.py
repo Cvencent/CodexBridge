@@ -560,6 +560,7 @@ class CompanionService:
         cwd: Path,
         codex_command: str | None = None,
         client_factory: Callable[[list[str], Path], Any] | None = None,
+        creation_client_factory: Callable[[], Any] | None = None,
         desktop_state_path: Path | None = None,
         sessions_root: Path | None = None,
         read_state: ReadStateStore | None = None,
@@ -575,7 +576,15 @@ class CompanionService:
         self._client_factory = client_factory
         self._isolated = bool(isolated)
         self._close_client_on_stop = bool(close_client_on_stop)
-        self._creation_client_factory = self._make_client if client_factory is None else None
+        # Thread creation must not borrow the long-lived shared app-server: that
+        # process keeps the new thread's writer lock, so Codex Desktop opens it
+        # and reports "This is open in another app". A short-lived client owns
+        # the lock only while naming the thread and releases it on close.
+        self._creation_client_factory = (
+            creation_client_factory
+            if creation_client_factory is not None
+            else (self._make_client if client_factory is None else None)
+        )
         self._desktop = None
         self._desktop_followed: dict[str, str] = {}
         self._desktop_required: set[str] = set()
