@@ -41,6 +41,17 @@ class ReadStateStoreTests(unittest.TestCase):
         self.assertEqual(1_800_000_000, store.thread_read_at("thread-1"))
         self.assertEqual(1_792_919_304, store.thread_read_at("thread-2"))
 
+    def test_repair_without_explicit_now_uses_current_time(self) -> None:
+        import time
+
+        store = ReadStateStore(None)
+        store.mark_thread("thread-1", 4549)
+
+        repaired = store.repair_implausible_thread_markers()
+
+        self.assertEqual(1, repaired)
+        self.assertGreaterEqual(store.thread_read_at("thread-1"), int(time.time()) - 2)
+
     def test_message_read_marker_is_global(self) -> None:
         store = ReadStateStore(None)
         store.mark_message("result:thread-1:1000")
