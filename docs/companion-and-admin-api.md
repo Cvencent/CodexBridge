@@ -198,8 +198,13 @@ Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、
 发现请求为明文 `CODEXBRIDGE_COMPANION_DISCOVER`（不带换行），应答为不超过 512 字节的 JSON：
 
 ```json
-{"service":"codexbridge-companion","name":"DESKTOP","version":"1.4.0","port":8568,"discovery_port":8569,"requires_pairing":true}
+{"service":"codexbridge-companion","name":"DESKTOP","version":"2.2.11","device_id":"bridge-a1b2c3d4e5f6","bridge_instance_id":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6","port":8568,"discovery_port":8569,"requires_pairing":true}
 ```
+
+`bridge_instance_id` 是持久化在 `companion.json` 的安装级身份，`device_id` 是由它
+派生的稳定设备码。两者都与当前 IP、端口无关。手机 MUST 用
+`bridge_instance_id`（旧实现可回退 `device_id`）识别“同一台 Bridge”；IP 只能作为
+当前连接地址，不能作为配对身份。
 
 默认连接端口为 `8568`，默认发现端口为 `8569`，并在管理页面显示每个端口的健康状态。
 手机连接端口和手机发现端口都可以在电脑端修改；修改发现端口后，手机端“扫描端口”
@@ -211,7 +216,8 @@ Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、
 ### 3.1 配对与鉴权
 
 - `POST /api/companion/pair` 请求体为 `{"code":"123456","name":"Pixel","client_id":"<安装标识>"}`。`client_id` 是可选字段，手机端应使用安装级稳定标识；旧客户端不传时电脑端保持兼容。配对码在电脑端管理页面生成，`10` 分钟有效，最多尝试 `5` 次，成功使用一次后立即失效。
-- 配对成功后返回 `{"ok":true,"phone_id":"phone-xxxxxxxxxxxx","token":"cbp_...","bridge":{...}}`。同一 `client_id` 再次配对时复用原 `phone_id`，轮换令牌并更新名称，因此不会生成重复设备。令牌只在这次响应中返回，电脑端只保存 SHA-256 摘要。
+- 配对成功后返回 `{"ok":true,"phone_id":"phone-xxxxxxxxxxxx","token":"cbp_...","bridge":{"name":"DESKTOP","version":"2.2.11","device_id":"bridge-...","bridge_instance_id":"...","port":8568}}`。同一 `client_id` 再次配对时复用原 `phone_id`，轮换令牌并更新名称，因此不会生成重复设备。令牌只在这次响应中返回，电脑端只保存 SHA-256 摘要。
+- 手机 MUST 保存 `bridge_instance_id` 和 `device_id`。电脑 IP 或端口变化后，手机应重新发现同一实例，更新 `baseUrl` / `lanUrl` / `lastSuccessfulUrl`，继续使用原令牌；不得因为地址变化清除令牌或要求重新配对。只有重新发现到同一实例后仍返回 `401 unauthorized`，才表示令牌确实失效。
 - 轮换令牌不会让已经拿到旧令牌的手机被永久拒绝：同一 `client_id` 重新配对后，电脑端仍会在 `1` 小时内接受该手机此前最多 `4` 个旧令牌，一旦手机用最新令牌成功访问，这些旧令牌立即失效。这样即使配对响应因电脑重启或网络中断丢失，手机也能继续使用，不必让用户手动重新配对。
 - 后续请求使用 `Authorization: Bearer <token>`；SSE 允许使用 `?token=`。未配对返回 `401 unauthorized`，电脑端关闭手机连接时返回 `403 companion_disabled`，配对码错误返回 `403 pairing_failed`。
 - 网络临时断开或电脑重启导致的 `401` 不应清除手机端已保存的地址、令牌和 `client_id`；客户端恢复到同一地址后继续使用原令牌，只有用户在设置中主动解除配对或电脑端移除设备时才需要重新配对。
@@ -222,7 +228,7 @@ Bambu、自定义页、显示和模块等管理配置；Codex 状态、任务、
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/companion/ping` | 无需鉴权，返回服务名、版本、端口 |
+| GET | `/api/companion/ping` | 无需鉴权，返回服务名、版本、端口、稳定实例码 |
 | POST | `/api/companion/pair` | 无需鉴权，使用配对码换取令牌 |
 | GET | `/api/companion/status` | 额度、当前任务与待处理审批 |
 | GET | `/api/companion/threads` | 线程列表，支持 `limit`、`search`、`cursor` |

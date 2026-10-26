@@ -80,6 +80,12 @@ def _new_token() -> str:
     return PHONE_TOKEN_PREFIX + raw.decode("ascii").rstrip("=")
 
 
+def _new_instance_id() -> str:
+    """Return a stable, IP-independent identity for this Bridge install."""
+
+    return secrets.token_hex(16)
+
+
 class CompanionStoreError(RuntimeError):
     """Raised when the pairing file cannot be read or safely replaced."""
 
@@ -138,6 +144,7 @@ class CompanionStore:
         self.registry = registry
         self.port = DEFAULT_PORT if port == LEGACY_PORT else port
         self.discovery_port = discovery_port
+        self.instance_id = _new_instance_id()
         self.enabled = True
         self.show_intermediate_events = False
         self.phones: dict[str, PhoneRecord] = {}
@@ -151,6 +158,12 @@ class CompanionStore:
         self._reload_marker: tuple[int, int] | None = None
         self.load_warning = ""
 
+    @property
+    def device_id(self) -> str:
+        """Stable public device code derived from the instance identity."""
+
+        return "bridge-" + self.instance_id[:12]
+
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         if self.path is None:
@@ -161,8 +174,9 @@ class CompanionStore:
             with self._lock:
                 recovered = self._recover_from_registry()
                 self._loaded_from_disk = True
-            if recovered:
-                self.save()
+            # Persist the newly generated instance identity immediately; it is
+            # what phones use to keep a pairing when the LAN address changes.
+            self.save()
             return
         except UnicodeDecodeError as error:
             return self._recover_corrupt_store(
@@ -237,6 +251,15 @@ class CompanionStore:
         show_intermediate_events = payload.get("show_intermediate_events")
         if isinstance(show_intermediate_events, bool):
             self.show_intermediate_events = show_intermediate_events
+        instance_id = payload.get("bridge_instance_id") or payload.get("instance_id")
+        if (
+            isinstance(instance_id, str)
+            and len(instance_id) == 32
+            and all(ch in "0123456789abcdef" for ch in instance_id.lower())
+        ):
+            self.instance_id = instance_id.lower()
+        else:
+            migrated = True
         port = payload.get("port")
         if isinstance(port, int) and 1 <= port <= 65535:
             if port in {LEGACY_PORT, LEGACY_COMPANION_PORT}:
@@ -406,6 +429,7 @@ class CompanionStore:
                 "show_intermediate_events": self.show_intermediate_events,
                 "port": self.port,
                 "discovery_port": self.discovery_port,
+                "bridge_instance_id": self.instance_id,
                 "phones": [
                     {
                         "phone_id": record.phone_id,
@@ -508,6 +532,8 @@ class CompanionStore:
                 "show_intermediate_events": self.show_intermediate_events,
                 "port": self.port,
                 "discovery_port": self.discovery_port,
+                "bridge_instance_id": self.instance_id,
+                "device_id": self.device_id,
                 "phones": phones,
                 "pairing_expires_at": self._code_expires_at if self.enabled else 0,
             }

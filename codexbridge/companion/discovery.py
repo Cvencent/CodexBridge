@@ -104,6 +104,8 @@ class CompanionDiscovery:
             "service": "codexbridge-companion",
             "name": socket.gethostname(),
             "version": VERSION,
+            "device_id": self.store.device_id,
+            "bridge_instance_id": self.store.instance_id,
             "port": self.store.port,
             "discovery_port": self.port,
             "requires_pairing": True,

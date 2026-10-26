@@ -248,6 +248,17 @@ class CompanionApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["service"], "codexbridge-companion")
+        self.assertEqual(payload["bridge_instance_id"], self.store.instance_id)
+        self.assertEqual(payload["device_id"], self.store.device_id)
+
+    def test_pair_response_carries_stable_bridge_identity(self) -> None:
+        code = self.store.pairing_code()["code"]
+
+        status, payload = self.request("POST", "/api/companion/pair", {"code": code})
+
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["bridge"]["bridge_instance_id"], self.store.instance_id)
+        self.assertEqual(payload["bridge"]["device_id"], self.store.device_id)
 
     def test_general_command_api_and_deduplicated_control(self):
         code = self.store.pairing_code()['code']

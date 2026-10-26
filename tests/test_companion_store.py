@@ -20,6 +20,31 @@ from codexbridge.devices.registry import DeviceRegistry
 
 
 class CompanionStoreTests(unittest.TestCase):
+    def test_bridge_instance_id_is_stable_and_persisted(self) -> None:
+        first = CompanionStore(self.path)
+        first.load()
+        instance_id = first.instance_id
+
+        second = CompanionStore(self.path)
+        second.load()
+
+        self.assertRegex(instance_id, r"^[0-9a-f]{32}$")
+        self.assertEqual(instance_id, second.instance_id)
+        self.assertEqual("bridge-" + instance_id[:12], second.device_id)
+
+    def test_legacy_store_gets_a_persisted_instance_id(self) -> None:
+        self.path.write_text(
+            json.dumps({"version": 1, "phones": []}),
+            encoding="utf-8",
+        )
+        store = CompanionStore(self.path)
+
+        store.load()
+
+        self.assertRegex(store.instance_id, r"^[0-9a-f]{32}$")
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["bridge_instance_id"], store.instance_id)
+
     def test_corrupt_companion_file_is_quarantined_not_overwritten(self) -> None:
         self.path.write_text('{"phones": [', encoding="utf-8")
         broken = self.path.read_text(encoding="utf-8")

@@ -35,6 +35,16 @@ class CompanionDiscoveryTests(unittest.TestCase):
         finally:
             client.close()
 
+    def test_discovery_reply_carries_stable_bridge_identity(self) -> None:
+        store = CompanionStore(Path(tempfile.mkdtemp()) / "companion.json")
+        store.load()
+        discovery = CompanionDiscovery(store, host="127.0.0.1", port=0)
+
+        reply = discovery._reply()
+
+        self.assertEqual(reply["bridge_instance_id"], store.instance_id)
+        self.assertEqual(reply["device_id"], store.device_id)
+
     def test_set_port_rebinds_the_udp_listener_and_persists_it(self) -> None:
         path = Path(tempfile.mkdtemp()) / "companion.json"
         store = CompanionStore(path)
