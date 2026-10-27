@@ -398,12 +398,49 @@ class BridgeHub:
         now = time.time()
         with self._lock:
             records = self.store.records()
+        # Match a live record against the terminal result of the *same turn*.
+        # The collector stops republishing the live ``task:<id>`` record once a
+        # turn ends, so that stale record stayed in the store and kept the
+        # badge lit (observed: ESP showed a task as running after it finished).
+        #
+        # Keyed per turn, not per thread: the same conversation can start a new
+        # turn later, and that one genuinely is running.
+        settled_turns: set[tuple[str, str]] = set()
+        settled_without_turn: set[str] = set()
+        for record in records:
+            if record.kind != "result" or record.status not in {
+                "completed", "failed", "interrupted", "cancelled", "canceled"
+            }:
+                continue
+            settled_thread = str(record.thread_id or "").strip()
+            if not settled_thread:
+                continue
+            data = record.data if isinstance(record.data, dict) else {}
+            task = data.get("task") if isinstance(data.get("task"), dict) else {}
+            settled_turn = str(task.get("turn_id") or "").strip()
+            if settled_turn:
+                settled_turns.add((settled_thread, settled_turn))
+            else:
+                settled_without_turn.add(settled_thread)
+
+        def still_running(record: "MessageRecord") -> bool:
+            thread = str(record.thread_id or "").strip()
+            data = record.data if isinstance(record.data, dict) else {}
+            task = data.get("task") if isinstance(data.get("task"), dict) else {}
+            turn = str(task.get("turn_id") or "").strip()
+            if turn:
+                return (thread, turn) not in settled_turns
+            # No turn id on either side: fall back to the thread-level check so
+            # an old snapshot without turn ids still settles.
+            return thread not in settled_without_turn
+
         for record in records:
             if record.kind in IN_FLIGHT_KINDS:
                 if (
                     record.status in IN_FLIGHT_STATUSES
                     and is_in_flight(record)
                     and is_fresh(record, now)
+                    and still_running(record)
                 ):
                     thread_id = str(record.thread_id or "").strip()
                     data = record.data if isinstance(record.data, dict) else {}
@@ -418,6 +455,16 @@ class BridgeHub:
                             continue
                         item_thread = str(item.get("thread_id") or thread_id).strip()
                         item_turn = str(item.get("turn_id") or "").strip()
+                        # Each entry describes a different turn, so it has to
+                        # be filtered on its own: a settled turn sitting in this
+                        # aggregate list used to keep the running count up
+                        # forever, because the per-record check above only ever
+                        # looked at the record's own task.
+                        if item_thread and item_turn:
+                            if (item_thread, item_turn) in settled_turns:
+                                continue
+                        elif item_thread and item_thread in settled_without_turn:
+                            continue
                         if item_thread and item_turn:
                             running_keys.add((item_thread, item_turn))
                 continue
@@ -684,6 +731,12 @@ class BridgeHub:
             if unchanged:
                 # Same words on the same screen: the periodic snapshot must not
                 # turn into periodic radio traffic and device wake-ups.
+                #
+                # Same words on the same screen: the periodic snapshot must not
+                # turn into periodic radio traffic and device wake-ups. The
+                # aggregate badge counts are unaffected: they are derived live
+                # from the store whenever a device asks or a state event is
+                # published, so this early return cannot leave them stale.
                 return
             event = None
             if self.event_spine is not None:

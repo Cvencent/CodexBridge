@@ -165,6 +165,145 @@ class CbdpHubEventTests(unittest.TestCase):
         self.hub._broadcast_codex_state()
         self.assertEqual(len(self._events(EVENT_CODEX_STATE)), 1)
 
+    def test_a_settled_thread_stops_counting_as_running(self):
+        # Reproduces the "ESP shows a task still running after it finished" bug.
+        # The collector stops republishing the live task:<id> record once a turn
+        # ends, so that stale record stayed in the store and kept the running
+        # badge lit forever.
+        from codexbridge.messages_store import MessageRecord
+
+        def working(thread_id: str, turn_id: str) -> MessageRecord:
+            return MessageRecord(
+                message_id=f"task:{thread_id}",
+                thread_id=thread_id,
+                kind="task",
+                status="working",
+                title="T",
+                body="",
+                created_at=1.0,
+                data={"task": {"thread_id": thread_id, "turn_id": turn_id,
+                               "status": "working"}},
+            )
+
+        def finished(thread_id: str, turn_id: str) -> MessageRecord:
+            return MessageRecord(
+                message_id=f"result:{thread_id}:9",
+                thread_id=thread_id,
+                kind="result",
+                status="completed",
+                title="T",
+                body="done",
+                created_at=9.0,
+                data={"task": {"thread_id": thread_id, "turn_id": turn_id,
+                               "status": "completed"}},
+            )
+
+        self.hub.publish(working("t1", "turn-1"))
+        self.hub.publish(working("t2", "turn-2"))
+        self.assertEqual(self.hub.counts()["running"], 2)
+
+        # t1 finishes while t2 keeps running.
+        self.hub.publish(finished("t1", "turn-1"))
+
+        self.assertEqual(
+            self.hub.counts()["running"], 1,
+            "a thread with a terminal result must not still count as running",
+        )
+
+    def test_a_settled_turn_inside_the_aggregate_task_list_is_excluded(self):
+        # The collector's task:<id> record carries data["tasks"] listing every
+        # visible conversation. A finished turn sitting in that list kept the
+        # running count up forever, because the per-record check only looked at
+        # the record's own task.
+        from codexbridge.messages_store import MessageRecord
+
+        aggregate = MessageRecord(
+            message_id="task:agg",
+            thread_id="agg",
+            kind="task",
+            status="working",
+            title="T",
+            body="",
+            created_at=1.0,
+            data={
+                "task": {"thread_id": "agg", "turn_id": "turn-A",
+                         "status": "working"},
+                "tasks": [
+                    {"thread_id": "agg", "turn_id": "turn-A",
+                     "status": "working"},
+                    {"thread_id": "dead", "turn_id": "turn-OLD",
+                     "status": "working"},
+                ],
+            },
+        )
+        self.hub.publish(aggregate)
+
+        finished = MessageRecord(
+            message_id="result:dead:5",
+            thread_id="dead",
+            kind="result",
+            status="completed",
+            title="T",
+            body="done",
+            created_at=5.0,
+            data={"task": {"thread_id": "dead", "turn_id": "turn-OLD",
+                           "status": "completed"}},
+        )
+        self.hub.publish(finished)
+
+        self.assertEqual(
+            self.hub.counts()["running"], 1,
+            "a settled turn inside the aggregate list must not count as running",
+        )
+        # Republishing the aggregate unchanged must keep the count at 1.
+        self.hub.publish(aggregate)
+        self.assertEqual(self.hub.counts()["running"], 1)
+
+    def test_a_new_turn_on_a_settled_thread_counts_as_running_again(self):
+        # The settle rule must be keyed per turn: the same conversation can
+        # start another turn later, and that one really is running.
+        from codexbridge.messages_store import MessageRecord
+
+        def live(thread_id: str, turn_id: str) -> MessageRecord:
+            return MessageRecord(
+                message_id=f"status:{thread_id}:working",
+                thread_id=thread_id,
+                kind="status",
+                status="working",
+                title="T",
+                body="",
+                created_at=1.0,
+                data={"task": {"thread_id": thread_id, "turn_id": turn_id,
+                               "status": "working"}},
+            )
+
+        def done(thread_id: str, turn_id: str) -> MessageRecord:
+            return MessageRecord(
+                message_id=f"result:{thread_id}:9",
+                thread_id=thread_id,
+                kind="result",
+                status="completed",
+                title="T",
+                body="done",
+                created_at=9.0,
+                data={"task": {"thread_id": thread_id, "turn_id": turn_id,
+                               "status": "completed"}},
+            )
+
+        self.hub.publish(live("t1", "turn-1"))
+        self.assertEqual(self.hub.counts()["running"], 1)
+
+        self.hub.publish(done("t1", "turn-1"))
+        self.assertEqual(self.hub.counts()["running"], 0)
+
+        # A second turn on the same thread.
+        self.hub.publish(live("t1", "turn-2"))
+
+        self.assertEqual(
+            self.hub.counts()["running"], 1,
+            "a new turn on an already-settled thread must count as running",
+        )
+
     def test_codex_state_reaches_a_summary_subscriber(self):
         from codexbridge.cbdp.events import SCOPE_SUMMARY
         from codexbridge.cbdp.gateway import CbdpGateway
