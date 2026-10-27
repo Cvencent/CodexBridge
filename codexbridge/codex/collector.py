@@ -47,6 +47,39 @@ def _task_data(task: Any, *, include_result: bool = False) -> dict[str, Any]:
     return result
 
 
+LIVE_STATUSES = frozenset({"working", "waiting_user", "queued", "starting"})
+
+
+def running_turns_from_snapshot(snapshot: dict[str, Any]) -> set[tuple[str, str]]:
+    """The turns this snapshot says are actually running.
+
+    This is the authority for the device badge. Deriving the count from the
+    message store instead let stale records keep a finished turn "running"
+    forever, because the collector stops republishing a turn once it ends.
+    """
+    if not isinstance(snapshot, dict):
+        return set()
+    tasks = snapshot.get("tasks")
+    turns: set[tuple[str, str]] = set()
+    fallback: set[str] = set()
+    for task in tasks if isinstance(tasks, list) else []:
+        if not isinstance(task, dict):
+            continue
+        thread_id = str(task.get("thread_id") or "").strip()
+        if not thread_id or str(task.get("status") or "") not in LIVE_STATUSES:
+            continue
+        turn_id = str(task.get("turn_id") or "").strip()
+        if turn_id:
+            turns.add((thread_id, turn_id))
+        else:
+            fallback.add(thread_id)
+    explicit = {thread for thread, _ in turns}
+    for thread_id in fallback:
+        if thread_id not in explicit:
+            turns.add((thread_id, ""))
+    return turns
+
+
 def records_from_snapshot(
     snapshot: dict[str, Any],
     now: float | None = None,
@@ -221,6 +254,7 @@ def run_codex_collector(
     on_source: Callable[[Any | None], None] | None = None,
     interval_for: Callable[[], float] | None = None,
     demand: Callable[[], bool] | None = None,
+    on_snapshot: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Poll the Codex snapshot until ``stop`` is set.
 
@@ -282,7 +316,13 @@ def run_codex_collector(
                 and not (restart is not None and restart.is_set())
                 and (enabled is None or enabled())
             ):
-                records = records_from_snapshot(source.snapshot())
+                snapshot = source.snapshot()
+                if on_snapshot is not None:
+                    try:
+                        on_snapshot(snapshot)
+                    except Exception:  # noqa: BLE001
+                        pass
+                records = records_from_snapshot(snapshot)
                 if records:
                     publish(records)
                 if report is not None:

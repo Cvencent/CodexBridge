@@ -245,6 +245,11 @@ class BridgeHub:
         # Last aggregate counts published as system.codex_state, so a steady
         # state does not append a duplicate event on every publish tick.
         self._last_codex_state: tuple[int, int, int] | None = None
+        # Authoritative running turns from the latest collector snapshot. The
+        # message store cannot answer this: a finished turn's records are left
+        # behind and its thread may never be republished, so a store-derived
+        # count can stay high forever.
+        self._live_turns: set[tuple[str, str]] | None = None
         # Per-device deferred work: queue, worker handle, and depth counters.
         self._work: dict[str, "queue.Queue[tuple[str, Any]]"] = {}
         self._workers: dict[str, threading.Thread] = {}
@@ -382,6 +387,11 @@ class BridgeHub:
             return False
         return True
 
+    def note_live_turns(self, turns: set[tuple[str, str]]) -> None:
+        """Record the authoritative running set from the collector."""
+        with self._lock:
+            self._live_turns = set(turns)
+
     def counts(self) -> dict[str, int]:
         """Aggregate running tasks and globally unread terminal results.
 
@@ -482,8 +492,11 @@ class BridgeHub:
         for thread_id in fallback_threads:
             if thread_id not in explicit_threads:
                 running_keys.add((thread_id, ""))
+        with self._lock:
+            live_turns = self._live_turns
+        running = len(live_turns) if live_turns is not None else len(running_keys)
         return {
-            "running": len(running_keys),
+            "running": running,
             "completed_unread": completed_unread,
             "failed_unread": failed_unread,
             "done": completed_unread,
@@ -1610,6 +1623,16 @@ class BridgeHub:
                 # devices that had never subscribed to the topic.
                 continue
             self._send_to(session, payload)
+
+    def publish_live_counts(self) -> None:
+        """Push the aggregate badge counts to every attached client.
+
+        Called once per collector snapshot. ``_publish_codex_state()`` only
+        appends an event when the numbers actually changed, so this adds no
+        traffic in steady state while guaranteeing a finished turn is reflected
+        immediately instead of waiting for some unrelated record to change.
+        """
+        self._broadcast_codex_state()
 
     def _broadcast_codex_state(self) -> None:
         payload = {"type": "codex_state", **self.counts()}

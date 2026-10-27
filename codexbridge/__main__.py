@@ -18,7 +18,11 @@ from codexbridge.codex.app_server import (
     _resolve_codex_command,
 )
 from codexbridge.codex.catalog import CodexCatalogService
-from codexbridge.codex.collector import records_from_snapshot, run_codex_collector
+from codexbridge.codex.collector import (
+    records_from_snapshot,
+    running_turns_from_snapshot,
+    run_codex_collector,
+)
 from codexbridge.devices.discovery import (
     DISCOVERY_TIMEOUT_SECONDS,
     PresenceListener,
@@ -741,6 +745,13 @@ def main(argv: list[str] | None = None) -> int:
         # waiting for the periodic UDP beat.
         home_counters.notify()
 
+    def note_codex_snapshot(snapshot: dict) -> None:
+        # The collector's snapshot is the authority for how many turns are
+        # actually running. Publish the aggregate right after recording it so a
+        # finished turn is reflected even when none of its own records change.
+        hub.note_live_turns(running_turns_from_snapshot(snapshot))
+        hub.publish_live_counts()
+
     def open_logs() -> None:
         os.startfile(data_dir)
 
@@ -839,6 +850,7 @@ def main(argv: list[str] | None = None) -> int:
                 else IDLE_COLLECT_SECONDS
             ),
             "demand": watcher_demand,
+            "on_snapshot": note_codex_snapshot,
         },
         daemon=True,
     )

@@ -304,6 +304,49 @@ class CbdpHubEventTests(unittest.TestCase):
             "a new turn on an already-settled thread must count as running",
         )
 
+    def test_the_authoritative_live_set_overrides_stale_store_records(self):
+        # A finished turn's records stay in the store and are never republished,
+        # so a store-derived count can stay high forever. The collector's
+        # snapshot is the authority and must win.
+        from codexbridge.messages_store import MessageRecord
+
+        self.hub.publish(MessageRecord(
+            message_id="task:stale", thread_id="stale", kind="task",
+            status="working", title="T", body="", created_at=1.0,
+            data={"task": {"thread_id": "stale", "turn_id": "old",
+                           "status": "working"}},
+        ))
+        self.assertGreaterEqual(self.hub.counts()["running"], 1)
+
+        self.hub.note_live_turns(set())
+        self.assertEqual(
+            self.hub.counts()["running"], 0,
+            "no live turns means the badge must read zero",
+        )
+
+        self.hub.note_live_turns({("t1", "turn-1"), ("t2", "turn-2")})
+        self.assertEqual(self.hub.counts()["running"], 2)
+
+    def test_a_snapshot_reports_only_genuinely_running_turns(self):
+        from codexbridge.codex.collector import running_turns_from_snapshot
+
+        snapshot = {
+            "tasks": [
+                {"thread_id": "a", "turn_id": "t1", "status": "working"},
+                {"thread_id": "b", "turn_id": "t2", "status": "waiting_user"},
+                {"thread_id": "c", "turn_id": "t3", "status": "completed"},
+                {"thread_id": "d", "turn_id": "t4", "status": "idle"},
+                {"thread_id": "e", "status": "working"},          # no turn id
+            ],
+        }
+        turns = running_turns_from_snapshot(snapshot)
+        self.assertIn(("a", "t1"), turns)
+        self.assertIn(("b", "t2"), turns)
+        self.assertIn(("e", ""), turns)
+        self.assertNotIn(("c", "t3"), turns)
+        self.assertNotIn(("d", "t4"), turns)
+        self.assertEqual(len(turns), 3)
+
     def test_codex_state_reaches_a_summary_subscriber(self):
         from codexbridge.cbdp.events import SCOPE_SUMMARY
         from codexbridge.cbdp.gateway import CbdpGateway
