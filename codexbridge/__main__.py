@@ -323,9 +323,20 @@ def _launch_restarted_process(
     launcher = subprocess.Popen if popen is None else popen
     project_root = Path(__file__).resolve().parents[1]
     cwd = data_dir if getattr(sys, "frozen", False) else project_root
+    # A frozen one-file app exports internal _PYI_* variables to its child.
+    # Re-launching the same executable without resetting them makes the new
+    # bootloader try to reuse the old process's temporary extraction directory;
+    # the old parent then removes it and both bootloaders hang. PyInstaller
+    # provides this reset switch specifically for self-restart/spawn.
+    env = os.environ.copy()
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for key in list(env):
+        if key.startswith("_PYI_"):
+            env.pop(key, None)
     launcher(
         _restart_command(),
         cwd=str(cwd),
+        env=env,
         close_fds=True,
     )
 
