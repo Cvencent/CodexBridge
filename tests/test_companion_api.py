@@ -7,6 +7,7 @@ import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -51,11 +52,20 @@ class CompanionApiTests(unittest.TestCase):
         )
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
+        hello = b""
+        while True:
+            line = response.fp.readline()
+            self.assertTrue(line, "SSE closed before the hello event")
+            hello += line
+            if line in (b"\n", b"\r\n"):
+                break
+        self.assertIn(b"hello", hello)
+        started = time.monotonic()
         self.api.stop()
         # The stream must reach EOF promptly after stop instead of staying
-        # half-open until a TCP timeout. The initial hello event is expected.
-        remaining = response.read()
-        self.assertIn(b"hello", remaining)
+        # half-open until a TCP timeout.
+        response.read()
+        self.assertLess(time.monotonic() - started, 3.0)
         connection.close()
 
     def test_sse_does_not_keep_old_capabilities_after_negotiation(self):
