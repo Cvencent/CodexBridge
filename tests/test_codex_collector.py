@@ -230,6 +230,53 @@ class CodexCollectorTest(unittest.TestCase):
         self.assertEqual(active, [source, None])
 
 
+class CollectorResilienceTest(unittest.TestCase):
+    """The collector thread must never die silently."""
+
+    def test_a_publish_failure_does_not_kill_the_thread(self):
+        # A sqlite3.DatabaseError from the event spine is neither OSError nor
+        # ValueError, so it used to escape the collector loop and kill the
+        # thread outright: the running badge froze at its last value with no
+        # error anywhere. It must be reported and the loop must survive.
+        import sqlite3
+
+        stop = threading.Event()
+        reports = []
+        attempts = {"n": 0}
+
+        def publish(records):
+            del records
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            stop.set()
+
+        source = FakeSource(SNAPSHOT)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            thread = threading.Thread(
+                target=run_codex_collector,
+                kwargs=dict(
+                    runtime_folder=Path(temp_dir),
+                    cwd=Path(temp_dir),
+                    interval=1.0,
+                    stop=stop,
+                    publish=publish,
+                    source_factory=lambda: source,
+                    report=lambda state, detail: reports.append((state, detail)),
+                ),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(stop.wait(15.0), "the collector must keep retrying")
+            thread.join(timeout=5.0)
+
+        self.assertGreaterEqual(attempts["n"], 2, "the loop must retry after the error")
+        self.assertTrue(
+            any(state == "error" and "DatabaseError" in detail for state, detail in reports),
+            "the failure must be reported instead of vanishing",
+        )
+
+
 class CollectorThrottleTest(unittest.TestCase):
     """The idle throttle must slow the beat without ever stopping collection."""
 

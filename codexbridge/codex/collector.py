@@ -307,9 +307,14 @@ def run_codex_collector(
                         # first request is fresh instead of up to one slow
                         # interval old.
                         break
-        except (AppServerError, OSError, ValueError) as error:
+        except Exception as error:  # noqa: BLE001
+            # Anything unexpected (a sqlite3 error from publish(), a projection
+            # failure, a malformed payload) used to escape this loop and kill
+            # the collector thread outright: the badge then froze at its last
+            # value while the app kept running, with no trace anywhere. Report
+            # it and keep the loop alive with backoff instead.
             if report is not None:
-                report("error", str(error))
+                report("error", f"{type(error).__name__}: {error}")
             deadline = time.monotonic() + backoff
             while (
                 not stop.is_set()
